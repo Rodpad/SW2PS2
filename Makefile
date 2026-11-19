@@ -19,7 +19,7 @@ endif
 
 APP_TITLE	:=	SW2PS2
 APP_AUTHOR	:=	Rodpad
-APP_VERSION	:=	0.1.0
+APP_VERSION	:=	1.0.0
 
 TARGET		:=	sw2ps2
 BUILD		:=	build
@@ -32,10 +32,6 @@ ICON		:=	sw2ps2.jpg
 ARCH	:=	$(SWITCH2_CPU) -mtp=soft -fPIE
 CFLAGS	:=	-g -Wall -O2 -ffunction-sections $(ARCH) $(DEFINES) -Wno-unused-function
 CFLAGS	+=	$(INCLUDE) -D__SWITCH__ -DNDEBUG -D__LIBRETRO__ -DAPP_VERSION=\"$(APP_VERSION)\" -I$(PORTLIBS)/include/freetype2
-# Pre-release expiry: the build's own time, stamped into buildstamp.o (rebuilt every build, below).
-SW2_BUILD_TIME	?=	$(shell date +%s)
-export SW2_BUILD_TIME
-CFLAGS	+=	-DSW2_BUILD_TIME=$(SW2_BUILD_TIME)LL
 CXXFLAGS	:= $(CFLAGS) -std=gnu++17
 ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map) -Wl,--gc-sections
@@ -80,7 +76,7 @@ export OUTPUT	:=	$(CURDIR)/$(TARGET)
 export TOPDIR	:=	$(CURDIR)
 export VPATH	:=	$(foreach dir,$(SOURCES),$(CURDIR)/$(dir))
 export DEPSDIR	:=	$(CURDIR)/$(BUILD)
-CPPFILES	:=	main.cpp cores.cpp uigfx.cpp audio.cpp bridge_core.cpp buildstamp.cpp
+CPPFILES	:=	main.cpp cores.cpp uigfx.cpp audio.cpp bridge_core.cpp
 CPPFILES	+=	armsx2_compat.cpp armsx2_app.cpp
 ifeq ($(ARMSX2_VK),1)
 CPPFILES	+=	vkpresent.cpp
@@ -97,7 +93,6 @@ export NROFLAGS += --icon=$(APP_ICON) --nacp=$(CURDIR)/$(TARGET).nacp --romfsdir
 all: $(BUILD)
 $(BUILD):
 	@[ -d $@ ] || mkdir -p $@
-	@rm -f $@/buildstamp.o
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
 clean:
 	@rm -fr $(BUILD) $(TARGET).nro $(TARGET).nacp $(TARGET).elf

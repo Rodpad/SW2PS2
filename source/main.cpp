@@ -2617,37 +2617,7 @@ int main(int argc, char** argv) {
   padInitialize(&pad1, HidNpadIdType_No1, HidNpadIdType_Handheld);
   padInitialize(&pad2, HidNpadIdType_No2);
   padStates[0] = &pad1; padStates[1] = &pad2;
-  {  // pre-release: a build works for a week. Its first start says so; once expired it says that and quits.
-    extern const long long sw2_build_time;
-    const long long expires = sw2_build_time + 7LL * 24 * 3600;
-    char until[64]; { time_t e = (time_t)expires; struct tm lt = *localtime(&e); strftime(until, sizeof until, "%d %B %Y, %H:%M", &lt); }
-    record("pre-release: built %lld, works until %s", sw2_build_time, until);
-    // A screen of lines until any button (after letting go of the one that launched us), or 30 s.
-    auto notice = [&](const vector<string>& lines, const string& prompt) {
-      const double endAt = nowMs() + 30000; bool released = false;
-      while (appletMainLoop() && nowMs() < endAt) {
-        padUpdate(&pad1);
-        if (!padGetButtons(&pad1)) released = true; else if (released) break;
-        gfx::beginFrame(col(C_BG));
-        gfx::text("SW2PS2 " APP_VERSION " pre-release", 80, 120, 40, col(C_TEXT), gfx::BOLD);
-        float y = 200; for (auto& l : lines) { gfx::text(l, 80, y, 26, col(C_TEXT)); y += 40; }
-        gfx::text(prompt, 80, y + 40, 24, col(C_DIM));
-        gfx::endFrame(0);
-      }
-    };
-    const string seenPath = string(DATA_DIR) + "/prerelease.txt";
-    if ((long long)time(nullptr) > expires) {
-      record("pre-release: expired, quitting");
-      notice({"This pre-release build has expired.", string("It stopped working on ") + until + ".", "Please download a newer build."}, "Press any button to exit.");
-      quitApp = true;
-    } else if (access((string(DATA_DIR) + "/autotest.json").c_str(), F_OK) != 0) {  // (not on test runs)
-      vector<uint8_t> seen; const string stamp = std::to_string(sw2_build_time);
-      if (!readFile(seenPath, seen) || string(seen.begin(), seen.end()) != stamp) {  // first start of this build
-        notice({"This is a pre-release build. It works for a week from when it was built,", string("until ") + until + ". After that it will stop working: please get a newer build."}, "Press any button to continue.");
-        writeFile(seenPath, stamp.data(), stamp.size());
-      }
-    }
-  }
+
   ps2core_setup(DATA_DIR, [](const char* line) { if (coreLogLines < 6000) { coreLogLines++; record("[core] %s", line); } });
 
   record("startup: picture, shaders");

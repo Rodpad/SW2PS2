@@ -1,5 +1,9 @@
 # SW2PS2
 
+> **Early development:** SW2PS2 is new and there will be bugs. Please report them in
+> [Issues](https://github.com/Rodpad/SW2PS2/issues) with the game, what happened and, if you can,
+> `/switch/sw2ps2/log.txt` from the SD card.
+
 A PlayStation 2 emulator for the Nintendo Switch 2 (hbmenu / kaiHEN), built on the
 [OunceSX2](https://github.com/nyathea/OunceSX2) core (ARMSX2 / PCSX2 lineage) with a native
 front end: game list with favourites and recents, settings and an in-game menu in tabs
