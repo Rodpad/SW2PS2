@@ -9,7 +9,7 @@
 # is sent and started with nxlink instead of being handed over to.
 set -e
 cd "$(dirname "$0")/.."
-IP=${SWITCH_IP:?set SWITCH_IP to the console's IP address (its FTP server on port 5000)}; FTP="ftp://$IP:5000/switch/sw2ps2"
+IP=${SWITCH_IP:?set SWITCH_IP to the IP address of the console (its FTP server on port 5000)}; FTP="ftp://$IP:5000/switch/sw2ps2"
 RUNS=${1:-'[{"boost": true}]'}; SECONDS_EACH=${2:-14}; SLOT=${3:-1}; GAME=${4:-Katamari_Damacy.iso}
 # Test builds carry a red TEST icon and the title "SW2PS2 TEST", so they are never mistaken
 # for the one to play (/switch/sw2ps2/sw2ps2.nro).

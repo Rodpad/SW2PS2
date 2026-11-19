@@ -549,19 +549,35 @@ static void flushPlaytime(const string& name) {
   playAccumSec = 0;
   if (!writeText(PLAYTIME(), playtime.dump())) record("Play time save failed");
 }
+// Games in dir and its subfolders (hidden folders skipped; at most 6 levels; from the SD card's
+// root the app and system folders are left out).
+static void scanGames(const string& dir, int depth, vector<Rom>& found) {
+  DIR* d = opendir(dir.c_str());
+  if (!d) return;
+  vector<string> subdirs;
+  while (struct dirent* e = readdir(d)) {
+    string n = e->d_name;
+    if (n.empty() || n[0] == '.') continue;
+    bool isDir = e->d_type == DT_DIR;
+    if (e->d_type == DT_UNKNOWN) { struct stat st; isDir = stat((dir + "/" + n).c_str(), &st) == 0 && S_ISDIR(st.st_mode); }
+    if (isDir) subdirs.push_back(n);
+    else if (isRomExt(n)) found.push_back(Rom{n, dir});
+  }
+  closedir(d);
+  if (depth >= 6) return;
+  const bool root = dir == "sdmc:" || dir == "sdmc:/";
+  std::sort(subdirs.begin(), subdirs.end(), [](const string& a, const string& b) { return naturalLess(a, b); });
+  for (const string& n : subdirs) {
+    if (root && (lower(n) == "switch" || lower(n) == "atmosphere")) continue;
+    scanGames((root ? string("sdmc:") : dir) + "/" + n, depth + 1, found);
+  }
+}
 static void scan() {
   allRoms.clear();
-  // One entry per game name (a .nes file wins over a .zip of the same name).
+  // One entry per game name (the first found wins over a same-named file deeper in the tree).
   for (const string& dir : {romDir}) {
     vector<Rom> found;
-    if (DIR* d = opendir(dir.c_str())) {
-      while (struct dirent* e = readdir(d)) {
-        string n = e->d_name;
-        if (e->d_type == DT_DIR || n[0] == '.') continue;
-        if (isRomExt(n)) found.push_back(Rom{n, dir});
-      }
-      closedir(d);
-    }
+    scanGames(dir, 0, found);
     std::sort(found.begin(), found.end(), [](const Rom& a, const Rom& b) { return isRomExt(a.name) && !isRomExt(b.name); });
     for (auto& r : found) {
       bool dup = false;
@@ -1002,12 +1018,18 @@ static void startGame(const Rom& rom) {
   static string romPath;
   romPath = rom.dir + "/" + rom.name;
   char bios[256];
-  if (!ps2core_find_bios(biosDir.c_str(), bios, sizeof bios)) {
+  char biosPath[512];
+  if (!ps2core_find_bios(biosDir.c_str(), biosPath, sizeof biosPath)) {
     const string shown = biosDir.rfind("sdmc:", 0) == 0 ? biosDir.substr(5) : biosDir;
     showMessage("No PS2 BIOS found.\n\nCopy the BIOS dump from your own PS2 to\n\n    " + shown + "/\n\non the SD card (or choose another folder in Settings -> App -> BIOS folder),\nthen start the game again.", [] { mode = "browser"; });
     return;
   }
-  if (&sw2_bios_dir) snprintf(sw2_bios_dir, 512, "%s", biosDir.rfind("sdmc:", 0) == 0 ? biosDir.c_str() + 5 : biosDir.c_str());  // the core wants "/bios/ps2"
+  {  // the dump may be in a subfolder: the core gets that folder ("/bios/ps2/...", no "sdmc:") and the file's name
+    string p = biosPath; size_t slash = p.rfind('/');
+    string folder = slash == string::npos ? biosDir : p.substr(0, slash);
+    snprintf(bios, sizeof bios, "%s", slash == string::npos ? p.c_str() : p.c_str() + slash + 1);
+    if (&sw2_bios_dir) snprintf(sw2_bios_dir, 512, "%s", folder.rfind("sdmc:", 0) == 0 ? folder.c_str() + 5 : folder.c_str());
+  }
 #ifdef SW2_VK
   bool gpu = ps2Renderer == 2;  // OpenGL
   const bool vulkan = ps2Renderer == 0;  // the core renders with Vulkan; vkpresent brings its frames to the GL picture
@@ -2505,7 +2527,9 @@ static void handleUi(u64 bits) {
       if (pickSel == 0) {
         if (pickForBios) {
           biosDir = pickAtRoot() ? "sdmc:" : pickPath; saveSettings(); mode = "settings";
-          char found[256]; showToast(ps2core_find_bios(biosDir.c_str(), found, sizeof found) ? string("BIOS found: ") + found : string("No BIOS in this folder yet"), 3500);
+          char found[512];
+          if (ps2core_find_bios(biosDir.c_str(), found, sizeof found)) { string f = found; showToast("BIOS found: " + f.substr(f.rfind('/') + 1), 3500); }
+          else showToast("No BIOS in this folder or its subfolders yet", 3500);
         } else {
         romDir = pickAtRoot() ? "sdmc:" : pickPath;
         saveSettings(); scan(); mode = "settings";

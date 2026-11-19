@@ -50,7 +50,7 @@ bool ps2core_vulkan();                // the loaded game shows through the Vulka
 #endif
 bool ps2core_is_gpu();                 // the last frame is in the GPU target (video() is stale)
 double ps2core_fps();                  // 59.94 (NTSC) or 50 (PAL) for the loaded game
-bool ps2core_find_bios(const char* dir, char* name, int size);  // first BIOS file (4-8 MB) in dir
+bool ps2core_find_bios(const char* dir, char* path, int size);  // a BIOS file (4-8 MB) in dir or its subfolders: its full path
 
 // Rewind history (delta-compressed states; see cores.cpp).
 bool rewind_init(long budgetBytes);

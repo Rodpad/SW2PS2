@@ -1,6 +1,7 @@
 // SW2PS2: the core adapter (core table) for the front end.
 #include "core.h"
 
+#include <algorithm>
 #include <dirent.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -26,17 +27,31 @@ void ps2core_setup(const char* dir, void (*log)(const char*)) {
   ps2_init((dataDir + "/system").c_str(), (dataDir + "/saves").c_str(), coreLog);
 }
 void ps2core_option(const char* key, const char* value) { ps2_set_option(key, value); }
-bool ps2core_find_bios(const char* biosDir, char* name, int size) {
-  std::string dir = biosDir, best;
-  if (DIR* d = opendir(dir.c_str())) {
-    while (dirent* e = readdir(d)) {
-      struct stat st; std::string p = dir + "/" + e->d_name;
-      if (e->d_name[0] != '.' && stat(p.c_str(), &st) == 0 && st.st_size >= 4 * 1024 * 1024 && st.st_size <= 8 * 1024 * 1024 && (best.empty() || std::string(e->d_name) < best)) best = e->d_name;
-    }
-    closedir(d);
+// A BIOS dump: a 4-8 MB file. The first by name in a folder, the folder itself before its
+// subfolders (hidden folders skipped, at most 4 levels down).
+static bool findBios(const std::string& dir, int depth, std::string& out) {
+  DIR* d = opendir(dir.c_str());
+  if (!d) return false;
+  std::string best; std::vector<std::string> subdirs;
+  while (dirent* e = readdir(d)) {
+    if (e->d_name[0] == '.') continue;
+    struct stat st; std::string p = dir + "/" + e->d_name;
+    if (stat(p.c_str(), &st) != 0) continue;
+    if (S_ISDIR(st.st_mode)) subdirs.push_back(e->d_name);
+    else if (st.st_size >= 4 * 1024 * 1024 && st.st_size <= 8 * 1024 * 1024 && (best.empty() || std::string(e->d_name) < best)) best = e->d_name;
   }
-  if (best.empty()) return false;
-  snprintf(name, size, "%s", best.c_str());
+  closedir(d);
+  if (!best.empty()) { out = dir + "/" + best; return true; }
+  if (depth >= 4) return false;
+  std::sort(subdirs.begin(), subdirs.end());
+  for (const std::string& s : subdirs) if (findBios(dir + "/" + s, depth + 1, out)) return true;
+  return false;
+}
+bool ps2core_find_bios(const char* biosDir, char* path, int size) {
+  std::string dir = biosDir, found;
+  if (!dir.empty() && dir.back() == '/') dir.pop_back();
+  if (!findBios(dir, 0, found)) return false;
+  snprintf(path, size, "%s", found.c_str());
   return true;
 }
 bool ps2core_use_gpu(bool on, int scale, const char** error) {
