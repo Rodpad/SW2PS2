@@ -1,6 +1,6 @@
 #---------------------------------------------------------------------------------
 # SW2PS2 for hbmenu (Switch 2 homebrew, kaiHEN): devkitPro + ounce-devkit.
-#   ./build-switch.sh            (the LRPS2 core -> build-switch/LRPS2/*.a)
+#   the OunceSX2 core first: ninja -C third_party/ouncesx2-eval/build-sw2-vk PCSX2 sw2-armsx2-libretro
 #   export DEVKITPRO=/opt/devkitpro && make
 #---------------------------------------------------------------------------------
 .SUFFIXES:
@@ -9,8 +9,9 @@ $(error "Please set DEVKITPRO in your environment. export DEVKITPRO=<path to>/de
 endif
 TOPDIR ?= $(CURDIR)
 include $(DEVKITPRO)/libounce/switch2_rules
-# OUNCEVK: a newer OunceVK driver (lib/, include/) used ahead of the portlibs copy; make OUNCEVK= uses the portlibs one.
-OUNCEVK	?=	$(TOPDIR)/third_party/ouncevk-20261118
+# OUNCEVK: a newer OunceVK driver (lib/, include/) to use ahead of the devkit's portlibs copy. Default:
+# the portlibs one (third_party/ouncevk-20261118 was ~3% faster but crashed on relaunch in hbmenu).
+OUNCEVK	?=
 ifneq ($(strip $(OUNCEVK)),)
 OVERLAY_LIBPATHS	:=	-L$(OUNCEVK)/lib $(OVERLAY_LIBPATHS)
 CPPFLAGS	:=	-I$(OUNCEVK)/include $(CPPFLAGS)
@@ -22,10 +23,8 @@ APP_VERSION	:=	0.1.0
 
 TARGET		:=	sw2ps2
 BUILD		:=	build
-CORE_BUILD	?=	build-switch
-CORE		=	$(CORE_BUILD)/LRPS2
 SOURCES		:=	source native
-INCLUDES	:=	source native third_party/LRPS2/libretro/libretro-common/include
+INCLUDES	:=	source native third_party/ouncesx2-eval/src/3rdparty/libretro
 ROMFS		:=	romfs
 ICON		:=	sw2ps2.jpg
 
@@ -40,14 +39,12 @@ CFLAGS	+=	-DSW2_BUILD_TIME=$(SW2_BUILD_TIME)LL
 CXXFLAGS	:= $(CFLAGS) -std=gnu++17
 ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map) -Wl,--gc-sections
-# CORE_KIND=armsx2 builds on the ARMSX2/OunceSX2 core (third_party/ouncesx2-eval/build-sw2) instead of LRPS2.
-CORE_KIND	?=	lrps2
-ifeq ($(CORE_KIND),armsx2)
+# The OunceSX2 core (ARMSX2 / PCSX2 lineage), built in third_party/ouncesx2-eval.
 CXXFLAGS	+=	-DSW2_ARMSX2 -DENABLE_LIBRETRO -DENABLE_OPENGL -DUSE_GLES -I$(TOPDIR)/third_party/ouncesx2-eval/src -I$(TOPDIR)/third_party/ouncesx2-eval/src/common/include -I$(TOPDIR)/third_party/ouncesx2-eval/src/3rdparty/fmt/include -I$(TOPDIR)/third_party/ouncesx2-eval/src/switch/app -I$(TOPDIR)/third_party/ouncesx2-eval/src/pcsx2 -I$(TOPDIR)/third_party/ouncesx2-eval/src/3rdparty/glad/include -I$(TOPDIR)/third_party/ouncesx2-eval/src/3rdparty/fast_float/include -std=gnu++20
 CFLAGS	+=	-DSW2_ARMSX2
 # ARMSX2_VK=1: the core built with its Vulkan renderer too (build-sw2-vk), and the front end's
 # Vulkan display (source/vkpresent.cpp) for the "GPU (Vulkan)" renderer. ES front end.
-ARMSX2_VK	?=	0
+ARMSX2_VK	?=	1
 ifeq ($(ARMSX2_VK),1)
 AX		:=	$(TOPDIR)/third_party/ouncesx2-eval/build-sw2-vk
 CXXFLAGS	+=	-DSW2_VK -DENABLE_VULKAN
@@ -76,9 +73,6 @@ AXLIBS	:=	$(AXWRAP) $(AX)/pcsx2/libPCSX2_LTO.a $(AX)/common/libcommon.a \
 		$(AX)/horizon-deps/libwebp/libwebp.a $(AX)/horizon-deps/libwebp/libsharpyuv.a $(AX)/horizon-deps/lz4/liblz4.a \
 		$(AX)/horizon-deps/sdl3/libSDL3.a $(AX)/3rdparty/glad/libglad.a $(if $(filter 1,$(ARMSX2_VK)),$(AX)/3rdparty/glslang/libglslang.a) $(AX)/liblibzstd_static.a $(TOPDIR)/third_party/ouncesx2-eval/deps-sw2/lib/libjpeg.a
 LIBS	:= -Wl,--wrap=pthread_create -Wl,--wrap=pthread_join -Wl,--wrap=smGetServiceWrapper -Wl,--wrap=smGetServiceOriginal -Wl,--start-group $(AXLIBS) -lEGL -lGLESv2 -lglapi -ldrm_nouveau -lkaihen -lfreetype -lharfbuzz -lpng16 -lbz2 -lminizip -lz -lnx -Wl,--end-group
-else
-LIBS	:= $(TOPDIR)/$(CORE)/pcsx2_libretro_switch2.a -lEGL -lGLESv2 -lglapi -ldrm_nouveau -lkaihen -lfreetype -lharfbuzz -lpng16 -lbz2 -lminizip -lz -lnx
-endif
 LIBDIRS	:= $(PORTLIBS) $(LIBNX)
 
 ifneq ($(BUILD),$(notdir $(CURDIR)))
@@ -86,12 +80,10 @@ export OUTPUT	:=	$(CURDIR)/$(TARGET)
 export TOPDIR	:=	$(CURDIR)
 export VPATH	:=	$(foreach dir,$(SOURCES),$(CURDIR)/$(dir))
 export DEPSDIR	:=	$(CURDIR)/$(BUILD)
-CPPFILES	:=	main.cpp cores.cpp uigfx.cpp audio.cpp bridge_lrps2.cpp buildstamp.cpp
-ifeq ($(CORE_KIND),armsx2)
+CPPFILES	:=	main.cpp cores.cpp uigfx.cpp audio.cpp bridge_core.cpp buildstamp.cpp
 CPPFILES	+=	armsx2_compat.cpp armsx2_app.cpp
 ifeq ($(ARMSX2_VK),1)
 CPPFILES	+=	vkpresent.cpp
-endif
 endif
 export LD	:=	$(CXX)
 export OFILES_SRC	:=	$(CPPFILES:.cpp=.o)

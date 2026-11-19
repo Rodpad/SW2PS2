@@ -1,5 +1,5 @@
 diff --git a/3rdparty/glad/include/EGL/eglplatform.h b/3rdparty/glad/include/EGL/eglplatform.h
-index 6786afd..acf6519 100644
+index 6786afd90b..acf6519919 100644
 --- a/3rdparty/glad/include/EGL/eglplatform.h
 +++ b/3rdparty/glad/include/EGL/eglplatform.h
 @@ -54,6 +54,12 @@ typedef void *EGLNativeDisplayType;
@@ -16,7 +16,7 @@ index 6786afd..acf6519 100644
  #ifndef WIN32_LEAN_AND_MEAN
  #define WIN32_LEAN_AND_MEAN 1
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index c85c735..51040c6 100644
+index c85c73507e..51040c693a 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -48,7 +48,20 @@ add_subdirectory(common)
@@ -42,7 +42,7 @@ index c85c735..51040c6 100644
  endif()
  
 diff --git a/cmake/BuildParameters.cmake b/cmake/BuildParameters.cmake
-index 0f57113..cbf1a43 100644
+index 0f5711345b..cbf1a434a3 100644
 --- a/cmake/BuildParameters.cmake
 +++ b/cmake/BuildParameters.cmake
 @@ -57,6 +57,8 @@ endif()
@@ -55,7 +55,7 @@ index 0f57113..cbf1a43 100644
  option(USE_VULKAN "Enable Vulkan GS renderer" ON)
  # What the GL renderer asks the host for. Android is GL ES whether this is set
 diff --git a/common/CMakeLists.txt b/common/CMakeLists.txt
-index 75e613e..53d4034 100644
+index 75e613e3b2..53d4034157 100644
 --- a/common/CMakeLists.txt
 +++ b/common/CMakeLists.txt
 @@ -250,7 +250,7 @@ if (USE_GCC AND CMAKE_INTERPROCEDURAL_OPTIMIZATION)
@@ -68,7 +68,7 @@ index 75e613e..53d4034 100644
  	target_sources(common PRIVATE
  		HTTPDownloaderCurl.cpp
 diff --git a/common/Horizon/HorizonHostSys.cpp b/common/Horizon/HorizonHostSys.cpp
-index ba4927f..b62ec8e 100644
+index ba4927fb80..b62ec8ee46 100644
 --- a/common/Horizon/HorizonHostSys.cpp
 +++ b/common/Horizon/HorizonHostSys.cpp
 @@ -427,7 +427,13 @@ std::unique_ptr<SharedMemoryMappingArea> SharedMemoryMappingArea::Create(size_t
@@ -87,7 +87,7 @@ index ba4927f..b62ec8e 100644
  	virtmemUnlock();
  	if (!base || !reservation)
 diff --git a/common/HostSys.cpp b/common/HostSys.cpp
-index 78610d1..9fd64ae 100644
+index 78610d1f15..9fd64aead8 100644
 --- a/common/HostSys.cpp
 +++ b/common/HostSys.cpp
 @@ -151,7 +151,9 @@ static void MonitoredWait(const std::atomic<s32>& word, s32 expected)
@@ -102,28 +102,30 @@ index 78610d1..9fd64ae 100644
  	MonitoredWait(word, expected);
  	// Charge unmeasurably short waits as one tick, not zero: the caller
 diff --git a/pcsx2-libretro/Main.cpp b/pcsx2-libretro/Main.cpp
-index 24210fb..24c6d82 100644
+index 24210fb067..66172dc9fb 100644
 --- a/pcsx2-libretro/Main.cpp
 +++ b/pcsx2-libretro/Main.cpp
-@@ -80,6 +80,11 @@
+@@ -80,6 +80,12 @@
  #include "pcsx2/GameList.h"
  #include "pcsx2/Host.h"
  #include "pcsx2/IopThread/OwnerAsserts.h"
 +#include "pcsx2/IopThread/IopThreadMode.h"
 +#ifdef __SWITCH__
-+extern int sw2_iop_thread, sw2_gs_back, sw2_iop_lag, sw2_audio_stretch, sw2_vuaot;  // SW2PS2 front end (native/armsx2_compat.cpp)
++extern int sw2_iop_thread, sw2_gs_back, sw2_iop_lag, sw2_audio_stretch, sw2_vuaot;
++extern char sw2_bios_dir[512];  // SW2PS2 front end (native/armsx2_compat.cpp)
 +extern int sw2_osd_stats;  // SW2PS2: the core's own performance overlay (Vulkan display: the front end draws nothing over it)
 +#endif
  #include "pcsx2/INISettingsInterface.h"
  #include "pcsx2/ImGui/FullscreenUI.h"
  #include "pcsx2/ImGui/ImGuiFullscreen.h"
-@@ -242,6 +247,29 @@ bool LibretroCore::InitializeConfig()
+@@ -242,6 +248,30 @@ bool LibretroCore::InitializeConfig()
  		// Audio goes out through retro_run pulling the stream ring; the Null
  		// backend keeps SPU2 mixing into the ring with no device thread.
  		s_base_settings->SetStringValue("SPU2/Output", "Backend", "Null");
 +#ifdef __SWITCH__
 +		s_base_settings->SetStringValue("SPU2/Output", "SyncMode", ::sw2_audio_stretch ? "TimeStretch" : "Disabled");  // SW2PS2 setting
 +		s_base_settings->SetBoolValue("EmuCore/CPU/Recompiler", "EnableVUAot", ::sw2_vuaot != 0);  // SW2PS2 test switch
++		if (::sw2_bios_dir[0]) s_base_settings->SetStringValue("Folders", "Bios", ::sw2_bios_dir);  // SW2PS2: the BIOS folder the player chose
 +		s_base_settings->SetBoolValue("EmuCore/GS", "HWAA1", false);  // SW2PS2: AA1 edge emulation cost SotC/FFX ~25% (2026-11-19); kept off
 +#endif
 +#ifdef __SWITCH__
@@ -147,7 +149,7 @@ index 24210fb..24c6d82 100644
  	}
  
  	Error save_error;
-@@ -762,7 +790,9 @@ void LibretroCore::CPUThreadMain(VMBootParameters initial_params)
+@@ -762,7 +792,9 @@ void LibretroCore::CPUThreadMain(VMBootParameters initial_params)
  		}
  	}
  
@@ -158,7 +160,7 @@ index 24210fb..24c6d82 100644
  		VMManager::Shutdown(false);
  	if (MTGS::IsOpen())
  	{
-@@ -1330,7 +1360,8 @@ static void ApplyCoreOptions(bool startup)
+@@ -1330,7 +1362,8 @@ static void ApplyCoreOptions(bool startup)
  				{"Accurate", GSHardwareDownloadMode::Enabled},
  				{"Disable Readbacks", GSHardwareDownloadMode::NoReadbacks},
  				{"Unsynchronized", GSHardwareDownloadMode::Unsynchronized},
@@ -168,7 +170,7 @@ index 24210fb..24c6d82 100644
  			for (const auto& [name, value] : kModes)
  			{
  				if (!std::strcmp(var.value, name))
-@@ -1880,6 +1911,9 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game)
+@@ -1880,6 +1913,9 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game)
  
  	LibretroCore::s_hw_render_gl = false;
  	LibretroCore::s_hw_render_vulkan = false;
@@ -178,7 +180,7 @@ index 24210fb..24c6d82 100644
  
  #ifdef ENABLE_OPENGL
  	const auto request_gl = [&]() -> bool {
-@@ -2101,13 +2135,18 @@ RETRO_API void retro_unload_game(void)
+@@ -2101,13 +2137,18 @@ RETRO_API void retro_unload_game(void)
  #ifdef ENABLE_OPENGL
  	GLLibretro::AbortPacing(); // same, for the GL handoff
  #endif
@@ -197,7 +199,7 @@ index 24210fb..24c6d82 100644
  	s_base_settings.reset();
  	s_secrets_settings.reset();
  	LibretroCore::s_content_path.clear();
-@@ -2119,9 +2158,11 @@ RETRO_API void retro_unload_game(void)
+@@ -2119,9 +2160,11 @@ RETRO_API void retro_unload_game(void)
  	VKLibretro::Active = false;
  #endif
  #ifdef ENABLE_OPENGL
@@ -210,7 +212,7 @@ index 24210fb..24c6d82 100644
  	LibretroCore::s_cpu_thread_initialized.store(false, std::memory_order_release);
  }
 diff --git a/pcsx2/CMakeLists.txt b/pcsx2/CMakeLists.txt
-index 58cef9d..683d07b 100644
+index 58cef9de0d..683d07b404 100644
 --- a/pcsx2/CMakeLists.txt
 +++ b/pcsx2/CMakeLists.txt
 @@ -108,6 +108,8 @@ set(pcsx2Sources
@@ -232,7 +234,7 @@ index 58cef9d..683d07b 100644
  	IopThread/IopBridge.h
  	IopThread/IopPlacement.h
 diff --git a/pcsx2/Config.h b/pcsx2/Config.h
-index 2cb9926..97b2fc4 100644
+index 2cb9926070..97b2fc4a18 100644
 --- a/pcsx2/Config.h
 +++ b/pcsx2/Config.h
 @@ -1438,7 +1438,10 @@ struct Pcsx2Config
@@ -248,7 +250,7 @@ index 2cb9926..97b2fc4 100644
  
  		s8 EECycleRate; // EE cycle rate selector (1.0, 1.5, 2.0)
 diff --git a/pcsx2/Dmac.cpp b/pcsx2/Dmac.cpp
-index 1da71e6..8944dd4 100644
+index 1da71e6ec9..8944dd416f 100644
 --- a/pcsx2/Dmac.cpp
 +++ b/pcsx2/Dmac.cpp
 @@ -4,6 +4,8 @@
@@ -305,7 +307,7 @@ index 1da71e6..8944dd4 100644
  			cpuClearInt( channel );
  			QueuedDMA._u16 &= ~(1 << channel); //Clear any queued DMA requests for this channel
 diff --git a/pcsx2/GS/Renderers/Common/GSRenderer.cpp b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
-index 7340c32..bf28a8b 100644
+index 7340c3205b..bf28a8bee2 100644
 --- a/pcsx2/GS/Renderers/Common/GSRenderer.cpp
 +++ b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
 @@ -1240,6 +1240,14 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
@@ -343,7 +345,7 @@ index 7340c32..bf28a8b 100644
  
  			// MetalFX spatial upscale runs before CAS/present, and only when actually upscaling
 diff --git a/pcsx2/GS/Renderers/OpenGL/GLContextEGL.cpp b/pcsx2/GS/Renderers/OpenGL/GLContextEGL.cpp
-index 303d7ff..be6ebe6 100644
+index 303d7ffb9f..be6ebe6a4a 100644
 --- a/pcsx2/GS/Renderers/OpenGL/GLContextEGL.cpp
 +++ b/pcsx2/GS/Renderers/OpenGL/GLContextEGL.cpp
 @@ -41,8 +41,18 @@ static bool TryLoadEGLFromOverride(Error* error)
@@ -389,7 +391,7 @@ index 303d7ff..be6ebe6 100644
  	{
  		Error::SetStringView(error, "Loading GLAD EGL functions failed");
 diff --git a/pcsx2/GS/Renderers/OpenGL/GLLibretro.cpp b/pcsx2/GS/Renderers/OpenGL/GLLibretro.cpp
-index 532ccf7..f7dd474 100644
+index 532ccf7802..f7dd474037 100644
 --- a/pcsx2/GS/Renderers/OpenGL/GLLibretro.cpp
 +++ b/pcsx2/GS/Renderers/OpenGL/GLLibretro.cpp
 @@ -16,6 +16,10 @@
@@ -454,7 +456,7 @@ index 532ccf7..f7dd474 100644
  		s_pacing = enabled;
  		if (!enabled)
 diff --git a/pcsx2/GS/Renderers/OpenGL/GLLibretro.h b/pcsx2/GS/Renderers/OpenGL/GLLibretro.h
-index 0981d06..710a316 100644
+index 0981d06a14..710a31629c 100644
 --- a/pcsx2/GS/Renderers/OpenGL/GLLibretro.h
 +++ b/pcsx2/GS/Renderers/OpenGL/GLLibretro.h
 @@ -103,6 +103,7 @@ namespace GLLibretro
@@ -466,7 +468,7 @@ index 0981d06..710a316 100644
  	bool HasFrame();                     // same, without consuming it
  
 diff --git a/pcsx2/GS/Renderers/OpenGL/GSDeviceOGL.cpp b/pcsx2/GS/Renderers/OpenGL/GSDeviceOGL.cpp
-index 6e853f4..7b53f1b 100644
+index 6e853f423b..7b53f1b1bf 100644
 --- a/pcsx2/GS/Renderers/OpenGL/GSDeviceOGL.cpp
 +++ b/pcsx2/GS/Renderers/OpenGL/GSDeviceOGL.cpp
 @@ -4064,6 +4064,26 @@ void GSDeviceOGL::SetupPipeline(const ProgramSelector& psel)
@@ -497,7 +499,7 @@ index 6e853f4..7b53f1b 100644
  	m_shader_cache.GetProgram(&prog, vs, ps);
  	it = m_programs.emplace(psel, std::move(prog)).first;
 diff --git a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
-index ed78b9c..cfdf58b 100644
+index ed78b9c38e..cfdf58bb80 100644
 --- a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
 +++ b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
 @@ -3795,12 +3795,17 @@ bool GSDeviceVK::CreateDeviceAndSwapChain()
@@ -519,7 +521,7 @@ index ed78b9c..cfdf58b 100644
  
  	// Libretro context sharing: the VkInstance comes from the frontend's
 diff --git a/pcsx2/GS/Renderers/Vulkan/VKLibretro.cpp b/pcsx2/GS/Renderers/Vulkan/VKLibretro.cpp
-index 5bba9b2..7d8f661 100644
+index 5bba9b2520..7d8f661dfb 100644
 --- a/pcsx2/GS/Renderers/Vulkan/VKLibretro.cpp
 +++ b/pcsx2/GS/Renderers/Vulkan/VKLibretro.cpp
 @@ -10,6 +10,10 @@
@@ -577,7 +579,7 @@ index 5bba9b2..7d8f661 100644
  		s_pacing = enabled;
  		if (!enabled)
 diff --git a/pcsx2/GameDatabase.cpp b/pcsx2/GameDatabase.cpp
-index 1bac5a4..869c72d 100644
+index 1bac5a4b58..869c72d0dd 100644
 --- a/pcsx2/GameDatabase.cpp
 +++ b/pcsx2/GameDatabase.cpp
 @@ -889,6 +889,9 @@ bool GameDatabaseSchema::GameEntry::configMatchesHWFix(const Pcsx2Config::GSOpti
@@ -639,7 +641,7 @@ index 1bac5a4..869c72d 100644
  				if (quiet || AutoTune::IsApplyingSettings())
  					break;
 diff --git a/pcsx2/Host.cpp b/pcsx2/Host.cpp
-index a804bee..6318a67 100644
+index a804bee024..6318a6772e 100644
 --- a/pcsx2/Host.cpp
 +++ b/pcsx2/Host.cpp
 @@ -425,6 +425,13 @@ SettingsInterface* Host::Internal::GetAutoTuneSettingsLayer()
@@ -657,7 +659,7 @@ index a804bee..6318a67 100644
  {
  	pxAssertRel(s_layered_settings_interface.GetLayer(LayeredSettingsInterface::LAYER_BASE) == nullptr,
 diff --git a/pcsx2/Host.h b/pcsx2/Host.h
-index edf0c78..592cdfe 100644
+index edf0c786f9..592cdfe969 100644
 --- a/pcsx2/Host.h
 +++ b/pcsx2/Host.h
 @@ -185,6 +185,7 @@ namespace Host
@@ -669,7 +671,7 @@ index edf0c78..592cdfe 100644
  		/// Sets the secrets settings layer. Should follow call to SetBaseSettingsLayer.
  		void SetSecretsSettingsLayer(SettingsInterface* sif);
 diff --git a/pcsx2/Hw.cpp b/pcsx2/Hw.cpp
-index 76d55ed..93d65ad 100644
+index 76d55ed399..93d65ad62d 100644
 --- a/pcsx2/Hw.cpp
 +++ b/pcsx2/Hw.cpp
 @@ -149,6 +149,7 @@ __ri bool hwMFIFOWrite(u32 addr, const u128* data, uint qwc)
@@ -681,7 +683,7 @@ index 76d55ed..93d65ad 100644
  	else
  	{
 diff --git a/pcsx2/HwRead.cpp b/pcsx2/HwRead.cpp
-index 08827cd..8759592 100644
+index 08827cd0d3..8759592f66 100644
 --- a/pcsx2/HwRead.cpp
 +++ b/pcsx2/HwRead.cpp
 @@ -8,6 +8,7 @@
@@ -734,7 +736,7 @@ index 08827cd..8759592 100644
  }
  
 diff --git a/pcsx2/HwWrite.cpp b/pcsx2/HwWrite.cpp
-index 11dfcaf..9fd7062 100644
+index 11dfcaf785..9fd706201c 100644
 --- a/pcsx2/HwWrite.cpp
 +++ b/pcsx2/HwWrite.cpp
 @@ -6,6 +6,7 @@
@@ -793,7 +795,7 @@ index 11dfcaf..9fd7062 100644
  					DevCon.Warning("Write  SBUS_F260  %x ", psHu32(SBUS_F260));
  #endif
 diff --git a/pcsx2/IPU/IPUdma.cpp b/pcsx2/IPU/IPUdma.cpp
-index 1c508c7..b4ed7b2 100644
+index 1c508c7f7d..b4ed7b249b 100644
 --- a/pcsx2/IPU/IPUdma.cpp
 +++ b/pcsx2/IPU/IPUdma.cpp
 @@ -177,6 +177,7 @@ void IPU0dma()
@@ -805,7 +807,7 @@ index 1c508c7..b4ed7b2 100644
  	ipu0ch.madr += readsize << 4;
  	ipu0ch.qwc -= readsize;
 diff --git a/pcsx2/Interpreter.cpp b/pcsx2/Interpreter.cpp
-index 8f13eea..38486c3 100644
+index 8f13eea5e2..38486c3ea1 100644
 --- a/pcsx2/Interpreter.cpp
 +++ b/pcsx2/Interpreter.cpp
 @@ -1,6 +1,7 @@
@@ -825,7 +827,7 @@ index 8f13eea..38486c3 100644
  			}
  		}
 diff --git a/pcsx2/IopThread/EeBridge.h b/pcsx2/IopThread/EeBridge.h
-index 74744db..57e3822 100644
+index 74744dbb46..57e3822f87 100644
 --- a/pcsx2/IopThread/EeBridge.h
 +++ b/pcsx2/IopThread/EeBridge.h
 @@ -1,24 +1,17 @@
@@ -993,7 +995,7 @@ index 74744db..57e3822 100644
  	__forceinline_odr void SetPadVibration(u32 pad_index, float large_or_single_motor_intensity, float small_motor_intensity)
  	{
 diff --git a/pcsx2/IopThread/IopBridge.h b/pcsx2/IopThread/IopBridge.h
-index 16eb97a..a6de79f 100644
+index 16eb97a562..a6de79f8cc 100644
 --- a/pcsx2/IopThread/IopBridge.h
 +++ b/pcsx2/IopThread/IopBridge.h
 @@ -9,13 +9,12 @@
@@ -1132,7 +1134,7 @@ index 16eb97a..a6de79f 100644
  	__forceinline_odr u8 MemRead8(u32 mem) { EmuHold hold; return iopMemRead8(mem); }
  	__forceinline_odr u16 MemRead16(u32 mem) { EmuHold hold; return iopMemRead16(mem); }
 diff --git a/pcsx2/IopThread/IopChannels.cpp b/pcsx2/IopThread/IopChannels.cpp
-index 1e96709..321c8de 100644
+index 1e96709030..321c8de1e6 100644
 --- a/pcsx2/IopThread/IopChannels.cpp
 +++ b/pcsx2/IopThread/IopChannels.cpp
 @@ -20,8 +20,7 @@ namespace IopThread
@@ -1146,7 +1148,7 @@ index 1e96709..321c8de 100644
  		return ticket;
  	}
 diff --git a/pcsx2/IopThread/IopChannels.h b/pcsx2/IopThread/IopChannels.h
-index 37981a7..2d3c488 100644
+index 37981a7769..2d3c488283 100644
 --- a/pcsx2/IopThread/IopChannels.h
 +++ b/pcsx2/IopThread/IopChannels.h
 @@ -1,9 +1,7 @@
@@ -1356,7 +1358,7 @@ index 37981a7..2d3c488 100644
  
  	private:
 diff --git a/pcsx2/IopThread/IopPlacement.cpp b/pcsx2/IopThread/IopPlacement.cpp
-index 8d13328..c4cca1c 100644
+index 8d133286c3..c4cca1c54e 100644
 --- a/pcsx2/IopThread/IopPlacement.cpp
 +++ b/pcsx2/IopThread/IopPlacement.cpp
 @@ -58,16 +58,34 @@ IopThread::HostCpuInfo IopThread::MakeHostInfo(bool is_arm64, u32 total_cores, u
@@ -1397,7 +1399,7 @@ index 8d13328..c4cca1c 100644
  {
  	// Rows are {ee_rank, vu_rank, gs_rank}; the row order matches the UI order.
 diff --git a/pcsx2/IopThread/IopPlacement.h b/pcsx2/IopThread/IopPlacement.h
-index 6e12dfe..418bb71 100644
+index 6e12dfeff5..418bb711a6 100644
 --- a/pcsx2/IopThread/IopPlacement.h
 +++ b/pcsx2/IopThread/IopPlacement.h
 @@ -1,16 +1,15 @@
@@ -1502,7 +1504,7 @@ index 6e12dfe..418bb71 100644
  	/// least this far below it. The SD865 (1024 against 871) and the T820 (1024 against 869) qualify; a Dimensity
  	/// 8300 (an X-class core a few percent over three more of its kind) and a part whose top cores are equal do not.
 diff --git a/pcsx2/IopThread/IopThread.cpp b/pcsx2/IopThread/IopThread.cpp
-index 78834b2..d1bd05b 100644
+index 78834b23b5..d1bd05bf5a 100644
 --- a/pcsx2/IopThread/IopThread.cpp
 +++ b/pcsx2/IopThread/IopThread.cpp
 @@ -1,7 +1,7 @@
@@ -2034,7 +2036,7 @@ index 78834b2..d1bd05b 100644
  		s.items_applied = m_items_applied.Get();
  		s.parks = m_parks.Get();
 diff --git a/pcsx2/IopThread/IopThread.h b/pcsx2/IopThread/IopThread.h
-index 5dde561..3e13714 100644
+index 5dde561fa5..3e137148d3 100644
 --- a/pcsx2/IopThread/IopThread.h
 +++ b/pcsx2/IopThread/IopThread.h
 @@ -1,10 +1,9 @@
@@ -2712,7 +2714,7 @@ index 5dde561..3e13714 100644
  	/// The outermost hold publishes the EE's cycle, asks the IOP to run up to it, waits until it
  	/// has, and the IOP then stays still until the hold ends. Holds taken while one is live, or
 diff --git a/pcsx2/IopThread/IopThreadMode.cpp b/pcsx2/IopThread/IopThreadMode.cpp
-index d1bf597..179e679 100644
+index d1bf5976ea..179e67973b 100644
 --- a/pcsx2/IopThread/IopThreadMode.cpp
 +++ b/pcsx2/IopThread/IopThreadMode.cpp
 @@ -31,6 +31,18 @@ s32 IopThread::ClampLag(s32 requested)
@@ -2770,7 +2772,7 @@ index d1bf597..179e679 100644
  
  	return IopThreadMode::Threaded;
 diff --git a/pcsx2/IopThread/IopThreadMode.h b/pcsx2/IopThread/IopThreadMode.h
-index a175b83..6ec5282 100644
+index a175b832f2..6ec5282ed3 100644
 --- a/pcsx2/IopThread/IopThreadMode.h
 +++ b/pcsx2/IopThread/IopThreadMode.h
 @@ -30,48 +30,80 @@ namespace IopThread
@@ -2918,7 +2920,7 @@ index a175b83..6ec5282 100644
  	extern IopThreadMode s_mode __attribute__((visibility("hidden")));
  #else
 diff --git a/pcsx2/IopThread/IopThreadVm.cpp b/pcsx2/IopThread/IopThreadVm.cpp
-index 036a217..7d0b958 100644
+index 036a217de0..7d0b958d9c 100644
 --- a/pcsx2/IopThread/IopThreadVm.cpp
 +++ b/pcsx2/IopThread/IopThreadVm.cpp
 @@ -1,8 +1,10 @@
@@ -3602,7 +3604,7 @@ index 036a217..7d0b958 100644
  
  	std::string OsdStatsLine()
 diff --git a/pcsx2/IopThread/IopThreadVm.h b/pcsx2/IopThread/IopThreadVm.h
-index ac8911f..016419d 100644
+index ac8911f63f..016419ddca 100644
 --- a/pcsx2/IopThread/IopThreadVm.h
 +++ b/pcsx2/IopThread/IopThreadVm.h
 @@ -2,22 +2,22 @@
@@ -3896,7 +3898,7 @@ index ac8911f..016419d 100644
  	/// A marker in Lockstep and with no thread. See ScopedHold for the rules.
  	class VmHold
 diff --git a/pcsx2/IopThread/OwnerAsserts.h b/pcsx2/IopThread/OwnerAsserts.h
-index 7e2fdbd..2e7be14 100644
+index 7e2fdbd14e..2e7be140cb 100644
 --- a/pcsx2/IopThread/OwnerAsserts.h
 +++ b/pcsx2/IopThread/OwnerAsserts.h
 @@ -1,8 +1,8 @@
@@ -3955,7 +3957,7 @@ index 7e2fdbd..2e7be14 100644
  	/// A handler that logs the first violation at each site and goes on, for runs that want the full list.
  	void LogViolation(Side side, const char* where);
 diff --git a/pcsx2/IopThread/SharedWord.h b/pcsx2/IopThread/SharedWord.h
-index 1e72bbd..d0122d6 100644
+index 1e72bbd418..d0122d617a 100644
 --- a/pcsx2/IopThread/SharedWord.h
 +++ b/pcsx2/IopThread/SharedWord.h
 @@ -1,27 +1,24 @@
@@ -4044,7 +4046,7 @@ index 1e72bbd..d0122d6 100644
  		{
  			StoreRelaxed(m_value, static_cast<T>(LoadRelaxed(m_value) & value));
 diff --git a/pcsx2/Memory.cpp b/pcsx2/Memory.cpp
-index 082f367..64d4623 100644
+index 082f367cbc..64d4623b71 100644
 --- a/pcsx2/Memory.cpp
 +++ b/pcsx2/Memory.cpp
 @@ -367,6 +367,18 @@ void SysMemory::Release()
@@ -4067,7 +4069,7 @@ index 082f367..64d4623 100644
  }
  
 diff --git a/pcsx2/Memory.h b/pcsx2/Memory.h
-index 16a24eb..f8ccb4b 100644
+index 16a24ebbdc..f8ccb4bb85 100644
 --- a/pcsx2/Memory.h
 +++ b/pcsx2/Memory.h
 @@ -43,8 +43,13 @@ namespace HostMemoryMap
@@ -4104,7 +4106,7 @@ index 16a24eb..f8ccb4b 100644
  	__fi static u8* GetVTLBAddressMap() { return GetDataPtr(HostMemoryMap::VTLBAddressMapOffset); }
  	__fi static u8* GetVTLBAddressMapEnd() { return GetDataPtr(HostMemoryMap::VTLBAddressMapOffset + HostMemoryMap::VTLBAddressMapSize); }
 diff --git a/pcsx2/Pcsx2Config.cpp b/pcsx2/Pcsx2Config.cpp
-index a58d80c..9e2ca21 100644
+index a58d80c321..9e2ca219d4 100644
 --- a/pcsx2/Pcsx2Config.cpp
 +++ b/pcsx2/Pcsx2Config.cpp
 @@ -436,6 +436,7 @@ void Pcsx2Config::SpeedhackOptions::LoadSave(SettingsWrapper& wrap)
@@ -4116,7 +4118,7 @@ index a58d80c..9e2ca21 100644
  	SettingsWrapBitBool(DynamicEECycleRate);
  	SettingsWrapEntry(DynamicEECycleRateTrace);
 diff --git a/pcsx2/R5900.cpp b/pcsx2/R5900.cpp
-index 48c686a..eb21ef5 100644
+index 48c686a506..eb21ef5bac 100644
 --- a/pcsx2/R5900.cpp
 +++ b/pcsx2/R5900.cpp
 @@ -35,6 +35,8 @@
@@ -4213,7 +4215,7 @@ index 48c686a..eb21ef5 100644
  	{
  		rcntUpdate<M>();
 diff --git a/pcsx2/R5900.h b/pcsx2/R5900.h
-index 3708b20..b98cf7b 100644
+index 3708b20a77..b98cf7bf4a 100644
 --- a/pcsx2/R5900.h
 +++ b/pcsx2/R5900.h
 @@ -530,6 +530,7 @@ void iopRunSliceOnIopThread();
@@ -4225,7 +4227,7 @@ index 3708b20..b98cf7b 100644
  // breakpoint code shared between interpreter and recompiler
  int isMemcheckNeeded(u32 pc);
 diff --git a/pcsx2/SPR.cpp b/pcsx2/SPR.cpp
-index f45f096..b38be12 100644
+index f45f096106..b38be128ee 100644
 --- a/pcsx2/SPR.cpp
 +++ b/pcsx2/SPR.cpp
 @@ -86,6 +86,7 @@ static void memcpy_to_spr(u32 dst, u8* src, size_t size)
@@ -4245,7 +4247,7 @@ index f45f096..b38be12 100644
  
  int  _SPR0chain()
 diff --git a/pcsx2/Sif.h b/pcsx2/Sif.h
-index a3e969b..d48a534 100644
+index a3e969bab0..d48a53404d 100644
 --- a/pcsx2/Sif.h
 +++ b/pcsx2/Sif.h
 @@ -183,6 +183,12 @@ extern void SIF2Dma();
@@ -4262,7 +4264,7 @@ index a3e969b..d48a534 100644
  
  extern void EEsif0Interrupt();
 diff --git a/pcsx2/Sif0.cpp b/pcsx2/Sif0.cpp
-index 2f4b195..3163eaf 100644
+index 2f4b19575c..3163eaf14a 100644
 --- a/pcsx2/Sif0.cpp
 +++ b/pcsx2/Sif0.cpp
 @@ -41,6 +41,7 @@ static __fi bool WriteFifoToEE()
@@ -4352,7 +4354,7 @@ index 2f4b195..3163eaf 100644
  
  }
 diff --git a/pcsx2/Sif1.cpp b/pcsx2/Sif1.cpp
-index 6b0f809..8d51551 100644
+index 6b0f80912e..8d515510e9 100644
 --- a/pcsx2/Sif1.cpp
 +++ b/pcsx2/Sif1.cpp
 @@ -67,6 +67,15 @@ static __fi bool WriteFifoToIOP()
@@ -4431,7 +4433,7 @@ index 6b0f809..8d51551 100644
  
  }
 diff --git a/pcsx2/VMManager.cpp b/pcsx2/VMManager.cpp
-index 4d5a8ab..c541dc3 100644
+index 4d5a8ab574..c541dc32c3 100644
 --- a/pcsx2/VMManager.cpp
 +++ b/pcsx2/VMManager.cpp
 @@ -5098,6 +5098,8 @@ u64 VMManager::Internal::GetPerformanceCoreMask()
@@ -4444,7 +4446,7 @@ index 4d5a8ab..c541dc3 100644
  	return 0; // no capacity source: the cores cannot be told apart, so Threaded is not offered
  #endif
 diff --git a/pcsx2/Vif1_Dma.cpp b/pcsx2/Vif1_Dma.cpp
-index c85af24..402e6b2 100644
+index c85af24247..402e6b2f3e 100644
 --- a/pcsx2/Vif1_Dma.cpp
 +++ b/pcsx2/Vif1_Dma.cpp
 @@ -61,6 +61,7 @@ void vif1TransferToMemory()
@@ -4456,7 +4458,7 @@ index c85af24..402e6b2 100644
  
  	//Some games such as Alex Ferguson's Player Manager 2001 reads less than GSLastDownloadSize by VIF then reads the remainder by FIFO
 diff --git a/pcsx2/arm64/BaseblockEx-arm64.h b/pcsx2/arm64/BaseblockEx-arm64.h
-index 8666bdd..e517661 100644
+index 8666bdd61d..e5176613a4 100644
 --- a/pcsx2/arm64/BaseblockEx-arm64.h
 +++ b/pcsx2/arm64/BaseblockEx-arm64.h
 @@ -438,6 +438,8 @@ public:
@@ -4469,7 +4471,7 @@ index 8666bdd..e517661 100644
  #ifdef PCSX2_RECOMPILER_TESTS
  	// Test-only introspection. Returns true iff a link patch site within the
 diff --git a/pcsx2/arm64/RecStubs.cpp b/pcsx2/arm64/RecStubs.cpp
-index 885d69d..03154a8 100644
+index 885d69dbd2..03154a859e 100644
 --- a/pcsx2/arm64/RecStubs.cpp
 +++ b/pcsx2/arm64/RecStubs.cpp
 @@ -116,7 +116,7 @@ void vtlb_DynBackpatchLoadStore(uptr code_address, u32 code_size, u32 guest_pc,
@@ -4491,7 +4493,7 @@ index 885d69d..03154a8 100644
  		armAsm->Add(a64::x0, a64::x8, a64::Operand(a64::w9, a64::UXTW));
  
 diff --git a/pcsx2/arm64/iR5900-arm64.cpp b/pcsx2/arm64/iR5900-arm64.cpp
-index bcd5ff7..ebdee7a 100644
+index bcd5ff70f8..ebdee7af46 100644
 --- a/pcsx2/arm64/iR5900-arm64.cpp
 +++ b/pcsx2/arm64/iR5900-arm64.cpp
 @@ -4,6 +4,11 @@
@@ -4606,7 +4608,7 @@ index bcd5ff7..ebdee7a 100644
 +}
 +#endif
 diff --git a/pcsx2/arm64/recVTLB-arm64.cpp b/pcsx2/arm64/recVTLB-arm64.cpp
-index 9a1a2d1..fad8b1a 100644
+index 9a1a2d1179..fad8b1acbf 100644
 --- a/pcsx2/arm64/recVTLB-arm64.cpp
 +++ b/pcsx2/arm64/recVTLB-arm64.cpp
 @@ -150,13 +150,16 @@ static void vtlbSoftmemWrite(int addr_wreg, int value_reg, u32 bits)
@@ -4646,7 +4648,7 @@ index 9a1a2d1..fad8b1a 100644
  	}
  	// ADDS sets N from bit 63 of ppf; B.mi (=N) branches on the sign bit
 diff --git a/pcsx2/sif2.cpp b/pcsx2/sif2.cpp
-index 37544b2..8e33ccf 100644
+index 37544b2ab1..8e33ccfdb4 100644
 --- a/pcsx2/sif2.cpp
 +++ b/pcsx2/sif2.cpp
 @@ -67,6 +67,7 @@ static __fi bool WriteFifoToEE()
@@ -4658,7 +4660,7 @@ index 37544b2..8e33ccf 100644
  	// Clearing handled by vtlb memory protection and manual blocks.
  	//Cpu->Clear(sif2dma.madr, readSize*4);
 diff --git a/pcsx2/vtlb.cpp b/pcsx2/vtlb.cpp
-index 4e7a662..20dd77b 100644
+index 4e7a662d40..20dd77b0e1 100644
 --- a/pcsx2/vtlb.cpp
 +++ b/pcsx2/vtlb.cpp
 @@ -40,6 +40,8 @@
@@ -5013,7 +5015,7 @@ index 4e7a662..20dd77b 100644
  		HostSys::MemProtect(eeMem->Main, Ps2MemSize::ExposedRam, PageAccess_ReadWrite());
  	vtlb_UpdateFastmemProtection(0, Ps2MemSize::ExposedRam, PageAccess_ReadWrite());
 diff --git a/pcsx2/vtlb.h b/pcsx2/vtlb.h
-index c91db07..7fa078a 100644
+index c91db07ca1..7fa078aa6d 100644
 --- a/pcsx2/vtlb.h
 +++ b/pcsx2/vtlb.h
 @@ -125,6 +125,13 @@ extern int vtlb_memSafeCmpBytes(u32 mem, const void* src, u32 size);
@@ -5047,7 +5049,7 @@ index c91db07..7fa078a 100644
  			fastmem_base = 0;
  		}
 diff --git a/switch/app/HorizonThreadWrap.cpp b/switch/app/HorizonThreadWrap.cpp
-index e3485bc..056c509 100644
+index e3485bce68..056c50988c 100644
 --- a/switch/app/HorizonThreadWrap.cpp
 +++ b/switch/app/HorizonThreadWrap.cpp
 @@ -158,6 +158,15 @@ int HorizonThreadWrap::ReleaseLiveThreads(const char* when, bool stop_running)
@@ -5067,7 +5069,7 @@ index e3485bc..056c509 100644
  {
  	ThreadStart* const ts = new (std::nothrow) ThreadStart{start, arg, {}};
 diff --git a/switch/app/HorizonThreadWrap.h b/switch/app/HorizonThreadWrap.h
-index 439b788..620e0c0 100644
+index 439b788b5b..620e0c0dd5 100644
 --- a/switch/app/HorizonThreadWrap.h
 +++ b/switch/app/HorizonThreadWrap.h
 @@ -3,6 +3,7 @@
@@ -5087,7 +5089,7 @@ index 439b788..620e0c0 100644
  } // namespace HorizonThreadWrap
 diff --git a/pcsx2/IopThread/IopLagControl.cpp b/pcsx2/IopThread/IopLagControl.cpp
 new file mode 100644
-index 0000000..5239361
+index 0000000000..523936139f
 --- /dev/null
 +++ b/pcsx2/IopThread/IopLagControl.cpp
 @@ -0,0 +1,262 @@
@@ -5355,7 +5357,7 @@ index 0000000..5239361
 +} // namespace IopThread
 diff --git a/pcsx2/IopThread/IopLagControl.h b/pcsx2/IopThread/IopLagControl.h
 new file mode 100644
-index 0000000..adaa27c
+index 0000000000..adaa27c727
 --- /dev/null
 +++ b/pcsx2/IopThread/IopLagControl.h
 @@ -0,0 +1,206 @@
@@ -5567,7 +5569,7 @@ index 0000000..adaa27c
 +} // namespace IopThread
 diff --git a/pcsx2/IopThread/IopLagRules.cpp b/pcsx2/IopThread/IopLagRules.cpp
 new file mode 100644
-index 0000000..d00e2bd
+index 0000000000..d00e2bdbe0
 --- /dev/null
 +++ b/pcsx2/IopThread/IopLagRules.cpp
 @@ -0,0 +1,163 @@
@@ -5736,7 +5738,7 @@ index 0000000..d00e2bd
 +} // namespace IopThread
 diff --git a/pcsx2/IopThread/IopLagRules.h b/pcsx2/IopThread/IopLagRules.h
 new file mode 100644
-index 0000000..e62f350
+index 0000000000..e62f35076c
 --- /dev/null
 +++ b/pcsx2/IopThread/IopLagRules.h
 @@ -0,0 +1,256 @@

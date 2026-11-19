@@ -1,4 +1,4 @@
-// SW2PS2: the LRPS2 libretro core behind a small C API (bridge_lrps2.cpp is
+// SW2PS2: the OunceSX2 libretro core behind a small C API (bridge_core.cpp is
 // the libretro "frontend" side: environment, video, audio and input callbacks).
 #pragma once
 #include <stdint.h>

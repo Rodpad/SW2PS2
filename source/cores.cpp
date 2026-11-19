@@ -1,4 +1,4 @@
-// SW2PS2: LRPS2 adapter (core table) for the front end.
+// SW2PS2: the core adapter (core table) for the front end.
 #include "core.h"
 
 #include <dirent.h>
@@ -8,7 +8,7 @@
 #include <vector>
 
 #include "uigfx.h"
-#include "../native/bridge_lrps2.h"
+#include "../native/bridge_core.h"
 
 const char* core_rom_name = "";
 Ps2Input ps2Input[2];
@@ -26,8 +26,8 @@ void ps2core_setup(const char* dir, void (*log)(const char*)) {
   ps2_init((dataDir + "/system").c_str(), (dataDir + "/saves").c_str(), coreLog);
 }
 void ps2core_option(const char* key, const char* value) { ps2_set_option(key, value); }
-bool ps2core_find_bios(char* name, int size) {
-  std::string dir = dataDir + "/system/pcsx2/bios", best;
+bool ps2core_find_bios(const char* biosDir, char* name, int size) {
+  std::string dir = biosDir, best;
   if (DIR* d = opendir(dir.c_str())) {
     while (dirent* e = readdir(d)) {
       struct stat st; std::string p = dir + "/" + e->d_name;
@@ -133,11 +133,7 @@ static int setCheats(const char**, int) { return 0; }
 static int cheatValid(const char*) { return 0; }
 
 const CoreApi PS2_CORE = {
-#ifdef SW2_ARMSX2
-    "ARMSX2", ".armsx2",  // its states are a different format: kept apart from LRPS2's
-#else
-    "LRPS2", "",
-#endif
+    "ARMSX2", ".armsx2",  // (state files carry the tag: the earlier LRPS2 core's were another format)
     romAlloc, unload, load, noop, reset, noop, frame,
     setAudio, setAudioRatio, audioTake, audioData, audioReset, setAudioDiscard,
     video, videoPitch, width, height,

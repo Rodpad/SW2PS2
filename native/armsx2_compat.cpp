@@ -1,9 +1,8 @@
-// SW2PS2: when SW2PS2 is built on the ARMSX2 core (make CORE_KIND=armsx2), the LRPS2-specific
-// switches and diagnostics the bridge and front end refer to, as harmless defaults.
+// SW2PS2: glue between the front end and the OunceSX2 (ARMSX2) core: SW2PS2's switches the core
+// reads, diagnostics the front end shows, and Horizon helpers (exit clean-up, crash watch).
 #include <stddef.h>
 #include <stdint.h>
 extern "C" {
-int lrps2_eager_gate = 1, sw2_fast_fpu = 0, sw2_ipu_batch = 0, sw2_direct_ram = 0;
 volatile unsigned sw2_prof_region = 0;
 unsigned long long sw2_gs_stats[16];
 unsigned long long sw2_int_bits[33];
@@ -164,6 +163,7 @@ extern "C" void sw2ax_classify_batch(const unsigned long long* pcs, unsigned* ou
 #ifdef SW2_ARMSX2
 int sw2_gs_back = 0;
 int sw2_audio_stretch = 1;  // SPU2 time-stretching (PCSX2 default on)
+char sw2_bios_dir[512] = "";  // the BIOS folder ("/bios/ps2"), set by the front end before each game
 int sw2_vuaot = 0;  // the core's VU background compiler (vu-aot live tier): off -- a second game in the same session crashed after a state load with it on (2026-11-19), and it gained nothing measurable
 int sw2_iop_lag = 98304;  // IOP thread lag bound in EE cycles: one frame let replies land late at boot, 24576 stalled FFX
 int sw2_db_effects = 1;

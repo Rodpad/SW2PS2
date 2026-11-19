@@ -1,5 +1,5 @@
 // SW2PS2 for hbmenu (Switch 2 homebrew, kaiHEN): PlayStation 2 emulator front end
-// (the SW2NES/SW2SNES front end on the LRPS2 core).
+// (the SW2NES/SW2SNES front end on the OunceSX2 core).
 // A port of the CivHomebrew app (app/sw2nes.js): the same screens, settings,
 // save formats and defaults, drawn with OpenGL ES at 1920x1080.
 #include <deque>
@@ -46,6 +46,9 @@ using gfx::Color;
 // RetroArch users and frontends use); any folder can be chosen in Settings.
 static const char* DEFAULT_ROM_DIR = "sdmc:/roms/ps2";
 static std::string romDir = DEFAULT_ROM_DIR;
+static const char* DEFAULT_BIOS_DIR = "sdmc:/bios/ps2";
+static std::string biosDir = DEFAULT_BIOS_DIR;  // where the PS2 BIOS dump is (Settings -> BIOS folder)
+static bool pickForBios = false;  // the folder picker is choosing the BIOS folder, not the ROM folder
 static const char* DATA_DIR = "sdmc:/switch/sw2ps2";
 static double NES_RATE = 59.94;  // the running game's frame rate (59.94 NTSC, 50 PAL)
 // Npad button bits (the same values the JS app uses).
@@ -258,7 +261,7 @@ struct GameVals { int aspect, scale, crop, crt, palette, faces[NFACE], faces2p[N
 struct Cheat { string code, desc; bool on; };
 struct Patch { long offset; uint8_t orig; };
 struct Running {
-  string name, base;
+  string name, base, stateBase, settingsBase;  // base: <data>/<game> (cheats, saves); states and per-game settings in their own folders
   bool battery = false, perGame = false;
   uint32_t sramHash = 0;
   double sramCheck = 0;
@@ -286,6 +289,7 @@ static double autoTestEnd = 0, autoWaitSince = 0, autoPollAt = 0;
 static vector<std::pair<string, string>> autoOptions;  // extra core options for the current test run
 static string autoLabel;
 static std::deque<std::pair<double, int>> autoLiveRes;  // "liveRes": [[seconds, resolution index], ...]: change resolution mid-game, as from the menu
+static double autoSaveAt = -1; static int autoSaveSlot = 4;  // "saveState": [seconds, slot]: save a state (tests the states folder)
 static double autoMenuOpenAt = -1;  // "menuOpen": seconds: open the in-game menu and leave it open (for screenshots)
 static double autoEarlyLoadAt = -1; static int autoEarlyLoadSlot = 1;  // "earlyLoad": [seconds, slot]: Load state straight after boot, no menu
 static double autoMenuLoadAt = -1; static int autoMenuLoadSlot = 1, autoMenuLoadStage = 0;  // "menuLoad": [seconds, slot]: open the menu, then Load state from it
@@ -401,7 +405,7 @@ static Json settingsJson(const GameVals& g) {
   j.set("volume", Json::number(g.volume)); j.set("filter", Json::number(g.filter));
   j.set("corner", Json::number(g.corner)); j.set("cornerSoft", Json::number(g.cornerSoft)); j.set("vignette", Json::number(g.vignette)); j.set("vignetteSize", Json::number(g.vignetteSize)); j.set("curvature", Json::number(g.curve)); j.set("shader", Json::number(g.shader)); j.set("signal", Json::number(g.signal)); j.set("boost", Json::number(g.boost));
   j.set("recent", strings(recentGames)); j.set("favourites", strings(favourites)); j.set("widescreen", strings(widescreenGames));
-  j.set("romDir", Json::string(romDir));
+  j.set("romDir", Json::string(romDir)); j.set("biosDir", Json::string(biosDir));
   j.set("advanced", Json::boolean(showAdvanced));
   j.set("runAhead", Json::number(runAhead)); j.set("frameDelay", Json::number(frameDelay)); j.set("audioBuffer", Json::number(audioBuffer));
   j.set("display", Json::number(displayMode)); j.set("rewind", Json::boolean(rewindOn)); j.set("ffMode", Json::number(ffMode)); j.set("ffSpeed", Json::number(ffSpeed));
@@ -415,7 +419,7 @@ static Json settingsJson(const GameVals& g) {
 static void saveSettings() {
   if (autoTest) return;  // a test run leaves the settings file alone
   GameVals g = running && running->perGame ? running->globalVals : gameValues();
-  if (running && running->perGame && !writeText(running->base + ".settings.json", gameJson(gameValues()).dump())) record("Game settings save failed");
+  if (running && running->perGame && !writeText(running->settingsBase + ".settings.json", gameJson(gameValues()).dump())) record("Game settings save failed");
   if (!writeText(SETTINGS(), settingsJson(g).dump())) record("Settings save failed");
 }
 static void applySettingsJson(const Json& v) {
@@ -435,6 +439,7 @@ static void applySettingsJson(const Json& v) {
   statsLevel = pick(v.get("statsLevel"), STATS_LEVELS.size(), statsLevel);
   if (const Json* b = v.get("advanced")) if (b->isBool()) showAdvanced = b->b;
   if (const Json* r = v.get("romDir")) if (r->isStr() && !r->s.empty()) romDir = r->s;
+  if (const Json* r = v.get("biosDir")) if (r->isStr() && !r->s.empty()) biosDir = r->s;
   runAhead = pick(v.get("runAhead"), RUN_AHEADS.size(), runAhead); frameDelay = pick(v.get("frameDelay"), FRAME_DELAYS.size(), frameDelay);
   audioBuffer = pick(v.get("audioBuffer"), AUDIO_BUFFERS.size(), audioBuffer); displayMode = pick(v.get("display"), DISPLAY_MODES.size(), displayMode);
   ffMode = pick(v.get("ffMode"), FF_MODES.size(), ffMode); ffSpeed = pick(v.get("ffSpeed"), FF_SPEEDS.size(), ffSpeed);
@@ -759,8 +764,8 @@ static void saveSram(bool force) {
   writeSram(h);
 }
 // Save states: <game>.state (slot 1), <game>.state2..4.
-static string statePath(int n) { return running->base + C->stateTag + (n == 1 ? ".state" : ".state" + std::to_string(n)); }
-static string slotsPath() { return running->base + C->stateTag + ".slots.json"; }
+static string statePath(int n) { return running->stateBase + C->stateTag + (n == 1 ? ".state" : ".state" + std::to_string(n)); }
+static string slotsPath() { return running->stateBase + C->stateTag + ".slots.json"; }
 static double slotTime(int n) { const Json* t = running ? running->slots.get(std::to_string(n)) : nullptr; return t && t->isNum() ? t->n : 0; }
 static string slotLabel(int n) {
   double t = slotTime(n);
@@ -908,6 +913,7 @@ static u32 clkNormalHz = 0;
 static u32 gpuPrevHz = 0;  // CPU rate at startup, before any boost: what quitting a game restores
 extern "C" __attribute__((weak)) void sw2ax_crash_watch(int);
 extern int sw2_vuaot __attribute__((weak));
+extern char sw2_bios_dir[512] __attribute__((weak));
 static bool memClockMax = false;
 static int memClockMhz = 0, gpuClockMhz = 0;  // test: exact rates  // test: the memory clock at its highest rate too
 static u32 emcPrevHz = 0;
@@ -989,10 +995,12 @@ static void startGame(const Rom& rom) {
   static string romPath;
   romPath = rom.dir + "/" + rom.name;
   char bios[256];
-  if (!ps2core_find_bios(bios, sizeof bios)) {
-    showMessage("No PS2 BIOS found.\n\nCopy the BIOS dump from your own PS2 to\n\n    /switch/sw2ps2/system/pcsx2/bios/\n\non the SD card, then start the game again.", [] { mode = "browser"; });
+  if (!ps2core_find_bios(biosDir.c_str(), bios, sizeof bios)) {
+    const string shown = biosDir.rfind("sdmc:", 0) == 0 ? biosDir.substr(5) : biosDir;
+    showMessage("No PS2 BIOS found.\n\nCopy the BIOS dump from your own PS2 to\n\n    " + shown + "/\n\non the SD card (or choose another folder in Settings -> App -> BIOS folder),\nthen start the game again.", [] { mode = "browser"; });
     return;
   }
+  if (&sw2_bios_dir) snprintf(sw2_bios_dir, 512, "%s", biosDir.rfind("sdmc:", 0) == 0 ? biosDir.c_str() + 5 : biosDir.c_str());  // the core wants "/bios/ps2"
 #ifdef SW2_VK
   bool gpu = ps2Renderer == 2;  // OpenGL
   const bool vulkan = ps2Renderer == 0;  // the core renders with Vulkan; vkpresent brings its frames to the GL picture
@@ -1017,7 +1025,6 @@ static void startGame(const Rom& rom) {
   tuneQuietUntil = nowMs() + 12000; slowNoticeShown = false; tuneWin.clear();
   ps2core_option("pcsx2_ee_cycle_rate", EE_SPEED_VALUES[rate]);
   ps2core_option("pcsx2_ee_cycle_skip", CYCLE_SKIP_VALUES[skip]);
-  ps2core_option("sw2_fast_fpu", ps2Fpu == 0 ? "enabled" : "disabled");
   { bool fast;
     auto rb = gameReadback.find(rom.name);
     if (autoReadback >= 0) fast = autoReadback == 1;
@@ -1025,7 +1032,6 @@ static void startGame(const Rom& rom) {
     else if (contains(fastReadbackGames, rom.name)) fast = true;
     else { const SpeedDefault* d = speedDefault(rom.name); fast = d && d->fastReadback; }
     ps2core_option("pcsx2_hw_download_mode", fast ? "Unsynchronized" : "Accurate"); }
-  ps2core_option("sw2_ipu_batch", "enabled");  // fewer event tests while the IPU decodes (God of War II +5%); same picture in host tests
   ps2core_option("pcsx2_widescreen_hint", contains(widescreenGames, rom.name) ? "enabled (16:9)" : "disabled");  // the core's patch, for games without their own widescreen setting
   for (auto& o : autoOptions) ps2core_option(o.first.c_str(), o.second.c_str());
   {  // leak check across game starts
@@ -1076,6 +1082,18 @@ static void startGame(const Rom& rom) {
   running = new Running();
   running->name = rom.name;
   running->base = string(DATA_DIR) + "/" + sanitize(rom.name);
+  running->stateBase = string(DATA_DIR) + "/states/" + sanitize(rom.name);
+  running->settingsBase = string(DATA_DIR) + "/settings/" + sanitize(rom.name);
+  {  // states and per-game settings once sat beside everything else in <data>: move them to their folders
+    mkdir((string(DATA_DIR) + "/states").c_str(), 0777); mkdir((string(DATA_DIR) + "/settings").c_str(), 0777);
+    auto move = [](const string& from, const string& to) { if (exists(from) && !exists(to) && rename(from.c_str(), to.c_str()) == 0) record("moved %s -> %s", from.c_str(), to.c_str()); };
+    for (int n = 1; n <= SLOT_COUNT; n++) {
+      const string suf = C->stateTag + string(n == 1 ? ".state" : ".state" + std::to_string(n));
+      move(running->base + suf, running->stateBase + suf);
+    }
+    move(running->base + C->stateTag + ".slots.json", running->stateBase + C->stateTag + ".slots.json");
+    move(running->base + ".settings.json", running->settingsBase + ".settings.json");
+  }
   running->battery = C->has_battery() != 0;
   if (running->battery) {
     vector<uint8_t> s;
@@ -1093,7 +1111,7 @@ static void startGame(const Rom& rom) {
   if (readText(slotsPath(), t) && Json::parse(t, j) && j.type == Json::OBJ) running->slots = j;
   stateSlot = autoLoadState ? newestSlot() : 1;
   running->globalVals = gameValues(); running->perGame = false;
-  if (readText(running->base + ".settings.json", t) && Json::parse(t, j) && j.type == Json::OBJ) { setGameValuesJson(j); running->perGame = true; }
+  if (readText(running->settingsBase + ".settings.json", t) && Json::parse(t, j) && j.type == Json::OBJ) { setGameValuesJson(j); running->perGame = true; }
   recentGames.erase(std::remove(recentGames.begin(), recentGames.end(), rom.name), recentGames.end());
   recentGames.insert(recentGames.begin(), rom.name);
   if ((int)recentGames.size() > RECENT_MAX) recentGames.resize(RECENT_MAX);
@@ -1211,7 +1229,7 @@ static void pictureChanged() { fitPicture(); applyCrt(); saveSettings(); }
 static void setPerGame(bool on) {
   if (on == running->perGame) return;
   if (on) { running->perGame = true; saveSettings(); showToast("Settings saved for this game"); }
-  else { running->perGame = false; remove((running->base + ".settings.json").c_str()); setGameValues(running->globalVals); showToast("Using settings for all games"); }
+  else { running->perGame = false; remove((running->settingsBase + ".settings.json").c_str()); setGameValues(running->globalVals); showToast("Using settings for all games"); }
 }
 static int crtChoiceIndex() { for (size_t i = 0; i < CRT_CHOICES.size(); i++) if (CRT_CHOICES[i] == crtStyle) return (int)i; return 0; }
 static vector<string> crtChoiceNames() { vector<string> v; for (int id : CRT_CHOICES) v.push_back(CRT_STYLES[id]); return v; }
@@ -1369,9 +1387,11 @@ static void pickLoad(const string& path) {
 static bool pickAtRoot() { return pickPath == "sdmc:/" || pickPath == "sdmc:"; }
 // Rows: "Use this folder", then ".." (unless at the root), then subfolders.
 static int pickRows() { return 1 + (pickAtRoot() ? 0 : 1) + (int)pickDirs.size(); }
-static void openFolderPicker() {
+static void openFolderPicker(bool bios = false) {
   struct stat st;
-  pickLoad(stat(romDir.c_str(), &st) == 0 ? romDir : "sdmc:/");
+  pickForBios = bios;
+  const string& start = bios ? biosDir : romDir;
+  pickLoad(stat(start.c_str(), &st) == 0 ? start : "sdmc:/");
   mode = "folders";
 }
 
@@ -1381,6 +1401,7 @@ struct SettingItem { string label; std::function<vector<string>()> choices; std:
 static vector<SettingItem> settingsItems() {
   return {
       {"ROM folder", [] { return vector<string>{romDir.rfind("sdmc:", 0) == 0 ? romDir.substr(5) : romDir}; }, [] { return 0; }, [](int) { openFolderPicker(); }},
+      {"BIOS folder", [] { return vector<string>{biosDir.rfind("sdmc:", 0) == 0 ? biosDir.substr(5) : biosDir}; }, [] { return 0; }, [](int) { openFolderPicker(true); }},
       {"Resolution (next start)", [] { return RESOLUTIONS; }, [] { return ps2Resolution; }, [](int v) { ps2Resolution = v; }},
       {"Emulated CPU speed (next start)", [] { return EE_SPEEDS; }, [] { return ps2EeSpeed; }, [](int v) { ps2EeSpeed = v; }},
       {"Emulated CPU cycle skip (next start)", [] { return CYCLE_SKIPS; }, [] { return ps2CycleSkip; }, [](int v) { ps2CycleSkip = v; }},
@@ -1620,7 +1641,7 @@ static void drawFolderPicker() {
   float x = (gfx::UI_W - winW) / 2, y = roundf((gfx::UI_H - winH) / 2);
   gfx::rect(x, y, winW, winH, col(C_PANEL), 14, 1, col(C_LINE));
   float cx = x + padX, cy = y + padY;
-  panelHeader(cx, cy, "ROM folder", "A: open   B: cancel");
+  panelHeader(cx, cy, pickForBios ? "BIOS folder" : "ROM folder", "A: open   B: cancel");
   cy += 34 + 12;
   string shown = pickPath.rfind("sdmc:", 0) == 0 ? pickPath.substr(5) : pickPath;
   if (shown.empty()) shown = "/";
@@ -1922,7 +1943,7 @@ static double coreLoad() {
 extern "C" int sw2_thread_info(int i, unsigned long long* ticks, int* core, void** entry);
 extern "C" int sw2_thread_total(void);
 extern "C" unsigned long long sw2_gs_stats[16];
-// The ARMSX2 core's own counters (native/armsx2_compat.cpp); absent in the LRPS2 build.
+// The ARMSX2 core's own counters (native/armsx2_compat.cpp).
 extern "C" __attribute__((weak)) float sw2ax_fps();
 extern "C" __attribute__((weak)) void sw2ax_register_exit_cleanup();
 extern "C" __attribute__((weak)) void sw2ax_crash_watch(int);
@@ -2324,7 +2345,8 @@ static bool autoStartRun() {
   record("autotest: running (%s)", toastText.c_str());
   autoTestEnd = nowMs() + seconds * 1000; sessionLog = 0;
   autoRunStart = nowMs(); autoShots.clear();
-  autoMenuLoadAt = -1; autoMenuLoadStage = 0; autoLiveRes.clear(); autoEarlyLoadAt = -1; autoMenuOpenAt = -1;
+  autoMenuLoadAt = -1; autoMenuLoadStage = 0; autoLiveRes.clear(); autoEarlyLoadAt = -1; autoMenuOpenAt = -1; autoSaveAt = -1;
+  if (const Json* sv = j->get("saveState")) if (sv->isArr() && sv->a.size() == 2 && sv->a[0].isNum() && sv->a[1].isNum()) { autoSaveAt = sv->a[0].n; autoSaveSlot = (int)sv->a[1].n; }
   if (const Json* mo = j->get("menuOpen")) if (mo->isNum()) autoMenuOpenAt = mo->n;
   if (const Json* el = j->get("earlyLoad")) if (el->isArr() && el->a.size() >= 1 && el->a[0].isNum()) { autoEarlyLoadAt = el->a[0].n; autoEarlyLoadSlot = el->a.size() > 1 && el->a[1].isNum() ? (int)el->a[1].n : 1; }
   if (const Json* lr = j->get("liveRes")) if (lr->isArr()) for (auto& e : lr->a) if (e.isArr() && e.a.size() == 2 && e.a[0].isNum() && e.a[1].isNum()) autoLiveRes.push_back({e.a[0].n, (int)e.a[1].n});
@@ -2442,9 +2464,14 @@ static void handleUi(u64 bits) {
     if (ev.down) pickSel = (pickSel + 1) % total;
     if (pressed & B_A) {
       if (pickSel == 0) {
+        if (pickForBios) {
+          biosDir = pickAtRoot() ? "sdmc:" : pickPath; saveSettings(); mode = "settings";
+          char found[256]; showToast(ps2core_find_bios(biosDir.c_str(), found, sizeof found) ? string("BIOS found: ") + found : string("No BIOS in this folder yet"), 3500);
+        } else {
         romDir = pickAtRoot() ? "sdmc:" : pickPath;
         saveSettings(); scan(); mode = "settings";
         showToast(std::to_string(allRoms.size()) + (allRoms.size() == 1 ? " game in " : " games in ") + (romDir.size() > 5 ? romDir.substr(5) : string("/")));
+        }
       } else if (up && pickSel == 1) pickLoad(parentDir(pickPath));
       else pickLoad((pickAtRoot() ? string("sdmc:") : pickPath) + "/" + pickDirs[pickSel - 1 - up]);
     } else if (pressed & B_B) mode = "settings";
@@ -2520,11 +2547,10 @@ static void handleUi(u64 bits) {
 int main(int argc, char** argv) {
   romfsInit();
   mkdir("sdmc:/switch", 0777); mkdir(DATA_DIR, 0777);
-  // First launch only (no settings file yet): create the default ROM folder.
-  // Later launches leave the SD card alone, so people who keep ROMs elsewhere
-  // (and removed roms/nes) don't get it back.
+  // First launch only (no settings file yet): write the settings. No folders are created: the
+  // game and BIOS folders (default /roms/ps2 and /bios/ps2) are the player's to make.
   bool firstLaunch = !exists(SETTINGS());
-  if (firstLaunch) { mkdir("sdmc:/roms", 0777); mkdir(DEFAULT_ROM_DIR, 0777); saveSettings(); }
+  if (firstLaunch) saveSettings();  // (sdmc:/roms/ps2 is the default game folder but is not created: people make their own)
   {  // a test run restarting the app between games keeps appending to the same log
     const string marker = string(DATA_DIR) + "/autotest.append";
     const bool append = exists(marker);
@@ -2697,6 +2723,9 @@ int main(int argc, char** argv) {
       const double t = (nowMs() - autoRunStart) / 1000.0;
       if (autoMenuLoadStage == 0 && t >= autoMenuLoadAt) { record("autotest: opening the menu at %.1f s", t); openMenu(); autoMenuLoadStage = 1; }
       else if (autoMenuLoadStage == 1 && t >= autoMenuLoadAt + 0.8) { record("autotest: Load state slot %d from the menu at %.1f s", autoMenuLoadSlot, t); stateSlot = autoMenuLoadSlot; closeMenu(); loadState(false, stateSlot); autoMenuLoadStage = 2; }
+    }
+    if (autoTest && !autoWaiting && running && autoSaveAt >= 0 && nowMs() - autoRunStart >= autoSaveAt * 1000) {
+      autoSaveAt = -1; stateSlot = autoSaveSlot; saveState(); record("autotest: saved slot %d to %s", autoSaveSlot, statePath(autoSaveSlot).c_str());
     }
     if (autoTest && !autoWaiting && running && autoMenuOpenAt >= 0 && nowMs() - autoRunStart >= autoMenuOpenAt * 1000) {
       autoMenuOpenAt = -1; menuCat = 0; openMenu(); record("autotest: menu opened");

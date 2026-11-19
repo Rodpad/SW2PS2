@@ -1,4 +1,4 @@
-// SW2PS2: the LRPS2 core (native/bridge_lrps2.cpp, ps2_*) behind the same
+// SW2PS2: the OunceSX2 core (native/bridge_core.cpp, ps2_*) behind the same
 // function table the SW2NES/SW2SNES front end uses, so the front end keeps its
 // structure. See cores.cpp. Run-ahead, rewind and cheats do not exist here
 // (a PS2 state is ~46 MB): their entries report "unavailable".
@@ -50,7 +50,7 @@ bool ps2core_vulkan();                // the loaded game shows through the Vulka
 #endif
 bool ps2core_is_gpu();                 // the last frame is in the GPU target (video() is stale)
 double ps2core_fps();                  // 59.94 (NTSC) or 50 (PAL) for the loaded game
-bool ps2core_find_bios(char* name, int size);  // first BIOS file in <data>/system/pcsx2/bios
+bool ps2core_find_bios(const char* dir, char* name, int size);  // first BIOS file (4-8 MB) in dir
 
 // Rewind history (delta-compressed states; see cores.cpp).
 bool rewind_init(long budgetBytes);

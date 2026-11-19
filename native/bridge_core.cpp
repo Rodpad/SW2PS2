@@ -1,8 +1,8 @@
-// SW2PS2: libretro frontend glue for the LRPS2 core (statically linked).
+// SW2PS2: libretro frontend glue for the OunceSX2 core (statically linked).
 #include <atomic>
 #include <strings.h>
 #include <string>
-#include "bridge_lrps2.h"
+#include "bridge_core.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -193,18 +193,9 @@ int ps2_video_is_gpu(void) { return hwFrame; }
 void ps2_set_vulkan(int on) { vkWanted = on != 0; }
 int ps2_vulkan_active(void) { return vkGranted; }
 #endif
-extern "C" int lrps2_eager_gate;
-extern "C" int sw2_fast_fpu;
-extern "C" int sw2_ipu_batch;
-extern "C" int sw2_direct_ram;
 void ps2_set_option(const char* key, const char* value) {
-  if (!strcmp(key, "sw2_direct_ram")) { sw2_direct_ram = !strcmp(value, "enabled"); return; }
-  if (!strcmp(key, "sw2_ipu_batch")) { sw2_ipu_batch = !strcmp(value, "enabled"); return; }
-  if (!strcmp(key, "sw2_fast_fpu")) { sw2_fast_fpu = !strcmp(value, "enabled"); return; }  // read when blocks compile: set before loading
-  if (!strcmp(key, "sw2_eager_frames")) { lrps2_eager_gate = strcmp(value, "disabled") != 0; return; }  // not a core option: see retro_run
 #ifdef SW2_ARMSX2
-  // The front end's LRPS2 option names, as ARMSX2's.
-  // The front end's LRPS2 option names and values, as ARMSX2's (it ignores the others).
+  // The front end's option names and values ("pcsx2_*", from the earlier core), as the core's (it ignores the others).
   static std::string mapped;
   auto pct = [](const char* v) { std::string t(v); size_t sp = t.find(' '); return sp == std::string::npos ? t : t.substr(0, sp); };  // "75% (Underclock)" -> "75%"
   if (!strcmp(key, "pcsx2_hw_download_mode")) key = "armsx2_hw_download_mode";
@@ -283,7 +274,7 @@ void ps2_unload(void) {
   sw2ax_after_unload();
 #endif
   // Every game starts from the core's defaults plus what the front end sets for it.
-  options.clear(); optionsDirty = true; sw2_fast_fpu = 0; sw2_ipu_batch = 0; sw2_direct_ram = 0; lrps2_eager_gate = 1;
+  options.clear(); optionsDirty = true;
   for (auto& p : rumbleNow) for (auto& m : p) m.store(0);
 }
 int ps2_loaded(void) { return loaded; }
