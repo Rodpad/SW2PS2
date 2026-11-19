@@ -55,7 +55,8 @@ SW2PS2 uses the [OunceSX2](https://github.com/nyathea/OunceSX2) core with its ow
 | `native/` | glue between the front end and the core (libretro bridge, Horizon helpers; two files of OunceSX2's own app compiled in) |
 | `patches/` | SW2PS2's changes to the emulator cores, against the upstream commits in `patches/upstreams.txt` |
 | `romfs/` | fonts (with their licences) and picture shaders |
-| `tools/` | icon generator, speed-list generator, profiling helpers, third-party setup |
+| `icon.png`, `sw2ps2.jpg` | the app icon: the lossless master and the JPEG the build uses (`sw2ps2-test.jpg`: test builds) |
+| `tools/` | speed-list generator, profiling helpers, third-party setup |
 | `tests/` | on-console test runner (`remote_test.sh`) and its log summariser |
 | `probe/` | a small hardware probe app |
 
