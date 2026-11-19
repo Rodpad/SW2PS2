@@ -1262,7 +1262,8 @@ static void applyResolutionLive() {
   record("resolution: %s now %s", running->name.c_str(), RESOLUTIONS[r].c_str());
   showToast("Resolution " + RESOLUTIONS[r], 2000);
 }
-static void openMenu() {
+// The main in-game menu's rows for one category (adv: with the advanced ones).
+static vector<MenuItem> menuItemsFor(int cat, bool adv) {
   vector<MenuItem> items = {
       act("Resume", [] { closeMenu(); }),
       act("Save state", [] { saveState(); closeMenu(); }),
@@ -1319,10 +1320,20 @@ static void openMenu() {
     static const vector<string> PIC = {"Aspect", "Scale", "Overscan", "Signal", "Shader", "Brightness boost", "Curvature", "Corner radius", "Corner softness",
                                        "Vignette", "Vignette size", "Settings for"};
     auto catOf = [](const string& l) { return contains(EMU, l) ? 1 : contains(PIC, l) ? 2 : 0; };
-    for (auto& m : items) if (m.label != "Run-ahead" && m.label != "Cheats..." && (showAdvanced || !contains(ADVANCED_MENU, m.label)) && catOf(m.label) == menuCat) kept.push_back(m);
+    for (auto& m : items) if (m.label != "Run-ahead" && m.label != "Cheats..." && (adv || !contains(ADVANCED_MENU, m.label)) && catOf(m.label) == cat) kept.push_back(m);
     items = kept;
   }
-  showMenuItems(stripNes(running->name), items);
+  return items;
+}
+// The fixed number of rows the tabbed menu is sized for: its largest category with every
+// advanced row shown, so switching category or showing / hiding advanced never resizes it.
+static int menuFixedRows() {
+  static int rows = 0;
+  if (!rows) for (int c = 0; c < (int)MENU_CATS.size(); c++) rows = std::max(rows, (int)menuItemsFor(c, true).size());
+  return rows;
+}
+static void openMenu() {
+  showMenuItems(stripNes(running->name), menuItemsFor(menuCat, showAdvanced));
   menuHasTabs = true;
   mode = "menu";
   saveSram(false);
@@ -1452,19 +1463,31 @@ static int settingsCatOf(const string& label) {
   static const vector<string> SND = {"Volume", "Audio buffer", "Vibration"};
   return contains(EMU, label) ? 0 : contains(PIC, label) ? 1 : contains(SND, label) ? 2 : 3;  // the rest: App
 }
+static vector<SettingItem> settingsFor(int cat, bool adv);
 static void rebuildSettings() {
-  SETTINGS_ITEMS.clear();
-  if (settingsCat == 3) SETTINGS_ITEMS.push_back({"Advanced options", [] { return vector<string>{"Hidden", "Shown"}; }, [] { return showAdvanced ? 1 : 0; },
-                            [](int v) { showAdvanced = v != 0; rebuildSettings(); }});
+  SETTINGS_ITEMS = settingsFor(settingsCat, showAdvanced);
+  if (settingsIndex > (int)SETTINGS_ITEMS.size()) settingsIndex = (int)SETTINGS_ITEMS.size();
+}
+// The fixed number of rows Settings is sized for: its largest category with every advanced row
+// shown, plus Back, so switching category or showing / hiding advanced never resizes it.
+static int settingsFixedRows() {
+  static int rows = 0;
+  if (!rows) for (int c = 0; c < (int)SETTINGS_CATS.size(); c++) rows = std::max(rows, (int)settingsFor(c, true).size() + 1);
+  return rows;
+}
+static vector<SettingItem> settingsFor(int cat, bool adv) {
+  vector<SettingItem> items;
+  if (cat == 3) items.push_back({"Advanced options", [] { return vector<string>{"Hidden", "Shown"}; }, [] { return showAdvanced ? 1 : 0; },
+                                 [](int v) { showAdvanced = v != 0; rebuildSettings(); }});
   // Not on this core: run-ahead, rewind, fast-forward, turbo and button remapping.
   static const vector<string> NOT_HERE = {"Run-ahead", "Rewind (hold ZL)", "Fast-forward", "Fast-forward speed", "Turbo speed", "Button mapping for", "Audio filter",
       "Switch A button", "Switch B button", "Switch X button", "Switch Y button", "Switch L button", "Switch R button"};
   for (auto& it : settingsItems())
-    if (!contains(NOT_HERE, it.label) && (showAdvanced || !contains(ADVANCED_SETTINGS, it.label)) && settingsCatOf(it.label) == settingsCat) SETTINGS_ITEMS.push_back(it);
-  if (showAdvanced && settingsCat == 3)
-    SETTINGS_ITEMS.push_back({"Reset all settings", [] { return vector<string>{"Press A", "Press A again to confirm"}; }, [] { return resetArmed ? 1 : 0; },
-                              [](int v) { if (resetArmed) { resetArmed = false; resetAllSettings(); gfx::setHighRefresh(displayMode == 1); rebuildSettings(); settingsIndex = 0; settingsTop = 0; showToast("All settings reset to defaults"); } else resetArmed = true; }});
-  if (settingsIndex > (int)SETTINGS_ITEMS.size()) settingsIndex = (int)SETTINGS_ITEMS.size();
+    if (!contains(NOT_HERE, it.label) && (adv || !contains(ADVANCED_SETTINGS, it.label)) && settingsCatOf(it.label) == cat) items.push_back(it);
+  if (adv && cat == 3)
+    items.push_back({"Reset all settings", [] { return vector<string>{"Press A", "Press A again to confirm"}; }, [] { return resetArmed ? 1 : 0; },
+                     [](int v) { if (resetArmed) { resetArmed = false; resetAllSettings(); gfx::setHighRefresh(displayMode == 1); rebuildSettings(); settingsIndex = 0; settingsTop = 0; showToast("All settings reset to defaults"); } else resetArmed = true; }});
+  return items;
 }
 
 /* ---------------- Drawing helpers ---------------- */
@@ -1550,17 +1573,17 @@ static void drawBrowser() {
   if (selected < top) top = selected;
   if (selected >= top + VIS) top = selected - VIS + 1;
   if (top > std::max(0, (int)roms.size() - VIS)) top = std::max(0, (int)roms.size() - VIS);
-  bool scroll = (int)roms.size() > VIS;
   string empty;
   if (roms.empty()) {
     if (listView == 1) empty = "No favourites yet.\n\nWhile playing, open the menu (L + R + both stick clicks) and set Favourite to On.";
     else if (listView == 2) empty = "No recently played games yet.";
     else empty = "No games found in\n\n    " + romDir + "\n\nCopy PS2 disc images (.iso, .chd, .cso or .cue with its .bin) there, for example over FTP with OunceShell, then choose Refresh. The folder can be changed in Settings.";
   }
-  float listInnerW = innerW - (scroll ? 16 : 0);
+  float listInnerW = innerW - 16;  // the scrollbar's gutter always kept: the list never changes width
   vector<string> emptyLines = empty.empty() ? vector<string>() : wrap(empty, listInnerW - 32, 17);
-  float listH = roms.empty() ? emptyLines.size() * 17 * 1.45f + 20 + 12 : VIS * ROW_H + 12;
-  float head = roms.empty() ? 0 : LIST_HEAD;
+  // One size whatever the tab or the number of games: as many rows as fit the screen.
+  float listH = maxRows() * ROW_H + 12;
+  float head = LIST_HEAD;
   float winH = padY * 2 + 34 + 12 + 36 + 10 + head + listH + 12 + 40;
   float x = (gfx::UI_W - winW) / 2, y = roundf((gfx::UI_H - winH) / 2);
   gfx::rect(x, y, winW, winH, col(C_PANEL), 14, 1, col(C_LINE));
@@ -1579,8 +1602,8 @@ static void drawBrowser() {
     gfx::text("Time played", colR - hw, cy + 1, 14, col(C_DIM), gfx::BOLD);
     gfx::text("Recent", recC - gfx::textWidth("Recent", 14, gfx::BOLD) / 2, cy + 1, 14, col(C_DIM), gfx::BOLD);
     gfx::text("Favourite", favC - gfx::textWidth("Favourite", 14, gfx::BOLD) / 2, cy + 1, 14, col(C_DIM), gfx::BOLD);
-    cy += head;
   }
+  cy += head;  // (kept with no games too: the window keeps its size)
   // List
   gfx::rect(cx, cy, listInnerW, listH, col(C_BG), 10, 1, col(C_LINE));
   if (roms.empty()) {
@@ -1628,7 +1651,7 @@ static void drawBrowser() {
   gfx::text("v" APP_VERSION, x + winW - padX - gfx::textWidth("v" APP_VERSION, 14), y + padY + 10, 14, col(C_DIM));
 }
 
-static const int SET_ROW_H = 34;
+static const int SET_ROW_H = ROW_H;  // as the game list's rows
 static void drawFolderPicker() {
   const float winW = 960, padX = 20, padY = 18, rowH = 34;
   int total = pickRows();
@@ -1665,14 +1688,14 @@ static void drawFolderPicker() {
   scrollbar(cx + listW + 8, cy, listH, total, vis, pickTop);
 }
 static void drawSettings() {
-  const float winW = 960, padX = 20, padY = 18, innerW = winW - 2 * padX;
+  const float winW = 640, padX = 20, padY = 18, innerW = winW - 2 * padX;
   int n = (int)SETTINGS_ITEMS.size(), total = n + 1;
-  int vis = std::max(5, std::min(total, (int)((gfx::UI_H * 0.9 - 36 - 50 - 14 - 46) / SET_ROW_H)));
+  // One size for every category (the largest, advanced shown); more rows than fit the screen scroll.
+  int vis = std::max(5, std::min(std::max(total, settingsFixedRows()), (int)((gfx::UI_H * 0.9 - 36 - 50 - 14 - 46) / SET_ROW_H)));
   if (settingsIndex >= 0 && settingsIndex < settingsTop) settingsTop = settingsIndex;
   if (settingsIndex < 0) settingsTop = 0;
   if (settingsIndex >= settingsTop + vis) settingsTop = settingsIndex - vis + 1;
-  bool scroll = total > vis;
-  float listW = innerW - (scroll ? 16 : 0), listH = vis * SET_ROW_H + 12;
+  float listW = innerW - 16, listH = vis * SET_ROW_H + 12;  // (scrollbar gutter always kept)
   float winH = padY * 2 + 34 + 12 + 36 + 10 + listH;
   float x = (gfx::UI_W - winW) / 2, y = roundf((gfx::UI_H - winH) / 2);
   gfx::rect(x, y, winW, winH, col(C_PANEL), 14, 1, col(C_LINE));
@@ -1689,10 +1712,10 @@ static void drawSettings() {
     float rx = cx + 6, ry = cy + 6 + k * SET_ROW_H, rw = listW - 12;
     if (active) { gfx::rect(rx, ry, rw, SET_ROW_H, col(C_SEL), 6); gfx::rect(rx, ry, 4, SET_ROW_H, col(C_ACCENT), 2); }
     if (i < n) {
-      textMid(SETTINGS_ITEMS[i].label, rx + 16, ry, SET_ROW_H, 18, col(C_TEXT));
+      textMid(SETTINGS_ITEMS[i].label, rx + 16, ry, SET_ROW_H, 20, col(C_TEXT));
       vector<string> ch = SETTINGS_ITEMS[i].choices();
-      valueBox(ch[SETTINGS_ITEMS[i].get()], rx + rw - 12, ry, SET_ROW_H, 18, active);
-    } else textMid("Back", rx + 16, ry, SET_ROW_H, 18, col(C_TEXT));
+      valueBox(ch[SETTINGS_ITEMS[i].get()], rx + rw - 12, ry, SET_ROW_H, 20, active);
+    } else textMid("Back", rx + 16, ry, SET_ROW_H, 20, col(C_TEXT));
   }
   scrollbar(cx + listW + 8, cy, listH, total, vis, settingsTop);
 }
@@ -1724,35 +1747,39 @@ static void drawGame(bool dim) {
 
 static void drawMenu() {
   if (dimInMenu) gfx::rect(0, 0, gfx::UI_W, gfx::UI_H, gfx::Color{0, 0, 0, 0.6f});
-  const float panelW = menuHasTabs ? 500 : 460, pad = 26, rowH = 21 * LH + 16, gap = 3, headH = 26 * LH + 14;
-  // As many rows as fit in 90% of the screen; the rest scroll.
+  // The game list's and Settings' layout: accent-bar title, tabs, rows of ROW_H in a list box.
+  // The tabbed menu is as wide as Settings and keeps one size (its largest category); other menus
+  // (cheats) fit their rows.
+  const float panelW = menuHasTabs ? 640 : 460, padX = 20, padY = 18, innerW = panelW - 2 * padX;
+  const float tabsH = menuHasTabs ? 36 + 10 : 0;
   int n = (int)menuItems.size();
-  const float tabsH = menuHasTabs ? 34 + 10 : 0;
-  int vis = std::max(4, std::min(n, (int)((gfx::UI_H * 0.9f - pad * 2 - headH - tabsH) / (rowH + gap))));
+  const int fit = (int)((gfx::UI_H * 0.9f - padY * 2 - 34 - 12 - tabsH - 12) / ROW_H);
+  int vis = std::max(4, std::min(menuHasTabs ? std::max(n, menuFixedRows()) : n, fit));
   if (menuIndex >= 0 && menuIndex < menuTop) menuTop = menuIndex;
   if (menuIndex < 0) menuTop = 0;
   if (menuIndex >= menuTop + vis) menuTop = menuIndex - vis + 1;
   if (menuTop > n - vis) menuTop = std::max(0, n - vis);
-  bool scroll = n > vis;
-  float listH = vis * (rowH + gap);
-  float h = pad * 2 + headH + tabsH + listH;
+  const bool gutter = menuHasTabs || n > vis;  // (tabbed: the scrollbar's gutter always kept)
+  float listW = innerW - (gutter ? 16 : 0), listH = vis * ROW_H + 12;
+  float h = padY * 2 + 34 + 12 + tabsH + listH;
   float x = (gfx::UI_W - panelW) / 2, y = roundf((gfx::UI_H - h) / 2);
   gfx::rect(x, y, panelW, h, col(C_PANEL), 14, 1, col(C_LINE));
-  float cx = x + pad, cy = y + pad, w = panelW - 2 * pad - (scroll ? 14 : 0);
-  gfx::text(gfx::ellipsize(menuTitle, panelW - 2 * pad, 26, gfx::BOLD), cx, cy - 2, 26, col(C_TEXT), gfx::BOLD);
-  cy += headH;
+  float cx = x + padX, cy = y + padY;
+  panelHeader(cx, cy, gfx::ellipsize(menuTitle, innerW - 20, 26, gfx::BOLD), "");
+  cy += 34 + 12;
   if (menuHasTabs) { drawTabBar(cx, cy, MENU_CATS, menuCat, menuIndex < 0 ? menuCat : -1); cy += tabsH; }
+  gfx::rect(cx, cy, listW, listH, col(C_BG), 10, 1, col(C_LINE));
   for (int k = 0; k < vis && menuTop + k < n; k++) {
     int i = menuTop + k;
     bool active = i == menuIndex;
-    float ry = cy + gap + k * (rowH + gap);
-    if (active) { gfx::rect(cx, ry, w, rowH, col(C_SEL), 8); gfx::rect(cx, ry, 4, rowH, col(C_ACCENT), 2); }
+    float rx = cx + 6, ry = cy + 6 + k * ROW_H, rw = listW - 12;
+    if (active) { gfx::rect(rx, ry, rw, ROW_H, col(C_SEL), 6); gfx::rect(rx, ry, 4, ROW_H, col(C_ACCENT), 2); }
     const MenuItem& m = menuItems[i];
     float vw = 0;
-    if (m.option()) { vector<string> ch = m.choices(); int v = m.get(); vw = valueBox(ch[std::max(0, std::min((int)ch.size() - 1, v))], cx + w - 14, ry, rowH, 18, active) + 16; }
-    textMid(gfx::ellipsize(m.label, w - 32 - vw, 21), cx + 18, ry, rowH, 21, col(C_TEXT));
+    if (m.option()) { vector<string> ch = m.choices(); int v = m.get(); vw = valueBox(ch[std::max(0, std::min((int)ch.size() - 1, v))], rx + rw - 12, ry, ROW_H, 20, active) + 16; }
+    textMid(gfx::ellipsize(m.label, rw - 28 - vw, 20), rx + 16, ry, ROW_H, 20, col(C_TEXT));
   }
-  if (scroll) scrollbar(cx + w + 6, cy + gap, listH - gap, n, vis, menuTop);
+  if (n > vis) scrollbar(cx + listW + 8, cy, listH, n, vis, menuTop);
 }
 
 static void drawCodeEditor() {

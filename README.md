@@ -2,8 +2,9 @@
 
 A PlayStation 2 emulator for the Nintendo Switch 2 (hbmenu / kaiHEN), built on the
 [OunceSX2](https://github.com/nyathea/OunceSX2) core (ARMSX2 / PCSX2 lineage) with a native
-front end: game list with favourites and recents, per-game settings, save-state slots,
-cheats, CRT shaders, live resolution switching, and Switch 2 CPU clocking.
+front end: game list with favourites and recents, settings and an in-game menu in tabs
+(L / R), per-game settings, save-state slots, cheats, CRT shaders, live resolution switching,
+and Switch 2 CPU clocking.
 
 No games, BIOS files or other copyrighted material are included. You need your own PS2
 BIOS (default folder `/bios/ps2`) and your own game dumps (default folder `/roms/ps2`); both
