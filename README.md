@@ -39,6 +39,11 @@ Needs devkitPro (devkitA64) with the ounce-devkit Switch 2 additions (libounce, 
 The core's Switch 2 build tree and its prebuilt dependencies (`third_party/ouncesx2-eval/deps-sw2`)
 are not in this repository.
 
+## Licence
+
+SW2PS2 is licensed under the GNU General Public License v3.0 or later (see `LICENSE`), as the
+OunceSX2 / ARMSX2 / PCSX2 core it builds on is. Fonts keep their own licences (`romfs/licenses`).
+
 ## Credits
 
 - [OunceSX2](https://github.com/nyathea/OunceSX2), [ARMSX2](https://github.com/ARMSX2/ARMSX2) and
