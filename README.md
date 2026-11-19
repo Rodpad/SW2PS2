@@ -32,17 +32,19 @@ session and on very early state loads, and test hooks.
 Needs devkitPro (devkitA64) with the ounce-devkit Switch 2 additions (libounce, kaiHEN, OunceVK).
 
 1. `tools/setup_third_party.sh` clones the cores at the pinned commits and applies `patches/`.
-2. Build the core (CMake/Ninja tree `third_party/ouncesx2-eval/build-sw2-vk`):
-   `ninja -C third_party/ouncesx2-eval/build-sw2-vk PCSX2 sw2-armsx2-libretro`
-3. Build the app: `make` (the Vulkan build on the devkit's OunceVK driver).
+2. `tools/build_core.sh` builds libjpeg-turbo (from the core's own copy) and the core, with the
+   exact settings the app is built with (CMake + Ninja).
+3. `make` builds the app (the Vulkan build on the devkit's OunceVK driver).
 
-The core's Switch 2 build tree and its prebuilt dependencies (`third_party/ouncesx2-eval/deps-sw2`)
-are not in this repository.
+After changing what the app links, `tools/make_notices.py` regenerates
+`romfs/licenses/THIRD_PARTY_NOTICES.txt`.
 
 ## Licence
 
 SW2PS2 is licensed under the GNU General Public License v3.0 or later (see `LICENSE`), as the
-OunceSX2 / ARMSX2 / PCSX2 core it builds on is. Fonts keep their own licences (`romfs/licenses`).
+OunceSX2 / ARMSX2 / PCSX2 core it builds on is. The libraries linked into the app keep their
+own licences: their notices are in `romfs/licenses/THIRD_PARTY_NOTICES.txt`, which ships inside
+the app with the GPL text.
 
 ## Credits
 
@@ -50,6 +52,7 @@ OunceSX2 / ARMSX2 / PCSX2 core it builds on is. Fonts keep their own licences (`
   [PCSX2](https://github.com/PCSX2/pcsx2): the emulator core (GPL-3.0+). From OunceSX2's Switch 2 app,
   `HorizonThreadWrap` and `ServiceLookupGuard` are compiled in, and its approach to setting Switch 2
   clock rates and to cleaning up threads at exit is followed.
-- Per-game CPU settings from the community-tested AetherSX2/NetherSX2 playable lists by
-  Darkelf2024 (CC BY 4.0).
+- Per-game CPU settings adapted (converted to SW2PS2's own table) from the community-tested
+  [AetherSX2/NetherSX2 playable lists](https://github.com/Darkelf2024/PS2-Playable-Lists-for-AetherSX2-NetherSX2)
+  by Darkelf2024, licensed [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
 - Fonts: Roboto (Apache 2.0), Source Code Pro (OFL 1.1) — licences in `romfs/licenses`.
