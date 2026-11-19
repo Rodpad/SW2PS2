@@ -180,11 +180,11 @@ static const SpeedDefault* speedDefault(const string& name) {
   // Index: rate 1 = 75%, 2 = 60%, 3 = 50%. These win over the community list below.
   struct Measured { const char* key; int rate; int skip; bool fastReadback; };
   static const Measured MEASURED[] = {
-    {"godofwarii", 3, 0, false},            // 49 -> 57 emu fps, 53 shown
-    {"shadowofthecolossus", 1, 0, false},   // 35 -> 60 emu fps, 30 shown (moderate skip: 25)
-    {"thesimpsonshitandrun", 1, 0, false},  // 33 -> 50 (PAL full speed), 38 shown (75% + max skip: 18)
+    // (God of War II: no entry since 2026-11-19 -- at 100% it now runs 60/60; 50% only cost it frames)
+    {"shadowofthecolossus", 1, 0, false},   // 75%: 60 emu / 30 shown; 100% falls behind (55 emu), 60% and 50% show fewer frames (re-measured 2026-11-19)
+    {"thesimpsonshitandrun", 1, 0, false},  // 75%: 50 (PAL full speed) / 45 shown; 100% 40 emu, 60% 38 shown (re-measured 2026-11-19)
+    {"tekkentagtournament", 1, 0, false},   // 75%: 57 emu / 57 shown; 100% 55 (2026-11-19)
     {"armoredcore3", 0, 0, true},           // 46 -> 60, all 60 shown (readbacks only, no CPU change)
-    {"burnoutrevenge", 2, 3, false},        // the old list's setting
   };
   for (const Measured& m : MEASURED)
     if (!skipMeasured) if (k == m.key || alt == m.key) {
@@ -206,17 +206,33 @@ static int effectiveRate(const string& name) {
   auto it = gameRate.find(name); if (it != gameRate.end() && it->second > 0) return it->second - 1;
   return autoRate(name);
 }
+// Games that keep 100% whatever the default: at 75% they show far fewer frames (measured on the
+// Switch 2, 2026-11-19: TimeSplitters: Future Perfect 57 -> 43 game fps; God of War II the same at both).
+static bool fullSpeedGame(const string& name) {
+  const string k = titleKey(name);
+  return k == "godofwarii" || k == "timesplittersfutureperfect";
+}
 static int autoRate(const string& name) {
+  if (fullSpeedGame(name)) return 0;
+  // 75% by default (the global setting); games the community lists or our measurements set lower keep that.
   const SpeedDefault* d = speedDefault(name); int r = d ? std::max(d->rate, ps2EeSpeedGlobal()) : ps2EeSpeedGlobal();
   return std::min(r, 3);
 }
 static int autoSkip(const string& name) { const SpeedDefault* d = speedDefault(name); return d ? std::max(d->skip, ps2CycleSkip) : ps2CycleSkip; }
+// GPU readbacks: Fast unless this game is set to Accurate in the in-game menu (Fast measured as
+// fast or faster in every game tried, 2026-11-19, with the same picture; Armored Core 3 49 -> 60).
+static bool fastReadback(const string& name) {
+  if (autoReadback >= 0) return autoReadback == 1;  // (test runs)
+  auto rb = gameReadback.find(name);
+  if (rb != gameReadback.end() && rb->second > 0) return rb->second == 2;
+  return true;
+}
 static int effectiveSkip(const string& name) {
   auto it = gameSkip.find(name); if (it != gameSkip.end() && it->second > 0) return it->second - 1;
   if (const SpeedDefault* d = speedDefault(name)) return std::max(d->skip, ps2CycleSkip);
   return ps2CycleSkip;
 }
-static int ps2Renderer = 0, ps2Resolution = 1, ps2EeSpeed = 0, ps2Fpu = 0;
+static int ps2Renderer = 0, ps2Resolution = 0, ps2EeSpeed = 1, ps2Fpu = 0;
 static int effectiveRes(const string& name) { auto it = gameRes.find(name); return it != gameRes.end() && it->second > 0 ? it->second - 1 : ps2Resolution; }
 static int ps2EeSpeedGlobal() { return ps2EeSpeed; }
 // CPU clock while a game runs: 0 normal, 1 the system's boost mode (CPU 1523 MHz, but the GPU drops
@@ -288,7 +304,9 @@ static bool autoTest = false, autoAgent = false, autoWaiting = false;
 static double autoTestEnd = 0, autoWaitSince = 0, autoPollAt = 0;
 static vector<std::pair<string, string>> autoOptions;  // extra core options for the current test run
 static string autoLabel;
-static std::deque<std::pair<double, int>> autoLiveRes;  // "liveRes": [[seconds, resolution index], ...]: change resolution mid-game, as from the menu
+static std::deque<std::pair<double, int>> autoLiveRes;
+struct AutoLiveSet { double at; string what; int v; };
+static std::deque<AutoLiveSet> autoLiveSet;  // "liveSet": [[seconds, "rate"|"skip"|"readback"|"clock", menu index], ...] (in memory only)  // "liveRes": [[seconds, resolution index], ...]: change resolution mid-game, as from the menu
 static bool autoPlayerStats = false;  // "playerStats": true: the stats text players see (screenshots of it)
 static double autoSaveAt = -1; static int autoSaveSlot = 4;  // "saveState": [seconds, slot]: save a state (tests the states folder)
 static double autoMenuOpenAt = -1;  // "menuOpen": seconds: open the in-game menu and leave it open (for screenshots)
@@ -413,7 +431,7 @@ static Json settingsJson(const GameVals& g) {
   j.set("ps2Renderer", Json::number(ps2Renderer)); j.set("ps2Resolution", Json::number(ps2Resolution)); j.set("ps2EeSpeed", Json::number(ps2EeSpeed)); j.set("ps2Fpu", Json::number(ps2Fpu)); j.set("ps2CycleSkip", Json::number(ps2CycleSkip));
   { Json rb = Json::object(); for (auto& kv : gameReadback) if (kv.second) rb.set(kv.first, Json::number(kv.second)); j.set("gameReadback", rb); }
   { Json r = Json::object(), k = Json::object(); for (auto& kv : gameRate) if (kv.second) r.set(kv.first, Json::number(kv.second)); for (auto& kv : gameSkip) if (kv.second) k.set(kv.first, Json::number(kv.second)); j.set("gameRate", r); j.set("gameSkip", k);
-    Json rs = Json::object(); for (auto& kv : gameRes) if (kv.second) rs.set(kv.first, Json::number(kv.second)); j.set("gameRes", rs); j.set("res2x", Json::boolean(true)); j.set("zfastDefault", Json::boolean(true)); } j.set("fastReadback", strings(fastReadbackGames)); j.set("cpuClock", Json::number(cpuClock)); j.set("gpuClock", Json::number(gpuClock));
+    Json rs = Json::object(); for (auto& kv : gameRes) if (kv.second) rs.set(kv.first, Json::number(kv.second)); j.set("gameRes", rs); j.set("res1x", Json::boolean(true)); j.set("ee75", Json::boolean(true)); j.set("zfastDefault", Json::boolean(true)); } j.set("fastReadback", strings(fastReadbackGames)); j.set("cpuClock", Json::number(cpuClock)); j.set("gpuClock", Json::number(gpuClock));
   j.set("autoLoad", Json::boolean(autoLoadState)); j.set("pauseMenu", Json::boolean(pauseInMenu)); j.set("vibration", Json::boolean(vibLevel != 0)); j.set("vibLevel", Json::number(vibLevel)); j.set("dimMenu", Json::boolean(dimInMenu));
   return j;
 }
@@ -446,6 +464,7 @@ static void applySettingsJson(const Json& v) {
   ffMode = pick(v.get("ffMode"), FF_MODES.size(), ffMode); ffSpeed = pick(v.get("ffSpeed"), FF_SPEEDS.size(), ffSpeed);
   ps2Renderer = 0;  // always the GPU (Vulkan) renderer: software was far too slow to be worth offering ps2Resolution = pick(v.get("ps2Resolution"), RESOLUTIONS.size(), ps2Resolution);
   ps2EeSpeed = pick(v.get("ps2EeSpeed"), EE_SPEEDS.size(), ps2EeSpeed);
+  if (!v.get("ee75") && ps2EeSpeed == 0) ps2EeSpeed = 1;  // 75% became the default (1.0.2); once, for settings saved on the old 100% default
   ps2Fpu = pick(v.get("ps2Fpu"), FPU_MODES.size(), ps2Fpu);
   ps2CycleSkip = pick(v.get("ps2CycleSkip"), CYCLE_SKIPS.size(), ps2CycleSkip);
 
@@ -453,7 +472,7 @@ static void applySettingsJson(const Json& v) {
   if (const Json* r = v.get("gameReadback")) if (r->type == Json::OBJ) { gameReadback.clear(); for (auto& kv : r->o) if (kv.second.isNum()) gameReadback[kv.first] = pick(&kv.second, 3, 0); }
   if (const Json* r = v.get("gameRes")) if (r->type == Json::OBJ) { gameRes.clear(); for (auto& kv : r->o) if (kv.second.isNum()) gameRes[kv.first] = pick(&kv.second, RESOLUTIONS.size() + 1, 0); }
   if (!v.get("zfastDefault") && shader == 2) shader = 6;  // zfast CRT became the default shader (2026-11-19); once, for settings saved on the old default
-  if (!v.get("res2x") && ps2Resolution == 0) ps2Resolution = 1;  // 2x became the default (measured free in every game, 2026-11-19); once, for settings saved before
+  if (!v.get("res1x") && ps2Resolution == 1) ps2Resolution = 0;  // 1x is the default again (1.0.2); once, for settings saved on 1.0.0-1.0.1's 2x default
   if (const Json* r = v.get("gameSkip")) if (r->type == Json::OBJ) { gameSkip.clear(); for (auto& kv : r->o) if (kv.second.isNum()) gameSkip[kv.first] = pick(&kv.second, CYCLE_SKIPS.size() + 1, 0); }
   if (const Json* r = v.get("fastReadback")) if (r->isArr()) { fastReadbackGames.clear(); for (auto& x : r->a) if (x.isStr()) fastReadbackGames.push_back(x.s); }
   {  // settings before v8 had boost on/off: those start on the new default (Maximum)
@@ -940,6 +959,14 @@ extern char sw2_bios_dir[512] __attribute__((weak));
 static bool memClockMax = false;
 static int memClockMhz = 0, gpuClockMhz = 0;  // test: exact rates  // test: the memory clock at its highest rate too
 static u32 emcPrevHz = 0;
+static void clockMaxApply(bool on);
+// The Switch 2 CPU clock for the chosen mode, now: Normal, the system's boost mode, or the maximum
+// through the clock service (restored to the startup rate when leaving Maximum or the game).
+static void applySwitchClock() {
+  appletSetCpuBoostMode(cpuClock == 1 ? ApmCpuBoostMode_FastLoad : ApmCpuBoostMode_Normal);
+  if (cpuClock == 2) { if (!clkMaxPrev) clockMaxApply(true); }
+  else if (clkMaxPrev) clockMaxApply(false);
+}
 static void clockMaxApply(bool on) {
   if (R_FAILED(clkrstInitialize())) { record("clock: clkrst unavailable"); return; }
   ClkrstSession cpu, gpu;
@@ -1054,13 +1081,7 @@ static void startGame(const Rom& rom) {
   tuneQuietUntil = nowMs() + 12000; slowNoticeShown = false; tuneWin.clear();
   ps2core_option("pcsx2_ee_cycle_rate", EE_SPEED_VALUES[rate]);
   ps2core_option("pcsx2_ee_cycle_skip", CYCLE_SKIP_VALUES[skip]);
-  { bool fast;
-    auto rb = gameReadback.find(rom.name);
-    if (autoReadback >= 0) fast = autoReadback == 1;
-    else if (rb != gameReadback.end() && rb->second > 0) fast = rb->second == 2;
-    else if (contains(fastReadbackGames, rom.name)) fast = true;
-    else { const SpeedDefault* d = speedDefault(rom.name); fast = d && d->fastReadback; }
-    ps2core_option("pcsx2_hw_download_mode", fast ? "Unsynchronized" : "Accurate"); }
+  ps2core_option("pcsx2_hw_download_mode", fastReadback(rom.name) ? "Unsynchronized" : "Accurate");
   ps2core_option("pcsx2_widescreen_hint", contains(widescreenGames, rom.name) ? "enabled (16:9)" : "disabled");  // the core's patch, for games without their own widescreen setting
   for (auto& o : autoOptions) ps2core_option(o.first.c_str(), o.second.c_str());
   {  // leak check across game starts
@@ -1084,8 +1105,7 @@ static void startGame(const Rom& rom) {
   }
   coreLogLines = 0;  // the core log limit is per game, so a later game's start-up is logged too
   record("Starting %s: BIOS %s, renderer %s%s, %dx, EE %s, FPU %s, CPU clock %s, cycle skip %s, list entry %s", rom.name.c_str(), bios, gpu || vulkan ? "GPU" : "software", vulkan ? " (Vulkan)" : "", renderScale, EE_SPEEDS[rate].c_str(), FPU_MODES[ps2Fpu].c_str(), CPU_CLOCKS[cpuClock].c_str(), CYCLE_SKIPS[skip].c_str(), speedDefault(rom.name) ? speedDefault(rom.name)->title : "none");
-  appletSetCpuBoostMode(cpuClock == 1 ? ApmCpuBoostMode_FastLoad : ApmCpuBoostMode_Normal);
-  if (cpuClock == 2) clockMaxApply(true);
+  applySwitchClock();
   if (R_SUCCEEDED(clkrstInitialize())) {  // the clocks this game starts with, for the log
     u32 c = 0, g = 0; ClkrstSession ses;
     if (R_SUCCEEDED(clkrstOpenSession(&ses, PcvModuleId_CpuBus, 3))) { clkrstGetClockRate(&ses, &c); clkrstCloseSession(&ses); }
@@ -1291,6 +1311,20 @@ static void applyResolutionLive() {
   record("resolution: %s now %s", running->name.c_str(), RESOLUTIONS[r].c_str());
   showToast("Resolution " + RESOLUTIONS[r], 2000);
 }
+// Per-game emulation settings applied to the running game at once (the core takes the option on
+// its next frame and recompiles where needed: a short hitch).
+static void applyRateLive() {
+  const int r = effectiveRate(running->name); ps2core_option("pcsx2_ee_cycle_rate", EE_SPEED_VALUES[r]);
+  record("live: %s PS2 CPU speed %s", running->name.c_str(), EE_SPEEDS[r].c_str());
+}
+static void applySkipLive() {
+  const int k = effectiveSkip(running->name); ps2core_option("pcsx2_ee_cycle_skip", CYCLE_SKIP_VALUES[k]);
+  record("live: %s PS2 CPU cycle skip %s", running->name.c_str(), CYCLE_SKIPS[k].c_str());
+}
+static void applyReadbackLive() {
+  const bool f = fastReadback(running->name); ps2core_option("pcsx2_hw_download_mode", f ? "Unsynchronized" : "Accurate");
+  record("live: %s GPU readbacks %s", running->name.c_str(), f ? "Fast" : "Accurate");
+}
 // The main in-game menu's rows for one category (adv: with the advanced ones).
 static vector<MenuItem> menuItemsFor(int cat, bool adv) {
   vector<MenuItem> items = {
@@ -1305,16 +1339,21 @@ static vector<MenuItem> menuItemsFor(int cat, bool adv) {
       opt("Widescreen", [] { return OFF_ON; }, [] { return contains(widescreenGames, running->name) ? 1 : 0; },
           [](int v) { widescreenGames.erase(std::remove(widescreenGames.begin(), widescreenGames.end(), running->name), widescreenGames.end()); if (v) widescreenGames.push_back(running->name); },
           [] { saveSettings(); pictureChanged(); showToast("16:9 now. Games without a widescreen setting of their own get the patch from their next start", 4000); }),
-      opt("CPU speed (next start)", [] { vector<string> a = {"Auto (" + EE_SPEEDS[autoRate(running->name)] + ")"}; for (auto& x : EE_SPEEDS) a.push_back(x); return a; },
+      // These apply at once (the core recompiles: a short hitch); saved for this game.
+      opt("PS2 CPU speed", [] { vector<string> a = {"Auto (" + EE_SPEEDS[autoRate(running->name)] + ")"}; for (auto& x : EE_SPEEDS) a.push_back(x); return a; },
           [] { auto it = gameRate.find(running->name); return it == gameRate.end() ? 0 : it->second; },
-          [](int v) { gameRate[running->name] = v; }, [] { saveSettings(); showToast("Applies from this game's next start", 3000); }),
-      opt("CPU cycle skip (next start)", [] { vector<string> a = {"Auto (" + CYCLE_SKIPS[autoSkip(running->name)] + ")"}; for (auto& x : CYCLE_SKIPS) a.push_back(x); return a; },
+          [](int v) { gameRate[running->name] = v; },
+          [] { saveSettings(); applyRateLive(); }),
+      opt("PS2 CPU cycle skip", [] { vector<string> a = {"Auto (" + CYCLE_SKIPS[autoSkip(running->name)] + ")"}; for (auto& x : CYCLE_SKIPS) a.push_back(x); return a; },
           [] { auto it = gameSkip.find(running->name); return it == gameSkip.end() ? 0 : it->second; },
-          [](int v) { gameSkip[running->name] = v; }, [] { saveSettings(); showToast("Applies from this game's next start", 3000); }),
-      opt("GPU readbacks (next start)", [] { const SpeedDefault* d = speedDefault(running->name); return vector<string>{string("Auto (") + (d && d->fastReadback ? "Fast" : "Accurate") + ")", "Accurate", "Fast"}; },
-          [] { auto it = gameReadback.find(running->name); if (it != gameReadback.end()) return it->second; return contains(fastReadbackGames, running->name) ? 2 : 0; },
+          [](int v) { gameSkip[running->name] = v; },
+          [] { saveSettings(); applySkipLive(); }),
+      opt("GPU readbacks", [] { return vector<string>{"Auto (Fast)", "Accurate", "Fast"}; },
+          [] { auto it = gameReadback.find(running->name); return it != gameReadback.end() ? it->second : 0; },
           [](int v) { fastReadbackGames.erase(std::remove(fastReadbackGames.begin(), fastReadbackGames.end(), running->name), fastReadbackGames.end()); gameReadback[running->name] = v; },
-          [] { saveSettings(); showToast("Applies from this game's next start", 3000); }),
+          [] { saveSettings(); applyReadbackLive(); }),
+      opt("Switch 2 CPU clock", [] { return CPU_CLOCKS; }, [] { return cpuClock; }, [](int v) { cpuClock = v; },
+          [] { saveSettings(); applySwitchClock(); record("live: Switch 2 CPU clock %s", CPU_CLOCKS[cpuClock].c_str()); }),
       opt("Resolution", [] { vector<string> a = {"Auto (" + RESOLUTIONS[ps2Resolution] + ")"}; for (auto& x : RESOLUTIONS) a.push_back(x); return a; },
           [] { auto it = gameRes.find(running->name); return it == gameRes.end() ? 0 : it->second; },
           [](int v) { gameRes[running->name] = v; }, [] { saveSettings(); applyResolutionLive(); }),
@@ -1345,7 +1384,7 @@ static vector<MenuItem> menuItemsFor(int cat, bool adv) {
   };
   {
     vector<MenuItem> kept;
-    static const vector<string> EMU = {"CPU speed (next start)", "CPU cycle skip (next start)", "GPU readbacks (next start)", "Resolution", "Widescreen", "Stats"};
+    static const vector<string> EMU = {"PS2 CPU speed", "PS2 CPU cycle skip", "GPU readbacks", "Switch 2 CPU clock", "Resolution", "Widescreen", "Stats"};
     static const vector<string> PIC = {"Aspect", "Scale", "Overscan", "Signal", "Shader", "Brightness boost", "Curvature", "Corner radius", "Corner softness",
                                        "Vignette", "Vignette size", "Settings for"};
     auto catOf = [](const string& l) { return contains(EMU, l) ? 1 : contains(PIC, l) ? 2 : 0; };
@@ -2354,7 +2393,7 @@ static bool autoStartRun() {
   const Json* g = j->get("game") ? j->get("game") : autoJson.get("game"); const Json* sl = j && j->get("slot") ? j->get("slot") : autoJson.get("slot"); const Json* sec = autoJson.get("seconds");
   int slot = sl && sl->isNum() ? (int)sl->n : 1; double seconds = sec && sec->isNum() ? sec->n : 20;
   ps2Renderer = pick(j->get("renderer"), RENDERERS.size(), 0); ps2Resolution = pick(j->get("resolution"), RESOLUTIONS.size(), 0);
-  ps2EeSpeed = pick(j->get("eeSpeed"), EE_SPEEDS.size(), 0);
+  ps2EeSpeed = pick(j->get("eeSpeed"), EE_SPEEDS.size(), 1);  // (as players get it: 75%)
   ps2Fpu = pick(j->get("fpu"), FPU_MODES.size(), 0);
   { const Json* rb = j->get("readback"); autoReadback = rb && rb->isNum() ? (int)rb->n : -1; }
   cpuClock = pick(j->get("clock"), CPU_CLOCKS.size(), 2);  // 0 normal, 1 boost mode, 2 maximum
@@ -2410,6 +2449,8 @@ static bool autoStartRun() {
   if (const Json* sv = j->get("saveState")) if (sv->isArr() && sv->a.size() == 2 && sv->a[0].isNum() && sv->a[1].isNum()) { autoSaveAt = sv->a[0].n; autoSaveSlot = (int)sv->a[1].n; }
   if (const Json* mo = j->get("menuOpen")) if (mo->isNum()) autoMenuOpenAt = mo->n;
   if (const Json* el = j->get("earlyLoad")) if (el->isArr() && el->a.size() >= 1 && el->a[0].isNum()) { autoEarlyLoadAt = el->a[0].n; autoEarlyLoadSlot = el->a.size() > 1 && el->a[1].isNum() ? (int)el->a[1].n : 1; }
+  autoLiveSet.clear();
+  if (const Json* ls = j->get("liveSet")) if (ls->isArr()) for (auto& e : ls->a) if (e.isArr() && e.a.size() == 3 && e.a[0].isNum() && e.a[1].isStr() && e.a[2].isNum()) autoLiveSet.push_back({e.a[0].n, e.a[1].s, (int)e.a[2].n});
   if (const Json* lr = j->get("liveRes")) if (lr->isArr()) for (auto& e : lr->a) if (e.isArr() && e.a.size() == 2 && e.a[0].isNum() && e.a[1].isNum()) autoLiveRes.push_back({e.a[0].n, (int)e.a[1].n});
   if (const Json* ml = j->get("menuLoad")) if (ml->isArr() && ml->a.size() >= 1 && ml->a[0].isNum()) { autoMenuLoadAt = ml->a[0].n; autoMenuLoadSlot = ml->a.size() > 1 && ml->a[1].isNum() ? (int)ml->a[1].n : 1; }
   autoPresses.clear();
@@ -2766,6 +2807,15 @@ int main(int argc, char** argv) {
     if (autoTest && !autoWaiting && running && autoEarlyLoadAt >= 0 && nowMs() - autoRunStart >= autoEarlyLoadAt * 1000) {
       record("autotest: Load state slot %d at %.2f s after start", autoEarlyLoadSlot, (nowMs() - autoRunStart) / 1000.0);
       autoEarlyLoadAt = -1; loadState(false, autoEarlyLoadSlot);
+    }
+    if (autoTest && !autoWaiting && running && !autoLiveSet.empty() && nowMs() - autoRunStart >= autoLiveSet.front().at * 1000) {
+      const AutoLiveSet a = autoLiveSet.front(); autoLiveSet.pop_front();
+      record("autotest: live %s -> %d at %.1f s", a.what.c_str(), a.v, (nowMs() - autoRunStart) / 1000.0);
+      if (a.what == "rate") { gameRate[running->name] = a.v; applyRateLive(); }
+      else if (a.what == "skip") { gameSkip[running->name] = a.v; applySkipLive(); }
+      else if (a.what == "readback") { autoReadback = -1; gameReadback[running->name] = a.v; applyReadbackLive(); }
+      else if (a.what == "clock") { cpuClock = a.v; applySwitchClock(); }
+      if (autoLiveSet.empty()) { gameRate.erase(running->name); gameSkip.erase(running->name); gameReadback.erase(running->name); }
     }
     if (autoTest && !autoWaiting && running && !autoLiveRes.empty() && nowMs() - autoRunStart >= autoLiveRes.front().first * 1000) {
       gameRes[running->name] = autoLiveRes.front().second + 1;  // in memory only: tests never save the player's settings

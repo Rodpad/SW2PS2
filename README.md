@@ -34,8 +34,6 @@ SW2PS2 uses the [OunceSX2](https://github.com/nyathea/OunceSX2) core with its ow
   measured on the Switch 2, falling back to the community-tested AetherSX2/NetherSX2 lists. Any
   game can be adjusted from the in-game menu, and the app tells you once if a game falls below
   full speed.
-- **2x resolution by default.** It was measured to cost nothing in the games tested.
-  Resolution can be changed per game, live, from the in-game menu.
 
 ### Stability
 
