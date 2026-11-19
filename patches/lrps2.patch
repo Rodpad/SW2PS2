@@ -1,0 +1,2893 @@
+diff --git a/Makefile b/Makefile
+index feef68f..4f75613 100644
+--- a/Makefile
++++ b/Makefile
+@@ -284,6 +284,26 @@ else ifeq ($(platform), vita)
+    STATIC_LINKING = 1
+    FLAGS += -DSTATIC_LINKING
+ 
++# Switch 2 homebrew (hbmenu under kaiHEN): static library for SW2PS2.
++#   export DEVKITPRO=/opt/devkitpro && make platform=switch2
++else ifeq ($(platform), switch2)
++   TARGET := $(TARGET_NAME)_libretro_switch2.a
++   CC      = $(DEVKITPRO)/devkitA64/bin/aarch64-none-elf-gcc
++   CXX     = $(DEVKITPRO)/devkitA64/bin/aarch64-none-elf-g++
++   AR      = $(DEVKITPRO)/devkitA64/bin/aarch64-none-elf-ar
++   arch    = aarch64
++   STATIC_LINKING = 1
++   HAVE_VULKAN = 0
++   HAVE_OPENGL = 1
++   GLES = 1
++   GLES3 = 1
++   HAVE_CHD = 1
++   LINK_STATIC_LIBCPLUSPLUS = 0
++   FLAGS += -DSTATIC_LINKING -D__SWITCH__ -DHAVE_LIBNX -DMEMJIT_SPLIT -DSW2_NO_FAULTS \
++            -DVIXL_CODE_BUFFER_MALLOC -include $(CORE_DIR)/sw2/include/sw2_compat.h \
++            -mcpu=cortex-a78c+crypto -mtp=soft -fPIE -ffunction-sections -fdata-sections \
++            -I$(CORE_DIR)/sw2/include -I$(DEVKITPRO)/libounce/include -I$(DEVKITPRO)/portlibs/switch2/include -I$(DEVKITPRO)/portlibs/switch/include
++
+ # Xbox 360
+ else ifeq ($(platform), xenon)
+    TARGET := $(TARGET_NAME)_libretro_xenon360.a
+@@ -572,6 +592,10 @@ endif
+ 
+ include Makefile.common
+ 
++ifeq ($(platform), switch2)
++   SOURCES_C += $(CORE_DIR)/sw2/sw2_posix.c $(CORE_DIR)/sw2/sw2_net.c
++endif
++
+ # GameDatabaseBuiltin.c is generated from the shipped GameIndex.yaml at
+ # build time (tools/gen_gamedb_builtin.sh, POSIX shell + od + awk only).
+ pcsx2/GameDatabaseBuiltin.c: bin/resources/GameIndex.yaml tools/gen_gamedb_builtin.sh
+diff --git a/libretro/libretro-common/faulthandler/faulthandler.c b/libretro/libretro-common/faulthandler/faulthandler.c
+index e4b2520..620697f 100644
+--- a/libretro/libretro-common/faulthandler/faulthandler.c
++++ b/libretro/libretro-common/faulthandler/faulthandler.c
+@@ -23,6 +23,14 @@
+ #define _GNU_SOURCE 1   /* REG_RIP in <ucontext.h> */
+ #endif
+ 
++#if defined(SW2_NO_FAULTS) && defined(__SWITCH__)
++/* SW2PS2: the Switch 2 does not hand faults back to homebrew. */
++#include <faulthandler.h>
++bool retro_faulthandler_install(retro_fault_handler_t handler) { (void)handler; return true; }
++void retro_faulthandler_remove(retro_fault_handler_t handler) { (void)handler; }
++bool retro_faulthandler_register_thread(void) { return true; }
++void retro_faulthandler_unregister_thread(void) { }
++#else
+ #include <string.h>
+ #include <faulthandler.h>
+ #include <retro_atomic.h>
+@@ -142,6 +150,10 @@ static int fault_slot_lookup(uintptr_t self)
+ 
+ bool retro_faulthandler_register_thread(void)
+ {
++#if defined(SW2_NO_FAULTS)
++   /* SW2PS2: the system does not hand faults back; nothing may rely on them. */
++   return true;
++#else
+    uintptr_t self = fault_thread_identity();
+    int i;
+    for (i = 0; i < RETRO_FAULT_MAX_THREADS; i++)
+@@ -157,10 +169,12 @@ bool retro_faulthandler_register_thread(void)
+       }
+    }
+    return false;
++#endif
+ }
+ 
+ void retro_faulthandler_unregister_thread(void)
+ {
++#if !defined(SW2_NO_FAULTS)
+    uintptr_t self = fault_thread_identity();
+    int i;
+    for (i = 0; i < RETRO_FAULT_MAX_THREADS; i++)
+@@ -176,6 +190,7 @@ void retro_faulthandler_unregister_thread(void)
+          return;
+       }
+    }
++#endif
+ }
+ 
+ #if defined(_WIN32)
+@@ -287,6 +302,10 @@ static void fault_filter(int sig, siginfo_t *si, void *ctx)
+ 
+ bool retro_faulthandler_install(retro_fault_handler_t handler)
+ {
++#if defined(SW2_NO_FAULTS)
++   (void)handler;
++   return true;
++#else
+    slock_t *lock = fault_reg_lock();
+    bool ok       = true;
+    if (!handler)
+@@ -351,10 +370,14 @@ bool retro_faulthandler_install(retro_fault_handler_t handler)
+    if (lock)
+       slock_unlock(lock);
+    return ok;
++#endif
+ }
+ 
+ void retro_faulthandler_remove(retro_fault_handler_t handler)
+ {
++#if defined(SW2_NO_FAULTS)
++   (void)handler;
++#else
+    slock_t *lock = fault_reg_lock();
+    if (lock)
+       slock_lock(lock);
+@@ -385,4 +408,7 @@ void retro_faulthandler_remove(retro_fault_handler_t handler)
+ #endif
+    if (lock)
+       slock_unlock(lock);
++#endif
+ }
++
++#endif /* SW2PS2 stub */
+diff --git a/libretro/libretro-common/features/features_cpu.c b/libretro/libretro-common/features/features_cpu.c
+index 868b674..d7e554a 100644
+--- a/libretro/libretro-common/features/features_cpu.c
++++ b/libretro/libretro-common/features/features_cpu.c
+@@ -264,7 +264,7 @@ retro_time_t cpu_features_get_time_usec(void)
+ #elif defined(WIIU)
+    return ticks_to_us(OSGetSystemTime());
+ #elif defined(SWITCH) || defined(HAVE_LIBNX)
+-   return (svcGetSystemTick() * 10) / 192;
++   return armTicksToNs(armGetSystemTick()) / 1000; /* SW2PS2: the tick rate is not 19.2 MHz on the Switch 2 */
+ #elif defined(_3DS)
+    return osGetTime() * 1000;
+ #elif defined(_POSIX_MONOTONIC_CLOCK) || defined(__QNX__) || defined(ANDROID) || defined(__MACH__)
+@@ -1116,7 +1116,7 @@ unsigned cpu_features_get_core_amount(void)
+ #elif defined(VITA)
+    return 4;
+ #elif defined(HAVE_LIBNX) || defined(SWITCH)
+-   return 4;
++   return 6; /* SW2PS2: Switch 2 */
+ #elif defined(_3DS)
+    u8 device_model = 0xFF;
+    CFGU_GetSystemModel(&device_model);/*(0 = O3DS, 1 = O3DSXL, 2 = N3DS, 3 = 2DS, 4 = N3DSXL, 5 = N2DSXL)*/
+diff --git a/libretro/libretro-common/include/memmap.h b/libretro/libretro-common/include/memmap.h
+index 4303db1..59106d2 100644
+--- a/libretro/libretro-common/include/memmap.h
++++ b/libretro/libretro-common/include/memmap.h
+@@ -30,6 +30,9 @@
+ 
+ #if defined(PSP) || defined(PS2) || defined(GEKKO) || defined(VITA) || defined(_XBOX) || defined(_3DS) || defined(WIIU) || defined(SWITCH) || defined(HAVE_LIBNX) || defined(__PS3__) || defined(__PSL1GHT__)
+ /* No mman available */
++#if defined(__SWITCH__)
++#include <sys/mman.h> /* SW2PS2: sw2/include, heap-backed */
++#endif
+ #elif defined(_WIN32) && !defined(_XBOX)
+ /* MSVC's minwindef.h defines min and max as macros in C++ as well as C
+  * -- MinGW's is guarded by #ifndef __cplusplus -- and they then break
+@@ -364,6 +367,22 @@ void memjit_write_end(void);
+ void *memjit_alloc(size_t len);
+ void memjit_free(void *addr, size_t len);
+ 
++/* SW2PS2: split JIT memory (MEMJIT_SPLIT). Where the system gives code a
++ * writable staging view and a separate executable view (Switch 2 under
++ * kaiHEN), memjit_alloc() returns the EXECUTABLE address: every address a
++ * recompiler computes, stores or branches to is that one. Bytes are written
++ * through memjit_rw(addr), the staging alias of the same offset, and become
++ * executable when memsync() covers them (it publishes the range).
++ * memjit_rx() maps a staging address back. Without MEMJIT_SPLIT both are
++ * the identity and memsync() only flushes the instruction cache. */
++#if defined(MEMJIT_SPLIT)
++void *memjit_rw(const void *addr);
++void *memjit_rx(const void *addr);
++#else
++#define memjit_rw(addr) ((void*)(addr))
++#define memjit_rx(addr) ((void*)(addr))
++#endif
++
+ /**
+  * memzero_pages:
+  *
+diff --git a/libretro/libretro-common/memmap/memmap.c b/libretro/libretro-common/memmap/memmap.c
+index 8788ff9..132cf0b 100644
+--- a/libretro/libretro-common/memmap/memmap.c
++++ b/libretro/libretro-common/memmap/memmap.c
+@@ -181,7 +181,7 @@ int mprotect(void *addr, size_t len, int prot)
+    return 0;
+ }
+ 
+-#elif !defined(HAVE_MMAN)
++#elif !defined(HAVE_MMAN) && !defined(__SWITCH__) /* SW2PS2: sw2/sw2_posix.c has them */
+ void* mmap(void *addr, size_t len, int prot, int flags,
+       int fildes, size_t offset)
+ {
+@@ -207,9 +207,17 @@ int mprotect(void *addr, size_t len, int prot)
+ #include <libkern/OSCacheControl.h>
+ #endif
+ 
++#if defined(MEMJIT_SPLIT)
++static int memjit_sync(void *start, void *end);
++#endif
++
+ int memsync(void *start, void *end)
+ {
+    size_t len = (char*)end - (char*)start;
++#if defined(MEMJIT_SPLIT)
++   if (memjit_sync(start, end))
++      return 0;
++#endif
+ #if defined(_WIN32) && !defined(_XBOX)
+    /* Coherent on x86; required on ARM64 Windows, where the JIT's writes
+     * are not seen by instruction fetch until this. */
+@@ -495,7 +503,7 @@ void memshm_unmap(void *addr, size_t len)
+ /* Gated on MAP_SHARED, as reserve/commit gates on its constants: DJGPP
+  * defines __unix__ and HAVE_MMAN but ships a stub <sys/mman.h> with no
+  * MAP_SHARED and no shm_open, and falls through to the stubs below. */
+-#elif defined(HAVE_MMAN) && !defined(__EMSCRIPTEN__) && defined(MAP_SHARED)
++#elif defined(HAVE_MMAN) && !defined(__EMSCRIPTEN__) && defined(MAP_SHARED) && !defined(SW2_NO_FAULTS) /* SW2PS2: no shared mirrors there */
+ 
+ #include <unistd.h>
+ #include <fcntl.h>
+@@ -627,6 +635,192 @@ void memshm_unmap(void *addr, size_t len) { (void)addr; (void)len; }
+ 
+ #endif
+ 
++#if defined(MEMJIT_SPLIT)
++/* ------------------------------------------------------------------ */
++/* SW2PS2: split JIT memory (see memmap.h)                             */
++/* ------------------------------------------------------------------ */
++#include <string.h>
++#if defined(__SWITCH__)
++#ifndef static_assert
++#define static_assert _Static_assert
++#endif
++#include <switch.h>
++#include <kaihen.h>
++#else
++/* Host simulation of the Switch 2 layout, for testing the recompilers on a
++ * Mac: the executable view is a MAP_JIT region that is only made writable
++ * inside memsync(), so a write that misses memjit_rw() faults. */
++#include <pthread.h>
++#include <libkern/OSCacheControl.h>
++#endif
++
++#define MEMJIT_MAX_REGIONS 32
++typedef struct
++{
++   unsigned char *rx, *rw;
++   size_t len;
++#if defined(__SWITCH__)
++   Jit jit;
++#endif
++} memjit_region_t;
++static memjit_region_t memjit_regions[MEMJIT_MAX_REGIONS];
++
++static memjit_region_t *memjit_find_rx(const void *p)
++{
++   int i;
++   for (i = 0; i < MEMJIT_MAX_REGIONS; i++)
++   {
++      memjit_region_t *r = &memjit_regions[i];
++      if (r->rx && (const unsigned char*)p >= r->rx && (const unsigned char*)p < r->rx + r->len)
++         return r;
++   }
++   return NULL;
++}
++
++void *memjit_rw(const void *addr)
++{
++   memjit_region_t *r = memjit_find_rx(addr);
++   return r ? (void*)(r->rw + ((const unsigned char*)addr - r->rx)) : (void*)addr;
++}
++
++void *memjit_rx(const void *addr)
++{
++   int i;
++   for (i = 0; i < MEMJIT_MAX_REGIONS; i++)
++   {
++      memjit_region_t *r = &memjit_regions[i];
++      if (r->rx && (const unsigned char*)addr >= r->rw && (const unsigned char*)addr < r->rw + r->len)
++         return r->rx + ((const unsigned char*)addr - r->rw);
++   }
++   return (void*)addr;
++}
++
++void memjit_write_begin(void) { }
++void memjit_write_end(void)   { }
++
++void *memjit_alloc(size_t len)
++{
++   int i;
++   memjit_region_t *r = NULL;
++   for (i = 0; i < MEMJIT_MAX_REGIONS; i++)
++      if (!memjit_regions[i].rx && !memjit_regions[i].len) { r = &memjit_regions[i]; break; }
++   if (!r)
++      return NULL;
++   r->len = len; /* claims the slot */
++#if !defined(__SWITCH__)
++   if (getenv("MEMJIT_LOG")) fprintf(stderr, "memjit_alloc %zu KB -> slot %d\n", len >> 10, (int)(r - memjit_regions));
++#endif
++#if defined(__SWITCH__)
++   if (R_FAILED(jitCreate(&r->jit, len)))
++   {
++      r->len = 0;
++      return NULL;
++   }
++   r->rw = (unsigned char*)jitGetRwAddr(&r->jit);
++   memset(r->rw, 0, len);
++   jitTransitionToWritable(&r->jit);
++   if (R_FAILED(jitTransitionToExecutable(&r->jit)))
++   {
++      jitClose(&r->jit);
++      r->len = 0;
++      return NULL;
++   }
++   r->rx = (unsigned char*)jitGetRxAddr(&r->jit);
++#else
++   {
++      void *rx = mmap(NULL, len, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
++      void *rw = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++      if (rx == MAP_FAILED || rw == MAP_FAILED)
++      {
++         r->len = 0;
++         return NULL;
++      }
++      r->rw = (unsigned char*)rw;
++      r->rx = (unsigned char*)rx;
++   }
++#endif
++   return r->rx;
++}
++
++void memjit_free(void *addr, size_t len)
++{
++   memjit_region_t *r = addr ? memjit_find_rx(addr) : NULL;
++   (void)len;
++#if !defined(__SWITCH__)
++   if (getenv("MEMJIT_LOG")) fprintf(stderr, "memjit_free %p -> %s\n", addr, r && r->rx == (unsigned char*)addr ? "freed" : "NOT A REGION BASE");
++#endif
++   if (!r || r->rx != (unsigned char*)addr)
++      return;
++#if defined(__SWITCH__)
++   jitClose(&r->jit);
++#else
++   munmap(r->rx, r->len);
++   munmap(r->rw, r->len);
++#endif
++   r->rx = NULL;
++   r->rw = NULL;
++   r->len = 0;
++}
++
++/* SW2PS2: how many JIT regions are live and their total size (leak check). */
++int memjit_live_regions(size_t *bytes)
++{
++   int i, n = 0; size_t b = 0;
++   for (i = 0; i < (int)(sizeof(memjit_regions) / sizeof(memjit_regions[0])); i++)
++      if (memjit_regions[i].rx) { n++; b += memjit_regions[i].len; }
++   if (bytes) *bytes = b;
++   return n;
++}
++
++/* SW2PS2: publish statistics (count, bytes, system ticks spent), for tuning. */
++static unsigned long long memjit_stat_n, memjit_stat_bytes, memjit_stat_ticks;
++void memjit_get_stats(unsigned long long *n, unsigned long long *bytes, unsigned long long *ticks)
++{
++   *n = memjit_stat_n; *bytes = memjit_stat_bytes; *ticks = memjit_stat_ticks;
++}
++
++/* Publishes [start, end) of a JIT region: staging bytes become executable. */
++static int memjit_publish(memjit_region_t *r, unsigned char *start, unsigned char *end)
++{
++   size_t off = (size_t)(start - r->rx), n;
++   if (end > r->rx + r->len)
++      end = r->rx + r->len;
++   if (end <= start)
++      return 0;
++   n = (size_t)(end - start);
++#if defined(__SWITCH__)
++   {
++      KaihenJitRange range;
++      u64 t0 = armGetSystemTick();
++      Result rc;
++      range.offset = off;
++      range.size   = n;
++      rc = kaihenJitPublishRanges(&r->jit, &range, 1);
++      __atomic_fetch_add(&memjit_stat_n, 1, __ATOMIC_RELAXED);
++      __atomic_fetch_add(&memjit_stat_bytes, n, __ATOMIC_RELAXED);
++      __atomic_fetch_add(&memjit_stat_ticks, armGetSystemTick() - t0, __ATOMIC_RELAXED);
++      return R_SUCCEEDED(rc) ? 0 : -1;
++   }
++#else
++   pthread_jit_write_protect_np(0);
++   memcpy(r->rx + off, r->rw + off, n);
++   pthread_jit_write_protect_np(1);
++   sys_icache_invalidate(r->rx + off, n);
++   return 0;
++#endif
++}
++
++/* For memsync(): 1 when the range was JIT memory (and is now published). */
++static int memjit_sync(void *start, void *end)
++{
++   memjit_region_t *r = memjit_find_rx(start);
++   if (!r)
++      return 0;
++   memjit_publish(r, (unsigned char*)start, (unsigned char*)end);
++   return 1;
++}
++
++#else /* !MEMJIT_SPLIT */
+ /* ------------------------------------------------------------------ */
+ /* JIT write toggle for per-thread W^X                                 */
+ /* ------------------------------------------------------------------ */
+@@ -716,6 +910,8 @@ void memjit_free(void *addr, size_t len)
+ #endif
+ }
+ 
++#endif /* MEMJIT_SPLIT */
++
+ /* ------------------------------------------------------------------ */
+ /* Zeroing a range of pages                                            */
+ /* ------------------------------------------------------------------ */
+@@ -1407,7 +1603,7 @@ unsigned char *memshm_area_map(memshm_area_t *area, void *handle,
+ #else
+    return NULL;
+ #endif
+-#elif defined(HAVE_MMAN) && !defined(__EMSCRIPTEN__) && defined(MAP_FIXED) && defined(MAP_ANONYMOUS)
++#elif defined(HAVE_MMAN) && !defined(__EMSCRIPTEN__) && defined(MAP_FIXED) && defined(MAP_ANONYMOUS) && !defined(SW2_NO_FAULTS)
+    void  *p;
+    size_t map_off;
+    size_t span = len;
+diff --git a/libretro/libretro-common/rthreads/rthreads.c b/libretro/libretro-common/rthreads/rthreads.c
+index 339654e..2a7a1a9 100644
+--- a/libretro/libretro-common/rthreads/rthreads.c
++++ b/libretro/libretro-common/rthreads/rthreads.c
+@@ -1037,6 +1037,27 @@ static void *thread_wrap(void *data_)
+ }
+ #endif
+ 
++#if defined(USE_SWITCH_THREADS)
++/* SW2PS2: the threads created here, for per-thread CPU time in the front
++ * end's profiling (sw2_thread_info). Entries are never removed; a thread
++ * that has exited reports failure. */
++#define SW2_MAX_THREADS 48
++static struct { Handle handle; int core; void *entry; } sw2_threads[SW2_MAX_THREADS];
++static int sw2_thread_count;
++int sw2_thread_info(int i, unsigned long long *ticks, int *core, void **entry)
++{
++   u64 t = 0;
++   if (i < 0 || i >= sw2_thread_count || i >= SW2_MAX_THREADS || !sw2_threads[i].handle)
++      return 0;
++   if (R_FAILED(svcGetInfo(&t, InfoType_ThreadTickCount, sw2_threads[i].handle, (u64)-1)))
++      return 0;
++   *ticks = t; *core = sw2_threads[i].core; *entry = sw2_threads[i].entry;
++   return 1;
++}
++unsigned sw2_thread_handle(int i) { return (i >= 0 && i < sw2_thread_count && i < SW2_MAX_THREADS) ? (unsigned)sw2_threads[i].handle : 0; }
++int sw2_thread_total(void) { return sw2_thread_count < SW2_MAX_THREADS ? sw2_thread_count : SW2_MAX_THREADS; }
++#endif
++
+ static sthread_t *sthread_create_ex(void (*thread_func)(void*),
+       void *userdata, int thread_priority, size_t stack_size);
+ 
+@@ -1260,6 +1281,11 @@ static sthread_t *sthread_create_ex(void (*thread_func)(void*),
+        * the process's default core. */
+       s32 prio = 0x2C;
+       Result rc;
++      /* SW2PS2: Horizon never migrates a thread, and -2 puts every one on
++       * the process's default core. Spread them over the six cores the
++       * Switch 2 gives homebrew, starting after the main thread's. */
++      static int sw2_next_core;
++      int sw2_core = 1 + (__atomic_fetch_add(&sw2_next_core, 1, __ATOMIC_RELAXED) % 5);
+ 
+       switch_reap();
+       svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+@@ -1267,19 +1293,28 @@ static sthread_t *sthread_create_ex(void (*thread_func)(void*),
+       {
+          s32 want = 0x3F - ((thread_priority - 1) * (0x3F - 0x1C)) / 99;
+          rc       = threadCreate(&thread->t, thread_wrap, data,
+-               NULL, stack, want, -2);
++               NULL, stack, want, sw2_core);
+          if (R_FAILED(rc))
+             rc    = threadCreate(&thread->t, thread_wrap, data,
+-                  NULL, stack, prio, -2);
++                  NULL, stack, prio, sw2_core);
+       }
+       else
+          rc       = threadCreate(&thread->t, thread_wrap, data,
+-               NULL, stack, prio, -2);
++               NULL, stack, prio, sw2_core);
+ 
+       if (R_SUCCEEDED(rc))
+       {
+          if (R_SUCCEEDED(threadStart(&thread->t)))
++         {
++            int slot = __atomic_fetch_add(&sw2_thread_count, 1, __ATOMIC_RELAXED);
+             thread_created = true;
++            if (slot < SW2_MAX_THREADS)
++            {
++               sw2_threads[slot].handle = thread->t.handle;
++               sw2_threads[slot].core   = sw2_core;
++               sw2_threads[slot].entry  = (void*)thread_func;
++            }
++         }
+          else
+             threadClose(&thread->t);
+       }
+diff --git a/libretro/main.c b/libretro/main.c
+index e8077df..fe49e8f 100644
+--- a/libretro/main.c
++++ b/libretro/main.c
+@@ -1923,6 +1923,16 @@ void retro_get_system_av_info(struct retro_system_av_info* info)
+ 	info->timing.sample_rate = 48000;
+ }
+ 
++/* SW2PS2: see the end of retro_run. */
++int lrps2_eager_gate = 1;
++/* SW2PS2: fast FPU mode for the arm64 EE recompiler (recR5900_arm64.cpp EmitFpuFastS). */
++int sw2_fast_fpu = 0;
++int sw2_direct_ram = 0;
++int sw2_syscall_interp = 0;
++/* SW2PS2: sampling profiler state, see pcsx2/sw2_prof.h. */
++volatile unsigned sw2_prof_region = 1;
++unsigned sw2_prof_pc(int iop) { return iop ? psxRegs.pc : cpuRegs.pc; }
++
+ void retro_reset(void)
+ {
+ 	cpu_thread_pause();
+@@ -2319,6 +2329,12 @@ static unsigned libretro_vulkan_negotiation_version(void)
+ 
+ void retro_init(void)
+ {
++#ifndef __SWITCH__
++	if (getenv("SW2_FAST_FPU")) sw2_fast_fpu = 1; /* host tests */
++	{ extern int sw2_ipu_batch; if (getenv("SW2_IPU_BATCH")) sw2_ipu_batch = 1; }
++	if (getenv("SW2_SYSCALL_INTERP")) sw2_syscall_interp = 1;
++	if (getenv("SW2_DIRECT_RAM")) sw2_direct_ram = 1;
++#endif
+ 	struct retro_log_callback log;
+    	bool option_categories          = false;
+ 	enum retro_pixel_format xrgb888 = RETRO_PIXEL_FORMAT_XRGB8888;
+@@ -3095,6 +3111,15 @@ void retro_run(void)
+ 		return;
+ 	}
+ 	audio_queue_upload(mtgs_presented_mark, batch_cb);
++
++	/* SW2PS2: let the EE start the next frame now instead of at the next
++	 * retro_run. Between two retro_runs the frontend draws, presents and
++	 * waits for the display; with the gate opened only on entry the EE sat
++	 * idle for all of that and then the frontend sat in retro_run waiting
++	 * for the EE's whole frame, so the two never overlapped. The input the
++	 * frame gets is the one polled at the top of this retro_run. */
++	if (lrps2_eager_gate)
++		mtgs_frame_gate_open();
+ }
+ 
+ WindowInfo host_acquire_render_window(void)
+diff --git a/pcsx2/CDVD/cdvd_flat.c b/pcsx2/CDVD/cdvd_flat.c
+index 939167b..4344d25 100644
+--- a/pcsx2/CDVD/cdvd_flat.c
++++ b/pcsx2/CDVD/cdvd_flat.c
+@@ -19,6 +19,7 @@
+  * a sector at a time for the whole session, and with a mapping every
+  * sector is read straight out of the page cache. Without one (a frontend
+  * VFS, a 32-bit off_t) it is read in chunks through the reader's cache. */
++#include "../sw2_prof.h"
+ #include <stdlib.h>
+ 
+ #include <compat/strl.h>
+@@ -56,6 +57,7 @@ static int flat_read_chunk(cdvd_reader_t* r, void* dst, s64 id)
+ 	cdvd_flat_t* f = (cdvd_flat_t*)r;
+ 	u64          at;
+ 	u32          len;
++	SW2_PROF(SW2P_DISC);
+ 	if (id < 0 || (at = (u64)id * FLAT_CHUNK_SIZE) >= f->file_size)
+ 		return -1;
+ 	if (filestream_seek(f->file, (int64_t)at, RETRO_VFS_SEEK_POSITION_START) != 0)
+diff --git a/pcsx2/Counters.c b/pcsx2/Counters.c
+index eec2889..2a7534a 100644
+--- a/pcsx2/Counters.c
++++ b/pcsx2/Counters.c
+@@ -13,6 +13,7 @@
+  *  If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++#include "sw2_prof.h"
+ #include <time.h>
+ #include <math.h>
+ #include <string.h>
+@@ -727,6 +728,7 @@ static __fi void rcntUpdate_vSync(void)
+ void rcntUpdate(void)
+ {
+ 	int i;
++	SW2_PROF(SW2P_COUNTERS);
+ 	if (cpuTestCycle(vsyncCounter.startCycle, vsyncCounter.deltaCycles))
+ 		rcntUpdate_vSync();
+ 	/* HBlank after as VSync can do error compensation */
+diff --git a/pcsx2/GS/GS.cpp b/pcsx2/GS/GS.cpp
+index fd005a3..df7a31a 100644
+--- a/pcsx2/GS/GS.cpp
++++ b/pcsx2/GS/GS.cpp
+@@ -510,6 +510,13 @@ void GSReadLocalMemoryUnsync(u8* mem, u32 qwc, u64 BITBLITBUF, u64 TRXPOS, u64 T
+ void GSgifTransfer(const u8* mem, u32 size)
+ {
+ 	PROFILE_SCOPE(ZONE_GS_TRANSFER);
++#ifndef __SWITCH__
++	/* SW2PS2 (host only): SW2_NULL_GS=1 drops the drawing, so the EE thread
++	 * is the bottleneck on the host and can be profiled. */
++	static int s_null = -1;
++	if (s_null < 0) s_null = getenv("SW2_NULL_GS") != NULL;
++	if (s_null) return;
++#endif
+ 	const struct gs_renderer_ops* ops = GS_OPS();
+ 	if (ops)
+ 		ops->transfer(mem, size);
+@@ -769,6 +776,21 @@ void GSFreeWrappedMemory(void* ptr, size_t size, size_t repeat)
+ 
+ static int s_shm_fd = -1;
+ 
++#if defined(__SWITCH__)
++// SW2PS2: no mirrored mappings on the Switch 2. The repeats are plain memory,
++// so an access that runs past the end of GS memory stays in bounds but does
++// not wrap to the start as it does with real mirrors.
++void* GSAllocateWrappedMemory(size_t size, size_t repeat)
++{
++	void* p = mmap(nullptr, size * repeat, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++	return p == MAP_FAILED ? nullptr : p;
++}
++
++void GSFreeWrappedMemory(void* ptr, size_t size, size_t repeat)
++{
++	munmap(ptr, size * repeat);
++}
++#else
+ void* GSAllocateWrappedMemory(size_t size, size_t repeat)
+ {
+ #ifdef __ANDROID__
+@@ -819,6 +841,7 @@ void GSFreeWrappedMemory(void* ptr, size_t size, size_t repeat)
+ 	close(s_shm_fd);
+ 	s_shm_fd = -1;
+ }
++#endif // __SWITCH__
+ 
+ #endif
+ 
+diff --git a/pcsx2/GS/Renderers/Common/GSRenderer.cpp b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
+index 98df8cd..9211aa3 100644
+--- a/pcsx2/GS/Renderers/Common/GSRenderer.cpp
++++ b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
+@@ -276,6 +276,13 @@ void GSState::VSyncBase(u32 field, bool registers_written, bool idle_frame)
+ 	bool skip_frame            = false;
+ 
+ 	m_disp_fb_sprite_blits     = 0;
++	{ /* SW2PS2: the game's own frame rate for the front end's stats --
++	   vsyncs with draws into the displayed framebuffer [11], and with GS
++	   privileged registers written [12] (PCSX2's two internal-FPS methods). */
++		extern unsigned long long sw2_gs_stats[16];
++		if (fb_sprite_frame) sw2_gs_stats[11]++;
++		if (registers_written) sw2_gs_stats[12]++;
++	}
+ 
+ 	if (GSConfig.SkipDuplicateFrames)
+ 	{
+diff --git a/pcsx2/GS/Renderers/OpenGL/GLStreamBuffer.c b/pcsx2/GS/Renderers/OpenGL/GLStreamBuffer.c
+index cb5672d..87d858a 100644
+--- a/pcsx2/GS/Renderers/OpenGL/GLStreamBuffer.c
++++ b/pcsx2/GS/Renderers/OpenGL/GLStreamBuffer.c
+@@ -13,6 +13,7 @@
+  *  If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++#include "../../../sw2_prof.h"
+ #include <string.h>
+ 
+ #include <memalign.h>
+@@ -162,7 +163,9 @@ static void gs_gl_stream_add_syncs(gs_gl_stream_buffer* sb, u32 offset)
+ 
+ static void gs_gl_stream_wait(GLsync* sync)
+ {
++	{ SW2_TIME_BEGIN();
+ 	glClientWaitSync(*sync, GL_SYNC_FLUSH_COMMANDS_BIT, GL_TIMEOUT_IGNORED);
++	SW2_TIME_END(5); }
+ 	glDeleteSync(*sync);
+ 	*sync = NULL;
+ }
+diff --git a/pcsx2/GS/Renderers/OpenGL/GSDeviceOGL.h b/pcsx2/GS/Renderers/OpenGL/GSDeviceOGL.h
+index 898d037..7d5aed9 100644
+--- a/pcsx2/GS/Renderers/OpenGL/GSDeviceOGL.h
++++ b/pcsx2/GS/Renderers/OpenGL/GSDeviceOGL.h
+@@ -15,6 +15,7 @@
+ 
+ #pragma once
+ 
++#include "../../../sw2_prof.h"
+ #include "GLContext.h"
+ #include "GLStreamBuffer.h"
+ #include "GLVertexInput.h"
+@@ -287,7 +288,11 @@ public:
+ 	__fi void FinishBeforeCpuRead() const
+ 	{
+ 		if (m_cpu_reads_need_finish)
++		{
++			SW2_TIME_BEGIN();
+ 			glFinish();
++			SW2_TIME_END(6);
++		}
+ 	}
+ 	__fi bool IsColClipFloat() const { return m_colclip_float; }
+ 	GLenum GLBlendFactor(u8 factor) const;
+diff --git a/pcsx2/GS/Renderers/OpenGL/GSTextureOGL.c b/pcsx2/GS/Renderers/OpenGL/GSTextureOGL.c
+index 1ac2e9d..af7682a 100644
+--- a/pcsx2/GS/Renderers/OpenGL/GSTextureOGL.c
++++ b/pcsx2/GS/Renderers/OpenGL/GSTextureOGL.c
+@@ -13,6 +13,7 @@
+  *  If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++#include "../../../sw2_prof.h"
+ #include <stdlib.h>
+ #include <string.h>
+ 
+@@ -284,7 +285,9 @@ static void gs_download_texture_gl_flush(gs_download_texture* base)
+ 	if (!base->m_needs_flush || !t->sync)
+ 		return;
+ 	base->m_needs_flush = 0;
++	{ SW2_TIME_BEGIN();
+ 	glClientWaitSync(t->sync, GL_SYNC_FLUSH_COMMANDS_BIT, GL_TIMEOUT_IGNORED);
++	SW2_TIME_END(6); }
+ 	glDeleteSync(t->sync);
+ 	t->sync = NULL;
+ }
+diff --git a/pcsx2/Gif.c b/pcsx2/Gif.c
+index 9378014..732cc15 100644
+--- a/pcsx2/Gif.c
++++ b/pcsx2/Gif.c
+@@ -13,6 +13,7 @@
+  *  If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++#include "sw2_prof.h"
+ #include "Common.h"
+ 
+ #include <string.h>
+@@ -294,6 +295,7 @@ static __fi void gifInterrupt_inl(void)
+ 
+ void gifInterrupt(void)
+ {
++	SW2_PROF(SW2P_GIF);
+ 	gifInterrupt_inl();
+ }
+ 
+@@ -446,6 +448,7 @@ void GIFdma(void)
+ 
+ void dmaGIF(void)
+ {
++	SW2_PROF(SW2P_GIF);
+ 	gif.gspath3done = false; /* For some reason this doesn't clear? So when the system starts the thread, we will clear it :) */
+ 	cpuRegs.dmastall &= ~(1 << DMAC_GIF);
+ 	if (gifch.chcr.MOD == NORMAL_MODE) /* Else it really is a normal transfer and we want to quit, else it gets confused with chains */
+diff --git a/pcsx2/IPU/IPU.c b/pcsx2/IPU/IPU.c
+index 2b0eb04..58ec291 100644
+--- a/pcsx2/IPU/IPU.c
++++ b/pcsx2/IPU/IPU.c
+@@ -85,10 +85,31 @@ void ipu_cmd_clear(void)
+ 	ipu_cmd.current = 0xffffffff;
+ }
+ 
++/* SW2PS2: batched output. Normally the decoder fills the 8-quadword output
++ * FIFO, an event later the FROM_IPU DMA drains it, and an event after that the
++ * decoder continues: two event tests per 128 bytes, which in God of War II
++ * came to ~16,000 event tests a frame and a quarter of the EE thread. With
++ * sw2_ipu_batch, while the DMA can take more than the FIFO holds, the drain
++ * and the next decode step happen here at once (up to 64 rounds); the last
++ * round leaves the usual events pending, so the DMA's end and the handshake
++ * with the game run as before. The IPU just finishes sooner. */
++int sw2_ipu_batch = 0;
++extern void IPU0dma(void);
++
+ void IPUProcessInterrupt(void)
+ {
+-	if (ipuRegs.ctrl.BUSY)
++	int rounds = 0;
++	if (!ipuRegs.ctrl.BUSY)
++		return;
++	IPUWorker();
++	while (sw2_ipu_batch && ++rounds < 64 && ipuRegs.ctrl.BUSY && IPUCoreStatus.WaitingOnIPUFrom
++	       && ipuRegs.ctrl.OFC && ipu0ch.chcr.STR && ipu0ch.qwc > ipuRegs.ctrl.OFC)
++	{
++		cpuRegs.interrupt &= ~(1 << DMAC_FROM_IPU); /* drain now, not at the pending event */
++		IPU0dma();                                  /* clears WaitingOnIPUFrom, schedules IPU_PROCESS */
++		cpuRegs.interrupt &= ~(1 << IPU_PROCESS);   /* ...which runs now instead */
+ 		IPUWorker();
++	}
+ }
+ 
+ /* ---- register accesses, on the EE thread ---- */
+diff --git a/pcsx2/Interpreter.c b/pcsx2/Interpreter.c
+index c270e3c..93c85ff 100644
+--- a/pcsx2/Interpreter.c
++++ b/pcsx2/Interpreter.c
+@@ -499,6 +499,26 @@ static void eeExecuteLoop(void)
+ 		switch (state) {
+ 		case EXEC_RESET:
+ 			{
++#ifdef ARCH_ARM64
++				if (g_ee_block_runner)
++				{
++					/* SW2PS2: the BIOS boot on the JIT. The interpreter only
++					 * steps the instruction AT the stop pc (no block starts
++					 * there); everything else runs as compiled blocks, which
++					 * end at the stop pc. */
++					const u32 stop = g_eeloadMain ? g_eeloadMain : EELOAD_START;
++					eeJitSetStopPc_arm64(stop);
++					do
++					{
++						if (cpuRegs.pc == stop)
++							execI();
++						else
++							g_ee_block_runner();
++					} while (cpuRegs.pc != stop);
++					eeJitSetStopPc_arm64(0);
++				}
++				else
++#endif
+ 				do
+ 				{
+ 					execI();
+@@ -540,6 +560,22 @@ static void eeExecuteLoop(void)
+ 		case EXEC_GAME_LOADING:
+ 			if (ElfEntry != 0xFFFFFFFF)
+ 			{
++#ifdef ARCH_ARM64
++				if (g_ee_block_runner)
++				{
++					const u32 stop = ElfEntry; /* SW2PS2: as above, up to the game's entry point */
++					eeJitSetStopPc_arm64(stop);
++					do
++					{
++						if (cpuRegs.pc == stop)
++							execI();
++						else
++							g_ee_block_runner();
++					} while (cpuRegs.pc != stop);
++					eeJitSetStopPc_arm64(0);
++				}
++				else
++#endif
+ 				do
+ 				{
+ 					execI();
+@@ -576,8 +612,57 @@ static void intExecute(void)
+ /* Run a single EE basic block through the interpreter (instructions until the */
+ /* next taken branch). The arm64 JIT's per-PC blocks call this for now (Phase */
+ /* C.3-1); later phases translate the instructions natively. */
++#ifndef __SWITCH__
++#include <stdio.h>
++/* SW2PS2 (host only): SW2_FALLBACK_STATS=1 counts the instructions the arm64
++ * EE rec hands to the interpreter, by opcode (key: op << 8 | sub-op), and
++ * prints them at exit. */
++static unsigned long long s_fb_first[64 << 8], s_fb_all[64 << 8], s_fb_calls;
++static int s_fb_on = -1;
++static unsigned fb_key(u32 c)
++{
++	const u32 op = c >> 26;
++	u32 sub = 0;
++	if (op == 0 || op == 28) sub = c & 0x3f;
++	else if (op == 1) sub = (c >> 16) & 31;
++	else if (op == 16 || op == 17 || op == 18) sub = ((c >> 21) & 31) >= 16 ? 0x80 | (c & 0x3f) : (c >> 21) & 31;
++	return (op << 8) | sub;
++}
++static void fb_dump(void)
++{
++	unsigned i, j, best;
++	unsigned long long total = 0;
++	for (i = 0; i < (64u << 8); i++) total += s_fb_all[i];
++	fprintf(stderr, "[fallback] %llu interpreter tails, %llu instructions\n", s_fb_calls, total);
++	for (j = 0; j < 25; j++)
++	{
++		best = 0;
++		for (i = 0; i < (64u << 8); i++) if (s_fb_first[i] > s_fb_first[best]) best = i;
++		if (!s_fb_first[best]) break;
++		fprintf(stderr, "[fallback]   op %2u sub 0x%02x: %llu tails start here\n", best >> 8, best & 0xff, s_fb_first[best]);
++		s_fb_first[best] = 0;
++	}
++}
++#endif
++
+ void eeRunBasicBlock_arm64(void)
+ {
++#ifndef __SWITCH__
++	if (s_fb_on < 0) { s_fb_on = getenv("SW2_FALLBACK_STATS") != NULL; if (s_fb_on) atexit(fb_dump); }
++	if (s_fb_on)
++	{
++		int first = 1;
++		s_fb_calls++;
++		branch2 = 0;
++		do {
++			const unsigned k = fb_key(memRead32(cpuRegs.pc));
++			if (first) { s_fb_first[k]++; first = 0; }
++			s_fb_all[k]++;
++			execI();
++		} while (!branch2);
++		return;
++	}
++#endif
+ 	branch2 = 0;
+ 	do { execI(); } while (!branch2);
+ }
+@@ -592,19 +677,48 @@ void eeRecExecute_arm64(void)
+ /* JIT's natively-translated loads/stores (Phase C.3-3). Defined here so they see */
+ /* Memory.h / Cpu. Cpu->CancelInstruction() fastjmps to intJmpBuf, which is safe */
+ /* from JIT code (fastjmp restores sp and callee-saved regs). */
+-u32  eeRead8_arm64 (u32 a) { return memRead8(a); }
+-u32  eeRead16_arm64(u32 a) { return memRead16(a); }
+-u32  eeRead32_arm64(u32 a) { return memRead32(a); }
+-u64  eeRead64_arm64(u32 a) { return memRead64(a); }
++#ifndef __SWITCH__
++/* SW2PS2 (host only): SW2_SLOWMEM_STATS=1 counts the JIT's slow-path memory
++ * accesses by 64 KB region (address >> 16), printed at exit. */
++static unsigned long long s_sm[0x10000 * 2], s_sm_kind[16];
++static int s_sm_on = -1;
++static void sm_dump(void)
++{
++	unsigned i, j, best; unsigned long long t = 0;
++	for (i = 0; i < 0x20000; i++) t += s_sm[i];
++	fprintf(stderr, "[slowmem] %llu slow-path accesses (r8 %llu r16 %llu r32 %llu r64 %llu r128 %llu | w8 %llu w16 %llu w32 %llu w64 %llu w128 %llu)\n", t,
++		s_sm_kind[0], s_sm_kind[1], s_sm_kind[2], s_sm_kind[3], s_sm_kind[4], s_sm_kind[8], s_sm_kind[9], s_sm_kind[10], s_sm_kind[11], s_sm_kind[12]);
++	{ extern void sw2_vmap_dump(void); sw2_vmap_dump(); }
++	for (j = 0; j < 20; j++) {
++		best = 0; for (i = 0; i < 0x20000; i++) if (s_sm[i] > s_sm[best]) best = i;
++		if (!s_sm[best]) break;
++		fprintf(stderr, "[slowmem]   %s %04x0000: %llu\n", best >= 0x10000 ? "write" : "read ", best & 0xffff, s_sm[best]);
++		s_sm[best] = 0;
++	}
++}
++static inline void sm_count(u32 a, int w, int k)
++{
++	if (s_sm_on > 0) s_sm_kind[k]++;
++	if (s_sm_on < 0) { s_sm_on = getenv("SW2_SLOWMEM_STATS") != NULL; if (s_sm_on) atexit(sm_dump); }
++	if (s_sm_on) s_sm[(w ? 0x10000 : 0) + (a >> 16)]++;
++}
++#define SM(a, w, k) sm_count((a), (w), (k))
++#else
++#define SM(a, w, k) ((void)0)
++#endif
++u32  eeRead8_arm64 (u32 a) { SM(a, 0, 0); return memRead8(a); }
++u32  eeRead16_arm64(u32 a) { SM(a, 0, 1); return memRead16(a); }
++u32  eeRead32_arm64(u32 a) { SM(a, 0, 2); return memRead32(a); }
++u64  eeRead64_arm64(u32 a) { SM(a, 0, 3); return memRead64(a); }
+ /* 128-bit LQ/SQ wrappers (Phase C.12). LQ/SQ silently align (addr & ~0xf on the */
+ /* caller side); dst/src is &cpuRegs.GPR.r[rt]. These are the slow path -- the */
+ /* JIT inlines the vtlb direct-pointer case and only calls here for handlers. */
+-void eeRead128_arm64 (u32 a, u128* dst)       { memRead128(a, dst); }
+-void eeWrite128_arm64(u32 a, const u128* src) { memWrite128(a, src); }
+-void eeWrite8_arm64 (u32 a, u32 v) { memWrite8(a, (u8)v); }
+-void eeWrite16_arm64(u32 a, u32 v) { memWrite16(a, (u16)v); }
+-void eeWrite32_arm64(u32 a, u32 v) { memWrite32(a, v); }
+-void eeWrite64_arm64(u32 a, u64 v) { memWrite64(a, v); }
++void eeRead128_arm64 (u32 a, u128* dst)       { SM(a, 0, 4); memRead128(a, dst); }
++void eeWrite128_arm64(u32 a, const u128* src) { SM(a, 1, 12); memWrite128(a, src); }
++void eeWrite8_arm64 (u32 a, u32 v) { SM(a, 1, 8); memWrite8(a, (u8)v); }
++void eeWrite16_arm64(u32 a, u32 v) { SM(a, 1, 9); memWrite16(a, (u16)v); }
++void eeWrite32_arm64(u32 a, u32 v) { SM(a, 1, 10); memWrite32(a, v); }
++void eeWrite64_arm64(u32 a, u64 v) { SM(a, 1, 11); memWrite64(a, v); }
+ void eeCancelInstruction_arm64(void) { Cpu->CancelInstruction(); }
+ /* Unaligned load/store family (LWL/LWR/LDL/LDR, SWL/SWR/SDL/SDR), called from */
+ /* the arm64 EE JIT (C.16) with the decoded rt index. Line-for-line mirrors of */
+diff --git a/pcsx2/MTGS.c b/pcsx2/MTGS.c
+index 3d29e17..256d9bf 100644
+--- a/pcsx2/MTGS.c
++++ b/pcsx2/MTGS.c
+@@ -13,6 +13,15 @@
+  *  If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++#include "sw2_prof.h"
++
++/* SW2PS2: wait timers for the front end's log (ticks of the system counter).
++ * 0 EE waiting for the GS, 1 its count, 2 GS side idle (ring empty),
++ * 3 GS side waiting for the VU1 worker, 4 EE at the frame gate,
++ * 5 GL stream buffer fence waits, 6 GL texture/finish waits,
++ * 7 GS work (ring commands), 8 vsync/present command. */
++unsigned long long sw2_gs_stats[16];
++unsigned long long sw2_int_bits[33];
+ #include <string.h>
+ 
+ #include "Common.h"
+@@ -163,6 +172,8 @@ static void mtgs_gate_notify(void)
+  * the GS gone, the vsync is where it stops, as a drained one is. */
+ static void mtgs_gate_wait(void)
+ {
++	const unsigned long long sw2_t0 = sw2_ticks();
++	SW2_PROF(SW2P_GATE_WAIT);
+ 	while (!MTGS_GATE_OPEN())
+ 	{
+ 		const int key = retro_eventcount_prepare_wait(&s_gate_ec);
+@@ -173,6 +184,7 @@ static void mtgs_gate_wait(void)
+ 		}
+ 		retro_eventcount_commit_wait(&s_gate_ec, key);
+ 	}
++	sw2_gs_stats[4] += sw2_ticks() - sw2_t0;
+ 	if (retro_atomic_load_acquire_int(&s_gate_granted) != s_gate_taken)
+ 		s_gate_taken++;
+ 	else
+@@ -240,6 +252,15 @@ void mtgs_reset_gs(bool hardware_reset)
+ 
+ void mtgs_post_vsync_start(void)
+ {
++	/* SW2PS2: the game's own frame rate -- a game shows a new frame by
++	 * pointing a display circuit at another buffer, so count the vsyncs at
++	 * which DISPFB1/DISPFB2 changed (sw2_gs_stats[10]). */
++	{
++		static u64 s_prev1, s_prev2;
++		const u64 d1 = *(const u64*)(PS2MEM_GS + 0x70), d2 = *(const u64*)(PS2MEM_GS + 0x90);
++		if (d1 != s_prev1 || d2 != s_prev2) sw2_gs_stats[10]++;
++		s_prev1 = d1; s_prev2 = d2;
++	}
+ 	PacketTagType* tag = RingWriteBegin();
+ 	if (tag)
+ 	{
+@@ -261,7 +282,7 @@ void mtgs_post_vsync_start(void)
+ 	{
+ 		static u64 last_wall, last_idle, last_wait;
+ 		static unsigned long frames;
+-		const u64 now = __builtin_ia32_rdtsc();
++		const u64 now = pcsx2_profile_now_ticks();
+ 		if ((++frames % 60) == 0)
+ 		{
+ 			const double wall = (double)(now - last_wall);
+@@ -374,6 +395,7 @@ static void mtgs_drain_mtvu_program(void)
+ 		 * microseconds apart, then register, re-check, park. */
+ 		if (!gif_path_pending_packets(path))
+ 		{
++			const unsigned long long sw2_t0 = sw2_ticks();
+ 			s32 spins = WorkEventCount_SpinBudget();
+ 			while (!gif_path_pending_packets(path) && spins-- > 0)
+ 				WORK_EVENTCOUNT_RELAX();
+@@ -387,6 +409,7 @@ static void mtgs_drain_mtvu_program(void)
+ 				}
+ 				retro_asym_eventcount_commit_wait(s_ec_xgkick, key);
+ 			}
++			sw2_gs_stats[3] += sw2_ticks() - sw2_t0;
+ 		}
+ 		gsPack = gif_path_get_packet_mtvu(path);
+ 		if (gsPack.size)
+@@ -427,14 +450,19 @@ bool mtgs_main_loop(bool flush_all)
+ 			 * that only a wedge reaches it: a second with nothing at all
+ 			 * in the ring, not an EE busy recompiling or a slow build. */
+ #ifdef ENABLE_PCSX2_PROFILER
+-			const u64  t0  = __builtin_ia32_rdtsc();
++			const u64  t0  = pcsx2_profile_now_ticks();
+ 			const bool got = work_eventcount_wait_timed(&s_sem_event, MTGS_WEDGE_MS);
+-			g_gs_idle_ticks += __builtin_ia32_rdtsc() - t0;
++			g_gs_idle_ticks += pcsx2_profile_now_ticks() - t0;
+ 			if (!got)
+ 				return false;
+ #else
+-			if (!work_eventcount_wait_timed(&s_sem_event, MTGS_WEDGE_MS))
+-				return false;
++			{
++				const unsigned long long sw2_t0 = sw2_ticks();
++				const bool sw2_got = work_eventcount_wait_timed(&s_sem_event, MTGS_WEDGE_MS);
++				sw2_gs_stats[2] += sw2_ticks() - sw2_t0;
++				if (!sw2_got)
++					return false;
++			}
+ #endif
+ 		}
+ 
+@@ -625,8 +653,10 @@ void mtgs_wait_gs(bool isMTVU)
+ 	 * produces. A producer's wait parks until the frontend's side has
+ 	 * drained the ring, which every retro_run does; anyone else's wait
+ 	 * drains it here. */
++	unsigned sw2_prof_prev __attribute__((cleanup(sw2_prof_restore))) = sw2_prof_region;
+ 	if (!isMTVU)
+ 	{
++		sw2_prof_region = SW2P_GS_WAIT;
+ 		if (MTGS_WAIT_DRAINS(sthread_get_current_thread_id(), s_producer_thread, 0))
+ 		{
+ 			/* Entries may have been written without a notify (a frame
+@@ -641,22 +671,27 @@ void mtgs_wait_gs(bool isMTVU)
+ 		work_eventcount_notify(&s_sem_event);
+ 		/* Blocks until mtgs_main_loop has committed every record written
+ 		 * so far, the vsync among them. */
+-		if (s_RingOk)
+-			work_eventcount_wait_drained(&s_sem_event, mtgs_ring_drained, NULL);
+-		else
+-			work_eventcount_wait_empty(&s_sem_event);
++		{
++			const unsigned long long sw2_t0 = sw2_ticks();
++			if (s_RingOk)
++				work_eventcount_wait_drained(&s_sem_event, mtgs_ring_drained, NULL);
++			else
++				work_eventcount_wait_empty(&s_sem_event);
++			sw2_gs_stats[0] += sw2_ticks() - sw2_t0;
++			sw2_gs_stats[1]++;
++		}
+ 		return;
+ 	}
+ 	if (!mtgs_is_open()) /* issued on a closed GS */
+ 		return;
+ 
+ #ifdef ENABLE_PCSX2_PROFILER
+-	t_wait0 = __builtin_ia32_rdtsc();
++	t_wait0 = pcsx2_profile_now_ticks();
+ #endif
+ 	work_eventcount_notify(&s_sem_event);
+ 	mtgs_wait_p1_progress();
+ #ifdef ENABLE_PCSX2_PROFILER
+-	g_ee_wait_ticks += __builtin_ia32_rdtsc() - t_wait0;
++	g_ee_wait_ticks += pcsx2_profile_now_ticks() - t_wait0;
+ #endif
+ }
+ 
+diff --git a/pcsx2/MTVU.c b/pcsx2/MTVU.c
+index c181016..4334d3d 100644
+--- a/pcsx2/MTVU.c
++++ b/pcsx2/MTVU.c
+@@ -13,6 +13,7 @@
+  *  If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++#include "sw2_prof.h"
+ #include <string.h>
+ #include <faulthandler.h>
+ 
+@@ -134,6 +135,10 @@ static __fi void mtvu_read_regs(VIFregisters* dest)
+  * point is the only hazard, and every observation point notifies. */
+ static void mtvu_kick_start(void)
+ {
++	/* SW2PS2: VIF unpacks no longer publish one by one (see
++	 * mtvu_vif_unpack); whatever they wrote becomes visible here, before
++	 * the notify, at every flush point. */
++	mtvu_publish();
+ 	s_kickPending = false;
+ 	work_eventcount_notify(&vu1Thread.semaEvent);
+ }
+@@ -171,9 +176,16 @@ sthread_t* mtvu_thread(void)
+  * Equal positions mean an empty ring, never a full one: a writer that
+  * came all the way round onto the reader would have filled it.
+  * tests/mtvuring holds this at a million packets. */
+-static __fi bool mtvu_has_space(s32 size, bool* need_wrap)
++/* SW2PS2: the reader's position as last seen. The reader only ever frees
++ * space (it moves on, or wraps after we have), so an old value can only
++ * understate the room: it is checked first, and the shared position --
++ * a cache line the worker writes after every packet -- is read only when
++ * the old value says there is not enough. With ~30,000 VIF unpacks a frame
++ * in Shadow of the Colossus, reading it each time kept that line bouncing
++ * between the two cores. */
++static s32 s_seenReadPos;
++static __fi bool mtvu_space_at(s32 readPos, s32 size, bool* need_wrap)
+ {
+-	const s32 readPos = retro_atomic_load_acquire_int(&vu1Thread.ato_read_pos);
+ 	*need_wrap = false;
+ 	if (readPos > vu1Thread.write_pos)
+ 		return (vu1Thread.write_pos + size < readPos);
+@@ -182,7 +194,13 @@ static __fi bool mtvu_has_space(s32 size, bool* need_wrap)
+ 	*need_wrap = true;
+ 	return (readPos > 0 && size < readPos);
+ }
+-
++static __fi bool mtvu_has_space(s32 size, bool* need_wrap)
++{
++	if (mtvu_space_at(s_seenReadPos, size, need_wrap))
++		return true;
++	s_seenReadPos = retro_atomic_load_acquire_int(&vu1Thread.ato_read_pos);
++	return mtvu_space_at(s_seenReadPos, size, need_wrap);
++}
+ static bool mtvu_wait_on_size(s32 size)
+ {
+ 	bool need_wrap;
+@@ -377,6 +395,7 @@ void mtvu_reset(void)
+ 	retro_atomic_store_release_int(&vu1Thread.ato_write_pos, 0);
+ 	vu1Thread.write_pos = 0;
+ 	retro_atomic_store_release_int(&vu1Thread.ato_read_pos, 0);
++	s_seenReadPos = 0;
+ 	vu1Thread.read_pos = 0;
+ 	memset(&vu1Thread.vif, 0, sizeof(vu1Thread.vif));
+ 	memset(&vu1Thread.vifRegs, 0, sizeof(vu1Thread.vifRegs));
+@@ -610,6 +629,7 @@ struct retro_asym_eventcount* mtvu_ec_p1_progress(void)
+ 
+ void mtvu_wait_vu(void)
+ {
++	SW2_PROF(SW2P_VU1_WAIT);
+ 	/* The empty wait trusts the work count: flush a deferred unpack
+ 	 * notify first, or it can pass with work still in the ring. */
+ 	mtvu_kick_pending();
+@@ -643,8 +663,17 @@ void mtvu_execute_vu(u32 vu_addr, u32 vif_top, u32 vif_itop, u32 fbrst)
+ }
+ 
+ /* VIF1's unpacks (Vif_Unpack.c). */
++#ifndef __SWITCH__
++#include <stdio.h>
++static unsigned long long s_up_n, s_up_bytes, s_up_hist[8];
++static void up_dump(void) { fprintf(stderr, "[mtvu] %llu unpacks, %llu bytes (avg %.0f); <=32:%llu <=64:%llu <=128:%llu <=256:%llu <=512:%llu <=1K:%llu more:%llu\n", s_up_n, s_up_bytes, s_up_n ? (double)s_up_bytes / s_up_n : 0.0, s_up_hist[0], s_up_hist[1], s_up_hist[2], s_up_hist[3], s_up_hist[4], s_up_hist[5], s_up_hist[6]); }
++#endif
+ void mtvu_vif_unpack(const u8* data, u32 size)
+ {
++#ifndef __SWITCH__
++	{ static int on = -1; if (on < 0) { on = getenv("SW2_MTVU_STATS") != NULL; if (on) atexit(up_dump); }
++	  if (on) { int b = size <= 32 ? 0 : size <= 64 ? 1 : size <= 128 ? 2 : size <= 256 ? 3 : size <= 512 ? 4 : size <= 1024 ? 5 : 6; s_up_n++; s_up_bytes += size; s_up_hist[b]++; } }
++#endif
+ 	const u32 vif_copy_size = (u32)((uptr)&vif1.StructEnd - (uptr)&vif1.tag);
+ 	mtvu_reserve(1 + SIZE_U32(vif_copy_size) + SIZE_U32(sizeof(VIFregistersMTVU)) + 1 + SIZE_U32(size));
+ 	mtvu_write(MTVU_VIF_UNPACK);
+@@ -652,8 +681,10 @@ void mtvu_vif_unpack(const u8* data, u32 size)
+ 	mtvu_write_regs(&vif1Regs);
+ 	mtvu_write(size);
+ 	mtvu_write_bytes(data, size);
+-	mtvu_publish();
+-	s_kickPending = true; /* published; the notify waits for a flush point */
++	/* SW2PS2: not published here: mtvu_kick_start publishes at the flush
++	 * point the notify already waits for (one store instead of one per
++	 * unpack -- ~30,000 a frame in Shadow of the Colossus). */
++	s_kickPending = true;
+ }
+ 
+ void* mtvu_write_mem_begin(int data_mem, u32 addr, u32 size)
+diff --git a/pcsx2/MemoryCardFile.c b/pcsx2/MemoryCardFile.c
+index 01c9dec..815409a 100644
+--- a/pcsx2/MemoryCardFile.c
++++ b/pcsx2/MemoryCardFile.c
+@@ -23,6 +23,9 @@
+ #include <streams/file_stream.h>
+ #include <string/stdstring.h>
+ #include <libretro.h>
++#include <rthreads/rthreads.h>
++#include <features/features_cpu.h>
++#include <retro_timers.h>
+ 
+ #include "MemoryCardFile.h"
+ #include "memcard_ecc.h"
+@@ -35,7 +38,7 @@ extern retro_log_printf_t log_cb;
+ #define PSX_CARD_SIZE 0x20000
+ 
+ /* A card per combined slot, the whole image in RAM: reads come from it,
+- * writes go to it and through to the file at once. */
++ * writes go to it and to the file shortly after (write-behind, below). */
+ typedef struct mcd_card
+ {
+ 	RFILE* file;
+@@ -48,10 +51,84 @@ typedef struct mcd_card
+ 	/* Its MagicGate ID, from <image>.id or the slot's named file. */
+ 	bool has_mg_id;
+ 	u8 mg_id[8];
++	/* SW2PS2: erase blocks changed in RAM and not yet written to the file
++	 * (see the write-behind below). */
++	u8* dirty;
++	size_t nblocks;
+ } mcd_card;
+ 
+ static mcd_card s_cards[MCD_SLOTS];
+ static bool s_open;
++
++/* SW2PS2: write-behind. Writing every sector through to the file at once
++ * stalled the emulation thread on slow storage (the Switch 2's SD card) for
++ * the whole of a save. Writes now change the RAM image, which reads already
++ * come from, and mark their erase blocks; a thread writes the marked blocks
++ * once the game has not written for a moment, and closing writes the rest. */
++static slock_t* s_mcd_lock;
++static sthread_t* s_mcd_flusher;
++static volatile bool s_mcd_flusher_run;
++static volatile retro_time_t s_mcd_last_write;
++static volatile bool s_mcd_any_dirty;
++
++static void mark_dirty(mcd_card* c, size_t adr, size_t size)
++{
++	size_t b, last;
++	if (!c->dirty || !size)
++		return;
++	last = (adr + size - 1) / MC2_ERASE_SIZE;
++	for (b = adr / MC2_ERASE_SIZE; b <= last && b < c->nblocks; b++)
++		c->dirty[b] = 1;
++	s_mcd_last_write = cpu_features_get_time_usec();
++	s_mcd_any_dirty = true;
++}
++
++/* Writes the marked blocks of every card. With the lock held throughout when
++ * `hold`, else a block is copied under the lock and written outside it. */
++static void flush_cards(bool hold)
++{
++	static u8 buf[MC2_ERASE_SIZE];
++	uint slot;
++	size_t b;
++	if (hold) slock_lock(s_mcd_lock);
++	s_mcd_any_dirty = false;
++	for (slot = 0; slot < MCD_SLOTS; ++slot)
++	{
++		mcd_card* c = &s_cards[slot];
++		bool wrote = false;
++		if (!c->file || !c->dirty)
++			continue;
++		for (b = 0; b < c->nblocks; b++)
++		{
++			size_t at, n;
++			if (!c->dirty[b])
++				continue;
++			at = b * MC2_ERASE_SIZE;
++			n = c->size - at < MC2_ERASE_SIZE ? c->size - at : MC2_ERASE_SIZE;
++			if (!hold) slock_lock(s_mcd_lock);
++			c->dirty[b] = 0;
++			memcpy(buf, c->data + at, n);
++			if (!hold) slock_unlock(s_mcd_lock);
++			if (filestream_seek(c->file, at, RETRO_VFS_SEEK_POSITION_START) == 0)
++				filestream_write(c->file, buf, n);
++			wrote = true;
++		}
++		if (wrote)
++			filestream_flush(c->file);
++	}
++	if (hold) slock_unlock(s_mcd_lock);
++}
++
++static void mcd_flusher(void* arg)
++{
++	(void)arg;
++	while (s_mcd_flusher_run)
++	{
++		retro_sleep(100);
++		if (s_mcd_any_dirty && cpu_features_get_time_usec() - s_mcd_last_write > 300000)
++			flush_cards(false);
++	}
++}
+ /* The checksum word's place in a PS2 card. */
+ static const u32 s_chkaddr = 0x210;
+ /* An ID file named for the slot, in place of the one beside its image. */
+@@ -287,6 +364,14 @@ static void open_cards(void)
+ 		if (!emu_config_mcd(slot, paths, PCSX2_PATH_MAX) || !paths[0])
+ 			continue;
+ 		open_card(slot, paths, staged);
++		{
++			mcd_card* oc = &s_cards[slot];
++			if (oc->data && oc->size)
++			{
++				oc->nblocks = (oc->size + MC2_ERASE_SIZE - 1) / MC2_ERASE_SIZE;
++				oc->dirty = (u8*)calloc(oc->nblocks, 1);
++			}
++		}
+ 	}
+ 	free(paths);
+ 	free(staged);
+@@ -295,6 +380,8 @@ static void open_cards(void)
+ static void close_cards(void)
+ {
+ 	uint slot;
++	if (s_mcd_lock)
++		flush_cards(true);
+ 	for (slot = 0; slot < MCD_SLOTS; ++slot)
+ 	{
+ 		mcd_card* c = &s_cards[slot];
+@@ -321,8 +408,11 @@ static void close_cards(void)
+ 		}
+ 
+ 		free(c->data);
++		free(c->dirty);
+ 		free(c->filename);
+ 		c->data = NULL;
++		c->dirty = NULL;
++		c->nblocks = 0;
+ 		c->filename = NULL;
+ 		c->size = 0;
+ 		c->file_size = -1;
+@@ -334,7 +424,12 @@ void FileMcd_EmuOpen(void)
+ 	if (s_open)
+ 		return;
+ 	s_open = true;
++	if (!s_mcd_lock)
++		s_mcd_lock = slock_new();
+ 	open_cards();
++	s_mcd_flusher_run = true;
++	if (!s_mcd_flusher)
++		s_mcd_flusher = sthread_create(mcd_flusher, NULL);
+ }
+ 
+ void FileMcd_EmuClose(void)
+@@ -342,6 +437,12 @@ void FileMcd_EmuClose(void)
+ 	if (!s_open)
+ 		return;
+ 	s_open = false;
++	if (s_mcd_flusher)
++	{
++		s_mcd_flusher_run = false;
++		sthread_join(s_mcd_flusher);
++		s_mcd_flusher = NULL;
++	}
+ 	close_cards();
+ }
+ 
+@@ -408,6 +509,7 @@ s32 FileMcd_Save(uint port, uint slot, const u8* src, u32 adr, int size)
+ 		return 1;
+ 	if ((size_t)adr + (size_t)size > c->size)
+ 		return 0;
++	slock_lock(s_mcd_lock);
+ 	dst = c->data + adr;
+ 	if (c->ispsx)
+ 		memcpy(dst, src, (size_t)size);
+@@ -424,10 +526,10 @@ s32 FileMcd_Save(uint port, uint slot, const u8* src, u32 adr, int size)
+ 			c->chksum ^= w;
+ 		}
+ 	}
+-	/* Just the changed region goes to the file, at once. */
+-	if (filestream_seek(c->file, adr, RETRO_VFS_SEEK_POSITION_START) != 0)
+-		return 0;
+-	return filestream_write(c->file, dst, size) == (int64_t)size;
++	/* The changed region goes to the file shortly (write-behind, above). */
++	mark_dirty(c, adr, (size_t)size);
++	slock_unlock(s_mcd_lock);
++	return 1;
+ }
+ 
+ s32 FileMcd_EraseBlock(uint port, uint slot, u32 adr)
+@@ -439,10 +541,11 @@ s32 FileMcd_EraseBlock(uint port, uint slot, u32 adr)
+ 		return 0;
+ 	/* The RAM image and the file both: a later read must not see what was
+ 	 * there before. */
++	slock_lock(s_mcd_lock);
+ 	memset(c->data + adr, 0xff, MC2_ERASE_SIZE);
+-	if (filestream_seek(c->file, adr, RETRO_VFS_SEEK_POSITION_START) != 0)
+-		return 0;
+-	return filestream_write(c->file, c->data + adr, MC2_ERASE_SIZE) == (int64_t)MC2_ERASE_SIZE;
++	mark_dirty(c, adr, MC2_ERASE_SIZE);
++	slock_unlock(s_mcd_lock);
++	return 1;
+ }
+ 
+ u64 FileMcd_GetCRC(uint port, uint slot)
+diff --git a/pcsx2/Profiler.h b/pcsx2/Profiler.h
+index f289fc8..7b38158 100644
+--- a/pcsx2/Profiler.h
++++ b/pcsx2/Profiler.h
+@@ -107,7 +107,7 @@ static PCSX2_INLINE u64 pcsx2_profile_now_ticks(void)
+ 	return (u64)__rdtsc();
+ #elif defined(__aarch64__)
+ 	u64 v;
+-	__asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(v));
++	__asm__ __volatile__("mrs %0, cntpct_el0" : "=r"(v));
+ 	return v;
+ #else
+ 	return pcsx2_profile_now_ns();
+diff --git a/pcsx2/R5900.c b/pcsx2/R5900.c
+index 77560ca..1917886 100644
+--- a/pcsx2/R5900.c
++++ b/pcsx2/R5900.c
+@@ -14,6 +14,7 @@
+  */
+ 
+ 
++#include "sw2_prof.h"
+ #include <retro_atomic.h>
+ #include <faulthandler.h>
+ #include <stdio.h>
+@@ -324,6 +325,14 @@ void _cpuEventTest_Shared(void)
+ {
+ 	uint mask;
+ 	int nextIopEventDeta;
++	SW2_PROF(SW2P_EVENTS);
++	sw2_gs_stats[9]++; /* event tests, for the log */
++	{ /* SW2PS2: which interrupt bits are pending at event tests, for the log */
++		extern unsigned long long sw2_int_bits[33];
++		u32 bits = cpuRegs.interrupt; int b;
++		if (!bits) sw2_int_bits[32]++;
++		for (b = 0; bits && b < 32; b++, bits >>= 1) if (bits & 1) sw2_int_bits[b]++;
++	}
+ 	retro_atomic_store_release_int(&eeEventTestIsActive, 1);
+ 	cpuRegs.nextEventCycle = cpuRegs.cycle + EE_WAIT_CYCLES;
+ 	cpuRegs.lastEventCycle = cpuRegs.cycle;
+@@ -377,6 +386,7 @@ void _cpuEventTest_Shared(void)
+ 		/* where a DMA buffer is overwritten without waiting for the transfer to end, which causes the fonts to get all messed up */
+ 		/* so to fix it, we run all the DMA's instantly when in the BIOS. */
+ 		/* Only use the lower 17 bits of the cpuRegs.interrupt as the upper bits are for VU0/1 sync which can't be done in a tight loop */
++		SW2_PROF(SW2P_DMA);
+ 		if ((!g_GameStarted || (emu_hot & EMU_HOT_INSTANT_DMA)) && dmacRegs.ctrl.DMAE && !(psHu8(DMAC_ENABLER + 2) & 1) && (cpuRegs.interrupt & 0x1FFFF))
+ 		{
+ 			while ((cpuRegs.interrupt & 0x1FFFF) && _cpuTestInterrupts())
+@@ -405,18 +415,19 @@ void _cpuEventTest_Shared(void)
+ 	if (iopEventAction)
+ 	{
+ 		const int prof = PROFILE_ZONE_BEGIN(ZONE_IOP_EXEC);
+-		EEsCycle = psxCpu->ExecuteBlock(EEsCycle);
++		{ SW2_PROF(SW2P_IOP);
++		EEsCycle = psxCpu->ExecuteBlock(EEsCycle); }
+ 		PROFILE_ZONE_END(ZONE_IOP_EXEC, prof);
+ 
+ 		iopEventAction = false;
+ 	}
+ 
+-	iopEventTest();
++	{ SW2_PROF(SW2P_IOPEVENT); iopEventTest(); }
+ 
+ 	/* ---- VU Sync ------------- */
+ 	/* We're in a EventTest.  All dynarec registers are flushed */
+ 	/* so there is no need to freeze registers here. */
+-	vucpu_execute_block(CpuVU0, 0);
++	{ SW2_PROF(SW2P_VU0); vucpu_execute_block(CpuVU0, 0); }
+ 	vucpu_execute_block(CpuVU1, 0);
+ 
+ 	/* ---- Schedule Next Event Test -------------- */
+diff --git a/pcsx2/SPU2/spu2sys.c b/pcsx2/SPU2/spu2sys.c
+index 7226438..af8ee64 100644
+--- a/pcsx2/SPU2/spu2sys.c
++++ b/pcsx2/SPU2/spu2sys.c
+@@ -19,6 +19,7 @@
+ /* This module contains (most!) stuff which is directly related to SPU2 emulation. */
+ /* Contents should be cross-platform compatible whenever possible. */
+ 
++#include "../sw2_prof.h"
+ #include "../IopCounters.h"
+ #include "../IopDma.h"
+ #include "../IopHw.h"
+@@ -220,6 +221,7 @@ void TimeUpdate(u64 cClocks)
+ 	u8 vc;
+ 	int v;
+ 	int max_pairs;
++	SW2_PROF(SW2P_SPU2);
+ 	int16_t *snd_buffer;
+ 	int snd_count;
+ 	u32 dClocks = cClocks - lClocks;
+diff --git a/pcsx2/VU0micro.c b/pcsx2/VU0micro.c
+index 8657f05..0d5d451 100644
+--- a/pcsx2/VU0micro.c
++++ b/pcsx2/VU0micro.c
+@@ -16,6 +16,7 @@
+ /* This module contains code shared by both the dynarec and interpreter versions */
+ /* of the VU0 micro. */
+ 
++#include "sw2_prof.h"
+ #include "Common.h"
+ #include "VUmicro.h"
+ 
+@@ -43,6 +44,7 @@ static __fi u32 vu0DenormalizeMicroStatus(u32 nstatus)
+ void vu0ExecMicro(u32 addr)
+ {
+ 	u32 CLIP, MAC, STATUS;
++	SW2_PROF(SW2P_VU0);
+ 	if (vuRegs[0].VI[REG_VPU_STAT].UL & 0x1)
+ 		vu0Finish();
+ 
+diff --git a/pcsx2/Vif1_Dma.c b/pcsx2/Vif1_Dma.c
+index 39800e1..f7b95dd 100644
+--- a/pcsx2/Vif1_Dma.c
++++ b/pcsx2/Vif1_Dma.c
+@@ -13,6 +13,7 @@
+  *  If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++#include "sw2_prof.h"
+ #include "Common.h"
+ #include "Vif.h"
+ #include "Vif_Dma.h"
+@@ -272,6 +273,7 @@ static __noinline void vif1_path2_done(void)
+ 
+ void vif1Interrupt(void)
+ {
++	SW2_PROF(SW2P_VIF);
+ 	g_vif1Cycles = 0;
+ 
+ 	if (gifRegs.stat.APATH == 2 && gif_path_is_done(GIF_PATH_2))
+@@ -429,6 +431,7 @@ void vif1Interrupt(void)
+ 
+ void dmaVIF1(void)
+ {
++	SW2_PROF(SW2P_VIF);
+ 	g_vif1Cycles      = 0;
+ 	vif1.inprogress   = 0;
+ 	cpuRegs.dmastall &= ~(1 << DMAC_VIF1);
+diff --git a/pcsx2/VirtualMemory.c b/pcsx2/VirtualMemory.c
+index de878b2..67ea114 100644
+--- a/pcsx2/VirtualMemory.c
++++ b/pcsx2/VirtualMemory.c
+@@ -34,6 +34,11 @@ static PageProtectionMode vmm_mode(bool write, bool exec)
+ 	return mode;
+ }
+ 
++/* SW2PS2: the manager that wanted a shared backing and got a plain one
++ * (SW2_NO_FAULTS). It holds data only, so it is mapped without exec. */
++static const VirtualMemoryManager* s_vmm_plain_data;
++#define VMM_PLAIN_EXEC(m) ((m) != s_vmm_plain_data)
++
+ bool vmm_init(VirtualMemoryManager* m, const char* file_mapping_name, size_t size)
+ {
+ 	m->file_handle = NULL;
+@@ -49,12 +54,16 @@ bool vmm_init(VirtualMemoryManager* m, const char* file_mapping_name, size_t siz
+ 		char real_file_mapping_name[128];
+ 		host_shm_name(real_file_mapping_name, sizeof(real_file_mapping_name), file_mapping_name);
+ 		m->file_handle = memshm_create(real_file_mapping_name, m->size);
++		if (!m->file_handle)
++			s_vmm_plain_data = m;
++#if !defined(SW2_NO_FAULTS) /* SW2PS2: no shared mirrors there; a plain private mapping (no fastmem) */
+ 		if (!m->file_handle)
+ 		{
+ 			free(m->pageuse);
+ 			m->pageuse = NULL;
+ 			return false;
+ 		}
++#endif
+ 	}
+ 	return true;
+ }
+@@ -83,7 +92,7 @@ static u8* vmm_map_at(const VirtualMemoryManager* m, uptr base)
+ 	return (u8*)p;
+ #else
+ 	if (!m->file_handle)
+-		return (u8*)host_mmap((void*)base, m->size, vmm_mode(true, true));
++		return (u8*)host_mmap((void*)base, m->size, vmm_mode(true, VMM_PLAIN_EXEC(m)));
+ 	p = memshm_map(m->file_handle, 0, (void*)base, m->size, host_prot(vmm_mode(true, false)));
+ 	if (p && (uptr)p != base)
+ 	{
+@@ -103,7 +112,7 @@ bool vmm_map(VirtualMemoryManager* m, uptr base)
+ 	else if (m->file_handle)
+ 		m->baseptr = (u8*)memshm_map(m->file_handle, 0, NULL, m->size, host_prot(vmm_mode(true, false)));
+ 	else
+-		m->baseptr = (u8*)host_mmap(NULL, m->size, vmm_mode(true, true));
++		m->baseptr = (u8*)host_mmap(NULL, m->size, vmm_mode(true, VMM_PLAIN_EXEC(m)));
+ 	return m->baseptr != NULL;
+ }
+ 
+diff --git a/pcsx2/arm64/AsmHelpers.cpp b/pcsx2/arm64/AsmHelpers.cpp
+index 1bc14ec..892095e 100644
+--- a/pcsx2/arm64/AsmHelpers.cpp
++++ b/pcsx2/arm64/AsmHelpers.cpp
+@@ -117,7 +117,7 @@ u8* armStartBlock()
+ 	memjit_write_begin();
+ 
+ 	pxAssert(!armAsm);
+-	armAsm = new (s_armAsmStorage) vixl::aarch64::MacroAssembler(static_cast<vixl::byte*>(armAsmPtr), armAsmCapacity);
++	armAsm = new (s_armAsmStorage) vixl::aarch64::MacroAssembler(static_cast<vixl::byte*>(memjit_rw(armAsmPtr)), armAsmCapacity); // SW2PS2: bytes go to the staging view
+ 	armAsm->GetScratchVRegisterList()->Remove(31);
+ 	armAsm->GetScratchRegisterList()->Remove(RSCRATCHADDR.GetCode());
+ 	return armAsmPtr;
+@@ -219,7 +219,7 @@ void armEmitJmpPtr(void* code_address, const void* target, bool flush_icache)
+ 	u32 insn = 0x14000000u | (static_cast<u32>(displacement) & 0x03FFFFFFu);
+ 
+ 	memjit_write_begin();
+-	std::memcpy(code_address, &insn, sizeof(insn));
++	std::memcpy(memjit_rw(code_address), &insn, sizeof(insn));
+ 	memjit_write_end();
+ 
+ 	if (flush_icache)
+@@ -468,7 +468,7 @@ u8* ArmConstantPool::GetJumpTrampoline(const void* target)
+ 		return nullptr;
+ 	}
+ 
+-	a64::MacroAssembler masm(static_cast<vixl::byte*>(m_base_ptr + offset), m_capacity - offset);
++	a64::MacroAssembler masm(static_cast<vixl::byte*>(memjit_rw(m_base_ptr + offset)), m_capacity - offset);
+ 	masm.Mov(RXVIXLSCRATCH, reinterpret_cast<intptr_t>(target));
+ 	masm.Br(RXVIXLSCRATCH);
+ 	masm.FinalizeCode();
+@@ -498,8 +498,11 @@ u8* ArmConstantPool::GetLiteral(const u128& value)
+ 		return nullptr;
+ 
+ 	const u32 offset = pcsx2_align_up_pow2_u32(m_used, 16);
+-	std::memcpy(&m_base_ptr[offset], &value, sizeof(value));
++	std::memcpy(memjit_rw(&m_base_ptr[offset]), &value, sizeof(value));
+ 	m_used = offset + sizeof(value);
++#if defined(MEMJIT_SPLIT)
++	memsync(m_base_ptr + offset, m_base_ptr + offset + sizeof(value)); // SW2PS2: publish the literal
++#endif
+ 	return m_base_ptr + offset;
+ }
+ 
+diff --git a/pcsx2/arm64/aR5900Glue.h b/pcsx2/arm64/aR5900Glue.h
+index ec0abdb..28843ac 100644
+--- a/pcsx2/arm64/aR5900Glue.h
++++ b/pcsx2/arm64/aR5900Glue.h
+@@ -73,6 +73,7 @@ void eeJitShutdown_arm64(void);
+ void eeJitReset_arm64(void);
+ void eeJitClear_arm64(u32 addr, u32 size);
+ void eeJitRunBlock_arm64(void);
++void eeJitSetStopPc_arm64(u32 pc); /* SW2PS2: boot stages on the JIT */
+ /* vtlb.c's fault handler hands fastmem faults in JIT code here. */
+ bool eeFastmemFault_arm64(uptr code_address);
+ 
+diff --git a/pcsx2/arm64/aVU.cpp b/pcsx2/arm64/aVU.cpp
+index 200d700..4de14eb 100644
+--- a/pcsx2/arm64/aVU.cpp
++++ b/pcsx2/arm64/aVU.cpp
+@@ -557,7 +557,13 @@ void mVUreset(microVU& mVU, bool resetReserve)
+ 	{
+ 		log_cb(RETRO_LOG_WARN, "mVU Reset\n");
+ 		// If MTVU is toggled on during gameplay we need to flush the running VU1 program, else it gets in a mess
+-		if (VU0.VI[REG_VPU_STAT].UL & 0x100)
++		/* SW2PS2: only with the recompiler already set up (its program
++		 * tables exist). On a fresh start after an earlier game in the same
++		 * process, VPU_STAT can still say VU1 runs (the VU registers outlive
++		 * the session) while the tables were freed by mVUclose: executing
++		 * then dereferenced a NULL program list (crash loading the 4th game
++		 * in a row on the Switch 2 after an option change). */
++		if ((VU0.VI[REG_VPU_STAT].UL & 0x100) && mVU.prog.prog[0])
+ 		{
+ 			CpuVU1->Execute(vu1RunCycles);
+ 		}
+diff --git a/pcsx2/arm64/aVU_Macro.inl b/pcsx2/arm64/aVU_Macro.inl
+index 7f14069..40b98ab 100644
+--- a/pcsx2/arm64/aVU_Macro.inl
++++ b/pcsx2/arm64/aVU_Macro.inl
+@@ -101,6 +101,13 @@ static void setupMacroOp(int mode)
+ 	microVU0.prog.IRinfo.curPC = 0;
+ 	microVU0.code = cpuRegs.code;
+ 	std::memset(&microVU0.prog.IRinfo.info[0], 0, sizeof(microVU0.prog.IRinfo.info[0]));
++	// SW2PS2: no VI constants in macro mode. The analysis pass of IADDI (Is == vi00)
++	// records It as a known constant in IRinfo.constReg, the table the microVU0
++	// compiler shares; nothing cleared it between macro ops, so a later macro
++	// LQI/SQI/ILWR... folded its address from that stale value although the EE
++	// (CTC2) or a VU0 micro program had changed the register since. ICO's
++	// geometry came out as white smears; with COP2 IADDI interpreted it was right.
++	std::memset(microVU0.prog.IRinfo.constReg, 0, sizeof(microVU0.prog.IRinfo.constReg));
+ 
+ 	// M5.3 Q read (x86 setupMacroOp 38-40). The *q ALU forms (0x111) read Q from
+ 	// memory before running; DIV/SQRT/RSQRT (0x112) only write Q, so they skip this.
+diff --git a/pcsx2/arm64/recR3000A_arm64.cpp b/pcsx2/arm64/recR3000A_arm64.cpp
+index 515000b..8d2bbb1 100644
+--- a/pcsx2/arm64/recR3000A_arm64.cpp
++++ b/pcsx2/arm64/recR3000A_arm64.cpp
+@@ -17,6 +17,7 @@
+ // Self-modifying code is handled by granular per-4KiB-page, mirror-normalised
+ // invalidation in recClearIOP (psxCpu->Clear is called on every IOP write).
+ 
++#include "sw2_prof.h"
+ #include "R3000A.h"
+ #include <memmap.h>
+ #include "common/Pcsx2Defs.h"
+@@ -96,7 +97,7 @@ namespace
+ 			return false;
+ 		memjit_write_begin();
+ 		{
+-			MacroAssembler masm(page, kPage, PositionDependentCode);
++			MacroAssembler masm(static_cast<vixl::byte*>(memjit_rw(page)), kPage, PositionDependentCode);
+ 			masm.Add(x0, x0, 1);
+ 			masm.Ret();
+ 			masm.FinalizeCode();
+@@ -707,6 +708,7 @@ namespace
+ 
+ 	BlockFn CompileBlock(u32 pc)
+ 	{
++		SW2_PROF(SW2P_IOP_COMPILE);
+ 		if (s_code_pos + 8192 > kCodeCacheSize)
+ 		{
+ 			s_blocks.clear();
+@@ -718,7 +720,7 @@ namespace
+ 
+ 		u8* start = s_code + s_code_pos;
+ 		memjit_write_begin(); // W^X: code cache writable on this thread until FinalizeCode
+-		MacroAssembler masm(start, kCodeCacheSize - s_code_pos, PositionDependentCode);
++		MacroAssembler masm(static_cast<vixl::byte*>(memjit_rw(start)), kCodeCacheSize - s_code_pos, PositionDependentCode); // SW2PS2: staging view
+ 		s_irc.Reset(); // fresh per-block register-cache state (C.32)
+ 
+ 		const Register gpr = x19;
+diff --git a/pcsx2/arm64/recR5900_arm64.cpp b/pcsx2/arm64/recR5900_arm64.cpp
+index d9f0e3c..3f7ea8e 100644
+--- a/pcsx2/arm64/recR5900_arm64.cpp
++++ b/pcsx2/arm64/recR5900_arm64.cpp
+@@ -44,6 +44,13 @@
+ // the analysis-flag plumbing they gate on.
+ #include "arm64/AsmHelpers.h"
+ #include "arm64/aR5900Analysis.h"
++#include "sw2_prof.h"
++#ifndef __SWITCH__
++static void Sw2JitDump();
++#endif
++extern "C" int sw2_fast_fpu;
++extern "C" int sw2_direct_ram; /* SW2PS2: main RAM without the page table (EmitVmapLookup) */
++extern "C" int sw2_syscall_interp; /* 1: SYSCALL to the interpreter as before (comparison) */
+ #include "VUmicro.h" // _vu0FinishMicro, _vu0WaitMicro, vu0Sync
+ #include "../Config.h"
+ 
+@@ -68,6 +75,7 @@ namespace
+ 
+ 	constexpr size_t kCodeCacheSize = 32 * 1024 * 1024;
+ 	constexpr int    kMaxInsns      = 64;
++	u32 s_stop_pc = 0; // SW2PS2: the boot stage's hook pc (0 = none); see eeJitSetStopPc_arm64
+ 	constexpr u32    kPageShift     = 12;
+ 
+ 	u8*    s_code     = nullptr;
+@@ -119,6 +127,12 @@ namespace
+ 
+ 	inline bool PageIsManual(u32 pg)
+ 	{
++#if defined(SW2_NO_FAULTS)
++		// SW2PS2: no write faults on the Switch 2, so no page is ever protected:
++		// every block validates its source at entry.
++		(void)pg;
++		return true;
++#endif
+ 		return pg < s_page_clears.size() && s_page_clears[pg] >= kManualClears;
+ 	}
+ 	// Any page the block's source spans having gone manual makes the block manual:
+@@ -188,7 +202,7 @@ namespace
+ 			return false;
+ 		memjit_write_begin();
+ 		{
+-			MacroAssembler masm(page, kPage, PositionDependentCode);
++			MacroAssembler masm(static_cast<vixl::byte*>(memjit_rw(page)), kPage, PositionDependentCode);
+ 			masm.Add(x0, x0, 1);
+ 			masm.Ret();
+ 			masm.FinalizeCode();
+@@ -218,7 +232,29 @@ namespace
+ 	// the vmap path would have sent to the wrapper too.
+ 	inline bool InlineVmapEnabled();
+ 
++	// SW2PS2: main RAM directly. An address below 32 MB is, with the PS2
++	// kernel's identity mapping of that range, main RAM at the same offset, so
++	// the host address is eeMem->Main + addr: a range test and a constant
++	// instead of the page-table load every access otherwise waits on.
++	inline void EmitVmapLookupRaw(MacroAssembler& m, Label* slow);
+ 	inline void EmitVmapLookup(MacroAssembler& m, Label* slow)
++	{
++		if (sw2_direct_ram && eeMem)
++		{
++			Label vm, got;
++			m.Tst(w0, 0xfe000000);
++			m.B(&vm, ne);
++			m.Mov(x10, reinterpret_cast<uint64_t>(eeMem->Main));
++			m.Add(x10, x10, Operand(w0, UXTW));
++			m.B(&got);
++			m.Bind(&vm);
++			EmitVmapLookupRaw(m, slow);
++			m.Bind(&got);
++			return;
++		}
++		EmitVmapLookupRaw(m, slow);
++	}
++	inline void EmitVmapLookupRaw(MacroAssembler& m, Label* slow)
+ 	{
+ 		m.Lsr(w11, w0, 12);
+ 		m.Ldr(x10, MemOperand(vmapbase, x11, LSL, 3)); // vmv.value
+@@ -440,6 +476,16 @@ namespace
+ 	struct ExitPending { Label* slow; uint64_t evt; };
+ 	static std::vector<ExitPending> s_exit_pending;
+ 	static std::deque<Label>        s_exit_labels;
++	// SW2PS2: the inline memory accesses' slow paths (the wrapper call), moved
++	// out of the hot instruction stream into the block's stub area: the access
++	// keeps only the test that branches there. The console's EE profile is
++	// spread over thousands of blocks, and longer hot code measurably cost
++	// speed (instruction-cache pressure), so ~6 instructions per access go.
++	//   pre 0: nothing; 1: x1 = base + imm; 2: x1 = imm (64-bit)
++	struct SlowCall { Label* slow; Label* done; uint64_t fn; int pre; Register base; int64_t imm; };
++	static std::vector<SlowCall> s_slow_pending;
++	static std::deque<Label>     s_slow_labels;
++	inline Label* SlowLabel() { s_slow_labels.emplace_back(); return &s_slow_labels.back(); }
+ 	static Label*                   s_stale = nullptr; // C.60: manual block failed its check
+ 	static u32                      s_stale_pc = 0;
+ 	struct BlockRec;
+@@ -1215,6 +1261,39 @@ namespace
+ 
+ 	// fpuRegisters layout: FPRreg fpr[32] (4 bytes each) at offset 0; u32 fprc[32]
+ 	// at offset 128 -> FCR31 (the status/cause reg) at offset 128 + 31*4 = 252.
++	// SW2PS2 fast FPU (sw2_fast_fpu): ADD/SUB/MUL.S, their ACC forms and
++	// MADD/MSUB(A).S as plain IEEE single-precision ops with only the result
++	// clamped (exponent 255 -> signed max, exponent 0 -> signed zero) and no
++	// O/U flag updates -- what PCSX2's x86 recompiler does by default. The
++	// MADD's product is rounded to single before the add (Fmul then Fadd,
++	// never a fused multiply-add), as on the EE.
++	// kind: 0 add, 1 sub, 2 mul, 3 madd, 4 msub. Result -> fpuRegs + dst_off.
++	void EmitFpuFastS(MacroAssembler& m, const Register& xfbase, u32 kind, u32 dst_off, u32 fs, u32 ft)
++	{
++		m.Ldr(s0, MemOperand(xfbase, fs * 4));
++		m.Ldr(s1, MemOperand(xfbase, ft * 4));
++		switch (kind)
++		{
++			case 0: m.Fadd(s0, s0, s1); break;
++			case 1: m.Fsub(s0, s0, s1); break;
++			case 2: m.Fmul(s0, s0, s1); break;
++			default:
++				m.Fmul(s0, s0, s1);
++				m.Ldr(s1, MemOperand(xfbase, kFpuAcc));
++				if (kind == 3) m.Fadd(s0, s1, s0); else m.Fsub(s0, s1, s0);
++				break;
++		}
++		m.Fmov(w0, s0);
++		m.And(w2, w0, 0x7f800000);
++		m.And(w3, w0, 0x80000000);
++		m.Orr(w4, w3, 0x7f7fffff);
++		m.Cmp(w2, 0x7f800000);
++		m.Csel(w0, w4, w0, eq);
++		m.Cmp(w2, 0);
++		m.Csel(w0, w3, w0, eq);
++		m.Str(w0, MemOperand(xfbase, dst_off));
++	}
++
+ 	void EmitCop1Reg(MacroAssembler& m, const Register& gpr, u32 insn)
+ 	{
+ 		const u32 rs    = (insn >> 21) & 31;
+@@ -1282,6 +1361,22 @@ namespace
+ 		// rs == 0x10 single-precision ops
+ 		const u32 ft = (insn >> 16) & 31;
+ 		m.Mov(x1, fbase);
++		// Not for games whose database entry asks for extra or full FPU clamping
++		// (EE/FPU clamp mode >= 2): they depend on the exact behaviour (Ico
++		// softlocked in its opening with the fast path).
++		if (sw2_fast_fpu && !CHECK_FPU_SOFT_REC && !CHECK_FPU_EXTRA_OVERFLOW && !CHECK_FPU_FULL)
++		{
++			switch (funct)
++			{
++				case 0x00: case 0x01: case 0x02: EmitFpuFastS(m, x1, funct, fd * 4, fs, ft); return;
++				case 0x18: case 0x19: case 0x1a: EmitFpuFastS(m, x1, funct & 3, kFpuAcc, fs, ft); return;
++				case 0x1c: EmitFpuFastS(m, x1, 3, fd * 4, fs, ft); return;
++				case 0x1d: EmitFpuFastS(m, x1, 4, fd * 4, fs, ft); return;
++				case 0x1e: EmitFpuFastS(m, x1, 3, kFpuAcc, fs, ft); return;
++				case 0x1f: EmitFpuFastS(m, x1, 4, kFpuAcc, fs, ft); return;
++				default: break;
++			}
++		}
+ 		if (funct == 0x00 || funct == 0x01 || funct == 0x02) // ADD.S/SUB.S/MUL.S
+ 		{
+ 			if (funct <= 1)
+@@ -2263,6 +2358,17 @@ namespace
+ 	// and no reads of cpuRegs.pc or cpuBlockCycles (MFC0's Count uses
+ 	// cpuRegs.cycle, which advances at branch boundaries identically in both
+ 	// execution modes, so mid-block reads match the interpreter handoff).
++	// SW2PS2: vu0Sync() only when VU0 is running (its first test, inline).
++	inline void EmitVu0SyncIfRunning(MacroAssembler& m)
++	{
++		Label idle;
++		m.Mov(x16, reinterpret_cast<uint64_t>(&vuRegs[0].VI[REG_VPU_STAT].UL));
++		m.Ldr(w16, MemOperand(x16));
++		m.Tbz(w16, 0, &idle);
++		m.Mov(x16, reinterpret_cast<uint64_t>(&vu0Sync)); m.Blr(x16);
++		m.Bind(&idle);
++	}
++
+ 	void EmitInterpOpCall(MacroAssembler& m, const Register& gpr, u32 insn, void (*fn)())
+ 	{
+ 		// The interp op body reads guest GPRs from memory (MTC0 rt, QFSRV
+@@ -2284,9 +2390,10 @@ namespace
+ 	// address is the buffer start plus the cursor. Falls back to the full
+ 	// materialization when the page displacement does not encode or the page
+ 	// offset is not size-aligned.
++	unsigned long long s_abs_near, s_abs_far; // SW2PS2: how often the adrp form applies
+ 	MemOperand AbsMem(MacroAssembler& m, const Register& scratch, const void* addr, unsigned size)
+ 	{
+-		const uintptr_t cur = reinterpret_cast<uintptr_t>(m.GetBuffer()->GetStartAddress<u8*>()) +
++		const uintptr_t cur = reinterpret_cast<uintptr_t>(memjit_rx(m.GetBuffer()->GetStartAddress<u8*>())) +
+ 		                      m.GetBuffer()->GetCursorOffset();
+ 		const s64 page_disp = (static_cast<s64>(reinterpret_cast<uintptr_t>(addr) & ~uintptr_t(0xFFF)) -
+ 		                       static_cast<s64>(cur & ~uintptr_t(0xFFF))) >> 12;
+@@ -2297,8 +2404,10 @@ namespace
+ 				vixl::aarch64::SingleEmissionCheckScope guard(&m);
+ 				m.adrp(scratch, page_disp);
+ 			}
++			s_abs_near++;
+ 			return MemOperand(scratch, page_off);
+ 		}
++		s_abs_far++;
+ 		m.Mov(scratch, reinterpret_cast<uint64_t>(addr));
+ 		return MemOperand(scratch);
+ 	}
+@@ -2577,6 +2686,19 @@ namespace {
+ 				});
+ 				DeferFastmemStub(m, fn, 0, 0);
+ 			}
++			else if (InlineVmapEnabled())
++			{
++				// SW2PS2: the pair is an unaligned little-endian load of 4/8 bytes
++				// at addr; when its aligned words share a page, one inline access
++				// (ARM loads unaligned from normal memory) does it. ~6% of the
++				// Simpsons' EE thread went to the wrapper and vtlb_memRead64.
++				Label* slow = SlowLabel(); Label* done = SlowLabel();
++				m.And(w11, w0, 0xfff); m.Cmp(w11, u.is64 ? 0xff8 : 0xffc); m.B(slow, hi);
++				EmitVmapLookup(m, slow);
++				if (u.is64) m.Ldr(x0, MemOperand(x10)); else m.Ldr(w0, MemOperand(x10));
++				m.Bind(done);
++				s_slow_pending.push_back({slow, done, fn, 0, x1, 0});
++			}
+ 			else { m.Mov(x16, fn); m.Blr(x16); }
+ 			if (!u.is64)
+ 				m.Sxtw(x0, w0); // LWL/LWR pairs sign-extend, exactly like LW
+@@ -2595,6 +2717,16 @@ namespace {
+ 				});
+ 				DeferFastmemStub(m, fn, 0, 0);
+ 			}
++			else if (InlineVmapEnabled())
++			{
++				// SW2PS2: the store pair writes the 4/8 bytes at addr (see the load).
++				Label* slow = SlowLabel(); Label* done = SlowLabel();
++				m.And(w11, w0, 0xfff); m.Cmp(w11, u.is64 ? 0xff8 : 0xffc); m.B(slow, hi);
++				EmitVmapLookup(m, slow);
++				if (u.is64) m.Str(x1, MemOperand(x10)); else m.Str(w1, MemOperand(x10));
++				m.Bind(done);
++				s_slow_pending.push_back({slow, done, fn, 0, x1, 0});
++			}
+ 			else { m.Mov(x16, fn); m.Blr(x16); }
+ 		}
+ 	}
+@@ -2696,7 +2828,7 @@ namespace {
+ 		u8* saved_ptr = armAsmPtr;
+ 		size_t saved_cap = armAsmCapacity;
+ 		armAsm = &m;
+-		armAsmPtr = m.GetBuffer()->GetStartAddress<u8*>();
++		armAsmPtr = static_cast<u8*>(memjit_rx(m.GetBuffer()->GetStartAddress<u8*>()));
+ 		armAsmCapacity = m.GetBuffer()->GetCapacity();
+ 
+ 		const bool ok = recVUMacroEmitMode0(insn);
+@@ -3035,8 +3167,8 @@ namespace {
+ 					// the wrapper call. Same value semantics: Ldrb/Ldrh/Ldr w0
+ 					// zero-extend into x0 exactly like the u32-returning
+ 					// wrappers.
+-					Label slow, done;
+-					EmitVmapLookup(m, &slow);
++					Label* slow = SlowLabel(); Label* done = SlowLabel();
++					EmitVmapLookup(m, slow);
+ 					switch (op)
+ 					{
+ 						case 0x20: case 0x24: m.Ldrb(w0, MemOperand(x10)); break; // LB/LBU
+@@ -3044,10 +3176,8 @@ namespace {
+ 						case 0x23: case 0x27: m.Ldr (w0, MemOperand(x10)); break; // LW/LWU
+ 						default:              m.Ldr (x0, MemOperand(x10)); break; // LD
+ 					}
+-					m.B(&done);
+-					m.Bind(&slow);
+-					m.Mov(x16, fn); m.Blr(x16);
+-					m.Bind(&done);
++					m.Bind(done);
++					s_slow_pending.push_back({slow, done, fn, 0, x1, 0});
+ 				}
+ 				else { m.Mov(x16, fn); m.Blr(x16); } // result in x0 (u32 returns are zero-extended in x0)
+ 				if (rt)
+@@ -3132,8 +3262,8 @@ namespace {
+ 					// PageFaultHandler -> mmap_ClearCpuBlock unprotects and
+ 					// drops the stale blocks -> the kernel retries this Str;
+ 					// identical flow to interpreter stores.
+-					Label slow, done;
+-					EmitVmapLookup(m, &slow);
++					Label* slow = SlowLabel(); Label* done = SlowLabel();
++					EmitVmapLookup(m, slow);
+ 					switch (op)
+ 					{
+ 						case 0x28: m.Strb(w1, MemOperand(x10)); break; // SB
+@@ -3141,10 +3271,8 @@ namespace {
+ 						case 0x2b: m.Str (w1, MemOperand(x10)); break; // SW
+ 						default:   m.Str (x1, MemOperand(x10)); break; // SD
+ 					}
+-					m.B(&done);
+-					m.Bind(&slow);
+-					m.Mov(x16, fn); m.Blr(x16);
+-					m.Bind(&done);
++					m.Bind(done);
++					s_slow_pending.push_back({slow, done, fn, 0, x1, 0});
+ 				}
+ 				else { m.Mov(x16, fn); m.Blr(x16); }
+ 				return true;
+@@ -3159,7 +3287,10 @@ namespace {
+ 			// compiler-generated 128-bit copies.
+ 			case 0x1e: // LQ
+ 			{
+-				if (!rt) return false; // rt==0: rare, leave to interp
++				// rt==0 (a load whose result is dropped; ~170 a frame in Shadow of the
++				// Colossus): the interpreter's LQ alone, keeping the rest of the block
++				// translated (it used to end the block and interpret ~44 ops).
++				if (!rt) { EmitInterpOpCall(m, gpr, insn, &intLQ); return true; }
+ 				{ const Register a = SrcGpr(m, gpr, rs, x0); m.Add(w0, a.W(), simm); }
+ 				m.And(w0, w0, 0xfffffff0);
+ 				Label slow, done;
+@@ -3178,15 +3309,18 @@ namespace {
+ 				{
+ 					if (InlineVmapEnabled())
+ 					{
+-						EmitVmapLookup(m, &slow);
++						Label* oslow = SlowLabel(); Label* odone = SlowLabel();
++						EmitVmapLookup(m, oslow);
+ 						m.Ldr(q0, MemOperand(x10));
+ 						m.Str(q0, MemOperand(gpr, rt * 16));
+-						m.B(&done);
+-						m.Bind(&slow);
++						m.Bind(odone);
++						s_slow_pending.push_back({oslow, odone, reinterpret_cast<uint64_t>(&eeRead128_arm64), 1, gpr, (int64_t)(rt * 16)});
++					}
++					else
++					{
++						m.Add(x1, gpr, rt * 16);
++						m.Mov(x16, reinterpret_cast<uint64_t>(&eeRead128_arm64)); m.Blr(x16);
+ 					}
+-					m.Add(x1, gpr, rt * 16);
+-					m.Mov(x16, reinterpret_cast<uint64_t>(&eeRead128_arm64)); m.Blr(x16);
+-					m.Bind(&done);
+ 				}
+ 				s_rc.Invalidate(rt); // 128-bit write bypasses StoreGpr (both paths)
+ 				return true;
+@@ -3209,15 +3343,18 @@ namespace {
+ 				{
+ 					if (InlineVmapEnabled())
+ 					{
+-						EmitVmapLookup(m, &slow);
++						Label* oslow = SlowLabel(); Label* odone = SlowLabel();
++						EmitVmapLookup(m, oslow);
+ 						m.Ldr(q0, MemOperand(gpr, rt * 16)); // GPR.r[0] is kept zero
+ 						m.Str(q0, MemOperand(x10));
+-						m.B(&done);
+-						m.Bind(&slow);
++						m.Bind(odone);
++						s_slow_pending.push_back({oslow, odone, reinterpret_cast<uint64_t>(&eeWrite128_arm64), 1, gpr, (int64_t)(rt * 16)});
++					}
++					else
++					{
++						m.Add(x1, gpr, rt * 16);
++						m.Mov(x16, reinterpret_cast<uint64_t>(&eeWrite128_arm64)); m.Blr(x16);
+ 					}
+-					m.Add(x1, gpr, rt * 16);
+-					m.Mov(x16, reinterpret_cast<uint64_t>(&eeWrite128_arm64)); m.Blr(x16);
+-					m.Bind(&done);
+ 				}
+ 				return true;
+ 			}
+@@ -3418,6 +3555,17 @@ namespace {
+ 					EmitFastmemAccess(m, [&] { m.ldr(w0, MemOperand(vmapbase, w0, UXTW)); });
+ 					DeferFastmemStub(m, reinterpret_cast<uint64_t>(&eeRead32_arm64), 0, 0);
+ 				}
++				else if (InlineVmapEnabled())
++				{
++					// SW2PS2: the inline vtlb direct case, as LW has. Without fastmem
++					// (the Switch 2) every FP load used to be a wrapper call: 55
++					// million in 300 frames of the Simpsons, its biggest slow path.
++					Label* slow = SlowLabel(); Label* done = SlowLabel();
++					EmitVmapLookup(m, slow);
++					m.Ldr(w0, MemOperand(x10));
++					m.Bind(done);
++					s_slow_pending.push_back({slow, done, reinterpret_cast<uint64_t>(&eeRead32_arm64), 0, x1, 0});
++				}
+ 				else { m.Mov(x16, reinterpret_cast<uint64_t>(&eeRead32_arm64)); m.Blr(x16); }
+ 				m.Mov(x1, reinterpret_cast<uint64_t>(&fpuRegs)); m.Str(w0, MemOperand(x1, rt * 4));
+ 				m.Bind(&skip);
+@@ -3435,6 +3583,15 @@ namespace {
+ 					EmitFastmemAccess(m, [&] { m.str(w1, MemOperand(vmapbase, w0, UXTW)); });
+ 					DeferFastmemStub(m, reinterpret_cast<uint64_t>(&eeWrite32_arm64), 0, 0);
+ 				}
++				else if (InlineVmapEnabled())
++				{
++					// SW2PS2: inline direct store, as SW has (see LWC1).
++					Label* slow = SlowLabel(); Label* done = SlowLabel();
++					EmitVmapLookup(m, slow);
++					m.Str(w1, MemOperand(x10));
++					m.Bind(done);
++					s_slow_pending.push_back({slow, done, reinterpret_cast<uint64_t>(&eeWrite32_arm64), 0, x1, 0});
++				}
+ 				else { m.Mov(x16, reinterpret_cast<uint64_t>(&eeWrite32_arm64)); m.Blr(x16); }
+ 				m.Bind(&skip);
+ 				return true;
+@@ -3457,22 +3614,57 @@ namespace {
+ 			// mask it, LQC2/SQC2 hand the raw address to memRead128/memWrite128),
+ 			// and LQC2 with ft == 0 still performs the read -- the load can have
+ 			// side effects -- it just throws the value away.
++			// SW2PS2: both used to be two C calls on every execution (vu0Sync and
++			// the 128-bit wrapper) -- 94 million in 900 frames of Shadow of the
++			// Colossus. vu0Sync() returns at once unless VU0 runs (VPU_STAT bit 0),
++			// so that test is inline and the call only taken when it is set; the
++			// access takes the inline vtlb direct case when the address is 16-byte
++			// aligned and memory-backed, and the wrapper otherwise (unaligned
++			// addresses and hardware registers behave exactly as before).
+ 			case 0x36: // LQC2
+ 			{
+ 				static u128 s_lqc2_sink; // ft == 0: the read happens, the value doesn't land
+-				m.Mov(x16, reinterpret_cast<uint64_t>(&vu0Sync)); m.Blr(x16);
++				const uint64_t dst = rt ? reinterpret_cast<uint64_t>(&vuRegs[0].VF[rt])
++				                        : reinterpret_cast<uint64_t>(&s_lqc2_sink);
++				EmitVu0SyncIfRunning(m);
+ 				{ const Register a = SrcGpr(m, gpr, rs, x0); m.Add(w0, a.W(), simm); }
+-				m.Mov(x1, rt ? reinterpret_cast<uint64_t>(&vuRegs[0].VF[rt])
+-				             : reinterpret_cast<uint64_t>(&s_lqc2_sink));
+-				m.Mov(x16, reinterpret_cast<uint64_t>(&eeRead128_arm64)); m.Blr(x16);
++				if (InlineVmapEnabled())
++				{
++					Label* slow = SlowLabel(); Label* done = SlowLabel();
++					m.Tst(w0, 0xf); m.B(slow, ne);
++					EmitVmapLookup(m, slow);
++					m.Ldr(q0, MemOperand(x10));
++					m.Mov(x1, dst); m.Str(q0, MemOperand(x1));
++					m.Bind(done);
++					s_slow_pending.push_back({slow, done, reinterpret_cast<uint64_t>(&eeRead128_arm64), 2, x1, (int64_t)dst});
++				}
++				else
++				{
++					m.Mov(x1, dst);
++					m.Mov(x16, reinterpret_cast<uint64_t>(&eeRead128_arm64)); m.Blr(x16);
++				}
+ 				return true;
+ 			}
+ 			case 0x3e: // SQC2
+ 			{
+-				m.Mov(x16, reinterpret_cast<uint64_t>(&vu0Sync)); m.Blr(x16);
++				const uint64_t src = reinterpret_cast<uint64_t>(&vuRegs[0].VF[rt]); // VF[0] is the (0,0,0,1) constant
++				EmitVu0SyncIfRunning(m);
+ 				{ const Register a = SrcGpr(m, gpr, rs, x0); m.Add(w0, a.W(), simm); }
+-				m.Mov(x1, reinterpret_cast<uint64_t>(&vuRegs[0].VF[rt])); // VF[0] is the (0,0,0,1) constant
+-				m.Mov(x16, reinterpret_cast<uint64_t>(&eeWrite128_arm64)); m.Blr(x16);
++				if (InlineVmapEnabled())
++				{
++					Label* slow = SlowLabel(); Label* done = SlowLabel();
++					m.Tst(w0, 0xf); m.B(slow, ne);
++					EmitVmapLookup(m, slow);
++					m.Mov(x1, src); m.Ldr(q0, MemOperand(x1));
++					m.Str(q0, MemOperand(x10));
++					m.Bind(done);
++					s_slow_pending.push_back({slow, done, reinterpret_cast<uint64_t>(&eeWrite128_arm64), 2, x1, (int64_t)src});
++				}
++				else
++				{
++					m.Mov(x1, src);
++					m.Mov(x16, reinterpret_cast<uint64_t>(&eeWrite128_arm64)); m.Blr(x16);
++				}
+ 				return true;
+ 			}
+ 			default: return false;
+@@ -3563,8 +3755,7 @@ namespace {
+ 			s_exit_pending.push_back({slow, evt});
+ 		}
+ 		// Not due (or no test at all): pc == target_pc, guaranteed.
+-		m.Mov(x3, reinterpret_cast<uint64_t>(&s_lut[np >> 2])); // the LUT slot itself
+-		m.Ldr(x3, MemOperand(x3));
++		m.Ldr(x3, AbsMem(m, x3, &s_lut[np >> 2], 8)); // the LUT slot itself (adrp-relative when in reach)
+ 		m.Cbz(x3, s_blk_ret);             // uncompiled -> return to the dispatcher
+ 		m.Add(x3, x3, kChainEntryOffset); // skip the successor's prologue
+ 		m.Br(x3);
+@@ -3572,6 +3763,15 @@ namespace {
+ 	// Deferred: the event-due tails, then the block's single return path.
+ 	void EmitExitStubs(MacroAssembler& m)
+ 	{
++		for (const SlowCall& c : s_slow_pending) // SW2PS2: out-of-line memory slow paths
++		{
++			m.Bind(c.slow);
++			if (c.pre == 1) m.Add(x1, c.base, c.imm);
++			else if (c.pre == 2) m.Mov(x1, static_cast<uint64_t>(c.imm));
++			m.Mov(x16, c.fn);
++			m.Blr(x16);
++			m.B(c.done);
++		}
+ 		for (ExitPending& e : s_exit_pending)
+ 		{
+ 			m.Bind(e.slow);
+@@ -3660,7 +3860,7 @@ namespace {
+ 				return true;
+ 			case 0x2a: case 0x2e: case 0x2c: case 0x2d: // SWL/SWR/SDL/SDR
+ 				return true;
+-			case 0x1e: return ((insn >> 16) & 31) != 0; // LQ (rt==0 -> interp)
++			case 0x1e: return true; // LQ (rt==0: the interpreter's LQ, called from the block)
+ 			case 0x36: case 0x3e: return true; // LQC2/SQC2: native (C.59)
+ 			case 0x37: return true; // LD
+ 			case 0x28: case 0x29: case 0x2b:
+@@ -3686,24 +3886,25 @@ namespace {
+ 	void EmitTailCycles(MacroAssembler& m, int cyc, bool with_update)
+ 	{
+ 		const uint64_t upd = reinterpret_cast<uint64_t>(&eeUpdateCycles_arm64);
+-		m.Mov(x10, reinterpret_cast<uint64_t>(&cpuBlockCycles)); // once, for both halves
++		// SW2PS2: adrp-relative when in reach (1 instruction instead of a
++		// 4-instruction movz/movk chain, on every block exit).
++		const MemOperand bc = AbsMem(m, x10, &cpuBlockCycles, 4); // once, for both halves
+ 		m.Ldr(w1, RegsField(&cpuRegs.CP0.n.Config));
+ 		m.Mov(w2, cyc); m.Mov(w3, cyc * 2);
+ 		m.Tst(w1, 1u << 18);
+ 		m.Csel(w2, w2, w3, ne);
+-		m.Ldr(w0, MemOperand(x10));
++		m.Ldr(w0, bc);
+ 		m.Add(w0, w0, w2); // cpuBlockCycles += cyc * (2 - CP0.Config[18])
+ 
+ 		if (!with_update)
+ 		{
+-			m.Str(w0, MemOperand(x10));
++			m.Str(w0, bc);
+ 			if (with_update) { m.Mov(x16, upd); m.Blr(x16); }
+ 			return;
+ 		}
+ 		// Default cycle rate: cycle += max(1, cpuBlockCycles >> 3); bc &= 7.
+ 		Label slow, done;
+-		m.Mov(x11, reinterpret_cast<uint64_t>(&EmuConfig.Speedhacks.EECycleRate));
+-		m.Ldrsb(w1, MemOperand(x11));
++		m.Ldrsb(w1, AbsMem(m, x11, &EmuConfig.Speedhacks.EECycleRate, 1));
+ 		m.Cbnz(w1, &slow);
+ 		m.Lsr(w2, w0, 3);
+ 		m.Cmp(w2, 0);
+@@ -3714,10 +3915,10 @@ namespace {
+ 		m.Add(x3, x3, Operand(w2, UXTW));
+ 		m.Str(x3, RegsField(&cpuRegs.cycle));
+ 		m.And(w0, w0, 7);
+-		m.Str(w0, MemOperand(x10));
++		m.Str(w0, bc);
+ 		m.B(&done);
+ 		m.Bind(&slow);
+-		m.Str(w0, MemOperand(x10)); // the helper reads cpuBlockCycles from memory
++		m.Str(w0, bc); // the helper reads cpuBlockCycles from memory
+ 		m.Mov(x16, upd);
+ 		m.Blr(x16);
+ 		m.Bind(&done);
+@@ -4006,6 +4207,31 @@ namespace {
+ 	// cpuRegs.pc like JR. TLBR/TLBWI/TLBP and the rest of the CO space stay
+ 	// interpreter handoffs (rare, TLB state machine). intSetBranch() is
+ 	// interpreter-loop bookkeeping and has no JIT equivalent to mirror.
++	// SW2PS2: SYSCALL natively. It used to end the block and hand the rest of the
++	// basic block -- the syscall, then the kernel's exception handler up to its
++	// first branch -- to the interpreter: ~2,900 times a frame in Shadow of the
++	// Colossus (35,000 interpreted instructions a frame), ~830 in the Simpsons.
++	// This does what execI + intSYSCALL do (pc pre-incremented, code set, the
++	// BIOS hooks and cpuException(0x20) in intSYSCALL) and leaves through the
++	// chain epilogue, so the handler at the exception vector runs recompiled.
++	bool EmitSyscall(MacroAssembler& m, const Register& gpr, u32 p, u32 insn, int cyc_leading)
++	{
++		if ((insn >> 26) != 0 || (insn & 0x3f) != 0x0c || sw2_syscall_interp)
++			return false;
++		s_rc.pinned = 0;
++		s_rc.FlushDirty(m, gpr); // intSYSCALL reads v1/a0/a1 from memory
++		StorePCImm(m, p + 4);    // as execI: pc pre-incremented (EPC = the syscall)
++		m.Mov(w0, insn);
++		m.Str(w0, RegsField(&cpuRegs.code));
++		m.Str(wzr, RegsField(&cpuRegs.branch)); // not in a delay slot
++		m.Mov(x16, reinterpret_cast<uint64_t>(&intSYSCALL));
++		m.Blr(x16);
++		s_rc.Reset(); // the exception path may write guest state
++		EmitCycleBookkeeping(m, cyc_leading + OpCycles(insn));
++		EmitChainEpilogue(m); // continue at the exception vector
++		return true;
++	}
++
+ 	bool EmitEret(MacroAssembler& m, const Register& gpr, u32 insn, int cyc_leading)
+ 	{
+ 		if ((insn >> 26) != 0x10 || ((insn >> 21) & 31) != 0x10 || (insn & 0x3f) != 0x18)
+@@ -4074,8 +4300,54 @@ namespace {
+ 	}
+ 
+ 
++	// SW2PS2 debugging (host only): SW2_REC_OFF=<mask> sends instruction
++	// classes to the interpreter, to find a miscompiled one by bisection.
++	//   1 SPECIAL ALU/shift/mult   2 REGIMM+branches+jumps   4 immediate ALU
++	//   8 COP0   16 COP1   32 COP2   64 MMI   128 loads   256 stores
++	//   512 LQ/SQ/LQC2/SQC2/LWC1/SWC1   1024 LDL/LDR/LWL/LWR/SDL/SDR/SWL/SWR
++	inline bool Sw2RecOff(u32 insn)
++	{
++#ifdef __SWITCH__
++		(void)insn;
++		return false;
++#else
++		static int mask = -1;
++		if (mask < 0) { const char* e = getenv("SW2_REC_OFF"); mask = e ? atoi(e) : 0; }
++		if (!mask) return false;
++		const u32 op = insn >> 26;
++		u32 cls;
++		switch (op)
++		{
++			case 0: cls = ((insn & 0x3f) == 8 || (insn & 0x3f) == 9) ? 2 : 1; break;
++			case 1: case 2: case 3: case 4: case 5: case 6: case 7: case 20: case 21: case 22: case 23: cls = 2; break;
++			case 8: case 9: case 10: case 11: case 12: case 13: case 14: case 15: case 24: case 25: cls = 4; break;
++			case 16: cls = 8; break;
++			case 17: cls = 16; break;
++			case 18: cls = 32; break;
++			case 28: cls = 64; break;
++			case 32: case 33: case 35: case 36: case 37: case 39: case 55: cls = 128; break;
++			case 40: case 41: case 43: case 63: cls = 256; break;
++			case 30: case 31: case 49: case 54: case 57: case 62: cls = 512; break;
++			case 26: case 27: case 34: case 38: case 42: case 44: case 45: case 46: cls = 1024; break;
++			default: cls = 0; break;
++		}
++		if (cls == 32)
++		{
++			// SW2_COP2_LO/HI: only COP2 ops whose key is in [lo, hi] go to the interpreter.
++			// key: moves/branches 200+rs; macro upper ops funct (0..59); special2 64 + (fd<<2 | funct&3)
++			static int lo = -2, hi = -2;
++			if (lo == -2) { const char* l = getenv("SW2_COP2_LO"); const char* h = getenv("SW2_COP2_HI"); lo = l ? atoi(l) : -1; hi = h ? atoi(h) : 1000; }
++			const u32 rs = (insn >> 21) & 31, funct = insn & 0x3f;
++			int key = rs < 16 ? 200 + (int)rs : funct < 0x3c ? (int)funct : 64 + (int)((((insn >> 6) & 0x1f) << 2) | (funct & 3));
++			return lo < 0 || (key >= lo && key <= hi);
++		}
++		return (cls & (u32)mask) != 0;
++#endif
++	}
++
+ 	BlockFn CompileBlock(u32 pc)
+ 	{
++		SW2_PROF(SW2P_EE_COMPILE);
+ 		if (s_code_pos + 8192 > kCodeCacheSize)
+ 		{
+ 			s_blocks.clear();
+@@ -4107,10 +4379,12 @@ namespace {
+ 		s_ma_labels.clear();
+ 		s_exit_pending.clear(); // C.54
+ 		s_exit_labels.clear();
++		s_slow_pending.clear();
++		s_slow_labels.clear();
+ 		s_exit_labels.emplace_back();
+ 		s_blk_ret = &s_exit_labels.front(); // the block's one return tail
+ 		memjit_write_begin(); // W^X: code cache writable on this thread until FinalizeCode
+-		MacroAssembler masm(start, kCodeCacheSize - s_code_pos, PositionDependentCode);
++		MacroAssembler masm(static_cast<vixl::byte*>(memjit_rw(start)), kCodeCacheSize - s_code_pos, PositionDependentCode); // SW2PS2: staging view
+ 		// The aVU macro emitters (C.30-2) hold RSCRATCHADDR (x17) and q31 across
+ 		// vixl macro expansions -- keep the assembler from synthesizing into them
+ 		// (mirrors armStartBlock in AsmHelpers.cpp).
+@@ -4164,16 +4438,32 @@ namespace {
+ 		// above has a fixed size), so the chained entry from another block runs it
+ 		// as well. x30 is clobbered by the call but the frame already holds it.
+ 		s_stale = nullptr;
++		// SW2PS2: with every block manual (no write faults on the Switch 2) the
++		// check runs on every block entry, so for code in main RAM it is done
++		// inline: the entry branches to a stub past the block's code that
++		// compares the live source words with a copy embedded next to it, 16
++		// bytes a step, and comes straight back. Only a mismatch takes the call
++		// (which discards the block). See the stub's emission below.
++		Label sw2_val, sw2_body;
++		const bool sw2_inline = manual && eeMem && InRam(Norm(pc));
+ 		if (manual)
+ 		{
+ 			s_stale_pc = pc;
+-			masm.Mov(x0, reinterpret_cast<uint64_t>(rec_ptr)); // C.61: no lookup
+-			masm.Mov(w1, pc);
+-			masm.Mov(x16, reinterpret_cast<uint64_t>(&eeBlockValidate_arm64));
+-			masm.Blr(x16);
+ 			s_exit_labels.emplace_back();
+ 			s_stale = &s_exit_labels.back();
+-			masm.Cbz(w0, s_stale); // source changed -> discarded, back to dispatcher
++			if (sw2_inline)
++			{
++				masm.B(&sw2_val);
++				masm.Bind(&sw2_body);
++			}
++			else
++			{
++				masm.Mov(x0, reinterpret_cast<uint64_t>(rec_ptr)); // C.61: no lookup
++				masm.Mov(w1, pc);
++				masm.Mov(x16, reinterpret_cast<uint64_t>(&eeBlockValidate_arm64));
++				masm.Blr(x16);
++				masm.Cbz(w0, s_stale); // source changed -> discarded, back to dispatcher
++			}
+ 		}
+ 
+ 		int n = 0;
+@@ -4183,15 +4473,18 @@ namespace {
+ 		bool branch_end = false; // ended via EmitBranch: branch + delay slot baked
+ 		Cop2RunInvalidate(); // C.66: liveness never crosses a block boundary
+ 		s_x19HeldVu = false; // C.78: a bracket never outlives its block (every run's last op closes it)
+-		while (n < kMaxInsns)
++		// SW2PS2 (boot on the JIT): a block never runs through the boot stage's
++		// stop pc; it ends there like a capped block, so the dispatcher sees it.
++		while (n < kMaxInsns && !(n > 0 && s_stop_pc && p == s_stop_pc))
+ 		{
+ 			s_emit_budget = (int)(kMaxInsns - n); // C.66: a COP2 run may not outlive the block
+ 			const u32 insn = memRead32(p);
++			if (Sw2RecOff(insn)) break; // SW2PS2 debugging: this class to the interpreter
+ 			s_emit_pc = p; // C.50: guest pc of the op being emitted (fastmem site bookkeeping)
+ 			// C.67: fuse the canonical unaligned pair into one host access. Both
+ 			// ops are consumed; the pair never straddles the block cap, and the
+ 			// second op is read from live memory exactly as EmitSimple would.
+-			if (n + 2 <= kMaxInsns)
++			if (n + 2 <= kMaxInsns && !(s_stop_pc && p + 4 == s_stop_pc))
+ 			{
+ 				UPair up;
+ 				if (UnalignedPair(insn, memRead32(p + 4), &up))
+@@ -4211,6 +4504,7 @@ namespace {
+ 			// C.77: ERET ends the block with no delay slot -- advance p past it so
+ 			// page coverage (ne = Norm(p)) includes the eret word itself.
+ 			if (EmitEret(masm, gpr, insn, cyc)) { p += 4; n++; done = true; break; }
++			if (EmitSyscall(masm, gpr, p, insn, cyc)) { p += 4; n++; done = true; break; }
+ 			break; // unsupported -> interpreter finishes the basic block
+ 		}
+ 
+@@ -4220,7 +4514,7 @@ namespace {
+ 		// fully-translatable tail to the interpreter; end the block cleanly at p
+ 		// and let the chain continue translating from there. This was the #1
+ 		// "breaker" in the handoff stats (LD/SD/etc. sitting at position 64).
+-		if (!done && n == kMaxInsns)
++		if (!done && (n == kMaxInsns || (n > 0 && s_stop_pc && p == s_stop_pc)))
+ 		{
+ 			StorePCImm(masm, p);
+ 			EmitCycleBookkeeping(masm, cyc);
+@@ -4246,6 +4540,59 @@ namespace {
+ 			EmitChainEpilogue(masm);
+ 		}
+ 
++		if (sw2_inline)
++		{
++			// The range is the one the block's record snapshots below.
++			const u32 vns = Norm(pc), vne = Norm(branch_end ? p + 8 : p);
++			const u32 words = vne > vns ? (vne - vns) >> 2 : 0;
++			Label slow, lit;
++			masm.Bind(&sw2_val);
++			if (words)
++			{
++				u32 off = 0;
++				masm.Mov(x16, reinterpret_cast<uint64_t>(eeMem->Main + vns));
++				masm.Adr(x17, &lit);
++				for (; off + 4 <= words; off += 4)
++				{
++					masm.Ldp(x0, x1, MemOperand(x16, off * 4));
++					masm.Ldp(x2, x3, MemOperand(x17, off * 4));
++					masm.Cmp(x0, x2);
++					masm.Ccmp(x1, x3, NoFlag, eq);
++					masm.B(&slow, ne);
++				}
++				if (words - off >= 2)
++				{
++					masm.Ldr(x0, MemOperand(x16, off * 4));
++					masm.Ldr(x2, MemOperand(x17, off * 4));
++					masm.Cmp(x0, x2);
++					masm.B(&slow, ne);
++					off += 2;
++				}
++				if (words - off >= 1)
++				{
++					masm.Ldr(w0, MemOperand(x16, off * 4));
++					masm.Ldr(w2, MemOperand(x17, off * 4));
++					masm.Cmp(w0, w2);
++					masm.B(&slow, ne);
++				}
++			}
++			masm.B(&sw2_body);
++			masm.Bind(&slow);
++			masm.Mov(x0, reinterpret_cast<uint64_t>(rec_ptr));
++			masm.Mov(w1, pc);
++			masm.Mov(x16, reinterpret_cast<uint64_t>(&eeBlockValidate_arm64));
++			masm.Blr(x16);
++			masm.Cbz(w0, s_stale);
++			masm.B(&sw2_body);
++			masm.Bind(&lit);
++			if (words)
++			{
++				vixl::ExactAssemblyScope scope(&masm, words * kInstructionSize);
++				for (u32 q = 0; q < words; q++)
++					masm.dc32(memRead32(pc + q * 4));
++			}
++		}
++
+ 		EmitFastmemStubs(masm);       // C.51: out of line, past the epilogue -- nothing falls into it
+ 		EmitMisalignStubs(masm, gpr); // C.53: same, for the misalign cancels
+ 		EmitExitStubs(masm);          // C.54: event-due tails + the block's single return path
+@@ -4268,6 +4615,8 @@ namespace {
+ 		s_ma_labels.clear();
+ 		s_exit_pending.clear();
+ 		s_exit_labels.clear();
++		s_slow_pending.clear();
++		s_slow_labels.clear();
+ 		s_blk_ret = nullptr;
+ 		s_code_pos += (sz + 15) & ~size_t(15);
+ 
+@@ -4323,6 +4672,7 @@ namespace {
+ 	// life of the block, and the block is erased only from here or from a clear.
+ 	extern "C" u32 eeBlockValidate_arm64(BlockRec* r, u32 pc)
+ 	{
++		SW2_PROF(SW2P_EE_VALIDATE);
+ 		const u32 np = Norm(pc);
+ 		const size_t bytes = r->src.size() * sizeof(u32);
+ 		bool same;
+@@ -4342,6 +4692,21 @@ namespace {
+ 		return 0;
+ 	}
+ 
++	// SW2PS2 (host only, SW2_JIT_DUMP): every compiled block, for tools/jitdis.
++	inline BlockFn Sw2LogBlock(u32 pc, BlockFn f)
++	{
++#ifndef __SWITCH__
++		static FILE* log = nullptr; static int on = -1;
++		if (on < 0)
++		{
++			const char* pre = getenv("SW2_JIT_DUMP"); on = pre != nullptr;
++			if (on) { char path[512]; snprintf(path, sizeof path, "%s.blocks", pre); log = fopen(path, "w"); if (log) fprintf(log, "base %llx\n", (unsigned long long)(uintptr_t)s_code); }
++		}
++		if (log) { fprintf(log, "%08x %llx\n", pc, (unsigned long long)(uintptr_t)f); fflush(log); }
++#endif
++		return f;
++	}
++
+ 	inline BlockFn BlockForPC(u32 pc)
+ 	{
+ 		const u32 np = Norm(pc);
+@@ -4357,10 +4722,10 @@ namespace {
+ 					return g;
+ 				s_blocks.erase(it); // source changed -> compile fresh
+ 			}
+-			return CompileBlock(pc);
++			return Sw2LogBlock(pc, CompileBlock(pc));
+ 		}
+ 		auto it = s_blocks.find(pc);
+-		return (it != s_blocks.end() && it->second.live) ? it->second.fn : CompileBlock(pc);
++		return (it != s_blocks.end() && it->second.live) ? it->second.fn : Sw2LogBlock(pc, CompileBlock(pc));
+ 	}
+ }
+ 
+@@ -4395,6 +4760,24 @@ void eeJitReset_arm64(void)
+ 	s_fm_pending.clear();
+ }
+ 
++// SW2PS2: the boot stages (Interpreter.c eeExecuteLoop) run on the JIT instead
++// of the interpreter and need control back exactly when the pc reaches one
++// address (EELOAD, its main, the game's entry point). No block is entered at
++// that pc and none runs through it: blocks end before it, and its LUT slot is
++// kept empty so chained exits return to the dispatcher there.
++void eeJitSetStopPc_arm64(u32 pc)
++{
++	s_stop_pc = pc;
++	if (!pc || !s_lut)
++		return;
++	const u32 np = Norm(pc);
++	if (InRam(np))
++		s_lut[np >> 2] = nullptr;
++	auto it = s_blocks.find(pc);
++	if (it != s_blocks.end())
++		it->second.live = false;
++}
++
+ void eeJitClear_arm64(u32 addr, u32 size)
+ {
+ 	// The clear MUST cover every block on the touched pages: the fault handler
+@@ -4429,6 +4812,9 @@ void eeJitShutdown_arm64(void)
+ {
+ 	s_blocks.clear();
+ 	s_page.clear();
++#ifndef __SWITCH__
++	Sw2JitDump(); // before the cache goes (SW2_JIT_DUMP)
++#endif
+ 	if (s_code) { memjit_free(s_code, kCodeCacheSize); s_code = nullptr; }
+ 	if (s_lut) { munmap(s_lut, (size_t)kRamWords * sizeof(BlockFn)); s_lut = nullptr; }
+ 	s_code_pos = 0;
+@@ -4463,7 +4849,7 @@ bool eeFastmemFault_arm64(uptr code_address)
+ 
+ 	u32* const insn = reinterpret_cast<u32*>(site.code);
+ 	memjit_write_begin();
+-	*insn = 0x14000000u | (static_cast<u32>(delta) & 0x03ffffffu); // B <stub>
++	*static_cast<u32*>(memjit_rw(insn)) = 0x14000000u | (static_cast<u32>(delta) & 0x03ffffffu); // B <stub>
+ 	memjit_write_end();
+ 	memsync(insn, (u8*)(insn) + (sizeof(u32)));
+ 
+@@ -4475,8 +4861,43 @@ bool eeFastmemFault_arm64(uptr code_address)
+ }
+ 
+ 
++#ifndef __SWITCH__
++// SW2PS2 (host only): SW2_JIT_DUMP=<prefix> writes, when the process exits,
++// <prefix>.code (the code cache, from s_code, s_code_pos bytes) and
++// <prefix>.blocks ("guest_pc host_rx_addr" per live block) for
++// tools/jitdis to disassemble the hot blocks a `sample` report names.
++static void Sw2JitDump()
++{
++	const char* pre = getenv("SW2_JIT_DUMP");
++	if (!pre || !s_code) return;
++	char path[512];
++	snprintf(path, sizeof path, "%s.code", pre);
++	if (FILE* f = fopen(path, "wb")) { fwrite(memjit_rw(s_code), 1, s_code_pos, f); fclose(f); }
++}
++#endif
++
++// SW2PS2: for the console profiler -- the guest pc of the live block whose
++// code holds host address `host` (the nearest block start at or below it),
++// and that start, or 0 when none.
++extern "C" void sw2_absmem_stats(unsigned long long* near_, unsigned long long* far_, unsigned long long* code, unsigned long long* data)
++{
++	*near_ = s_abs_near; *far_ = s_abs_far; *code = (unsigned long long)(uintptr_t)s_code; *data = (unsigned long long)(uintptr_t)&cpuBlockCycles;
++}
++extern "C" u32 sw2_jit_guest_pc(u64 host, u64* block_start)
++{
++	u64 best = 0; u32 pc = 0;
++	for (auto& kv : s_blocks)
++	{
++		const u64 f = (u64)(uintptr_t)kv.second.fn;
++		if (kv.second.live && f <= host && f > best) { best = f; pc = kv.first; }
++	}
++	if (block_start) *block_start = best;
++	return (best && host - best < 65536) ? pc : 0;
++}
++
+ void eeJitRunBlock_arm64(void)
+ {
+ 
++
+ 	BlockForPC(cpuRegs.pc)();
+ }
+diff --git a/pcsx2/vtlb.c b/pcsx2/vtlb.c
+index 916ccfa..5289ade 100644
+--- a/pcsx2/vtlb.c
++++ b/pcsx2/vtlb.c
+@@ -1512,3 +1512,18 @@ void mmap_ResetBlockTracking(void)
+ 	}
+ 	memset(m_PageProtectInfo, 0, sizeof(m_PageProtectInfo));
+ }
++
++#ifndef __SWITCH__
++/* SW2PS2 (host only, SW2_SLOWMEM_STATS): lookup-table entries for a few pages. */
++void sw2_vmap_dump(void)
++{
++	static const u32 pages[] = { 0x01ff0000, 0x01ff8000, 0x001f0000, 0x012f0000, 0x70000000, 0x00100000 };
++	unsigned i;
++	for (i = 0; i < sizeof(pages) / sizeof(pages[0]); i++)
++	{
++		const u32 va = pages[i];
++		const sptr v = (sptr)vtlbdata.vmap[va >> VTLB_PAGE_BITS];
++		fprintf(stderr, "[slowmem] vmap %08x: %s (raw %llx)\n", va, (v + (sptr)va) < 0 ? "HANDLER" : "direct", (unsigned long long)v);
++	}
++}
++#endif
+diff --git a/pcsx2/sw2_prof.h b/pcsx2/sw2_prof.h
+new file mode 100644
+index 0000000..b23497c
+--- /dev/null
++++ b/pcsx2/sw2_prof.h
+@@ -0,0 +1,31 @@
++/* SW2PS2: region tags for the front end's sampling profiler. The EE thread
++ * stores which subsystem it is in; a sampler thread on another core reads
++ * it. Only functions that run on the EE thread carry a tag. */
++#ifndef SW2_PROF_H
++#define SW2_PROF_H
++#ifdef __cplusplus
++extern "C" {
++#endif
++enum { SW2P_EE = 1, SW2P_IOP, SW2P_SPU2, SW2P_GIF, SW2P_EVENTS, SW2P_VIF, SW2P_VU0, SW2P_COUNTERS,
++       SW2P_EE_COMPILE, SW2P_EE_VALIDATE, SW2P_GATE_WAIT, SW2P_GS_WAIT, SW2P_VU1_WAIT, SW2P_IOP_COMPILE, SW2P_DISC, SW2P_DMA, SW2P_IOPEVENT, SW2P_COUNT };
++extern volatile unsigned sw2_prof_region;
++unsigned sw2_prof_pc(int iop);
++static inline void sw2_prof_restore(unsigned* p) { sw2_prof_region = *p; }
++extern unsigned long long sw2_gs_stats[16];
++static inline unsigned long long sw2_ticks(void)
++{
++#if defined(__aarch64__)
++	unsigned long long v;
++	__asm__ __volatile__("mrs %0, cntpct_el0" : "=r"(v));
++	return v;
++#else
++	return 0;
++#endif
++}
++#define SW2_TIME_BEGIN() const unsigned long long sw2_tb = sw2_ticks()
++#define SW2_TIME_END(i) (sw2_gs_stats[i] += sw2_ticks() - sw2_tb)
++#define SW2_PROF(r) unsigned sw2_prof_prev __attribute__((cleanup(sw2_prof_restore))) = sw2_prof_region; sw2_prof_region = (r)
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/sw2/include/sw2_compat.h b/sw2/include/sw2_compat.h
+new file mode 100644
+index 0000000..52a922f
+--- /dev/null
++++ b/sw2/include/sw2_compat.h
+@@ -0,0 +1,11 @@
++/* SW2PS2: force-included in every unit of the Switch 2 build (see Makefile). */
++#ifndef SW2_COMPAT_H
++#define SW2_COMPAT_H
++#ifndef __ASSEMBLER__
++#include <errno.h>
++#include <arpa/inet.h>
++#ifndef ESHUTDOWN
++#define ESHUTDOWN 108
++#endif
++#endif
++#endif
+diff --git a/sw2/include/sys/mman.h b/sw2/include/sys/mman.h
+new file mode 100644
+index 0000000..6c7d058
+--- /dev/null
++++ b/sw2/include/sys/mman.h
+@@ -0,0 +1,50 @@
++/* SW2PS2: <sys/mman.h> for the Switch 2 homebrew toolchain (no POSIX mman).
++ * The functions are in sw2/sw2_posix.c: anonymous mappings come from the
++ * heap, there are no file or fixed mappings, and mprotect() does nothing. */
++#ifndef SW2_SYS_MMAN_H
++#define SW2_SYS_MMAN_H
++#include <stddef.h>
++#include <sys/types.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++#ifndef PROT_NONE
++#define PROT_NONE 0x0
++#endif
++#ifndef PROT_READ
++#define PROT_READ 0x1
++#endif
++#ifndef PROT_WRITE
++#define PROT_WRITE 0x2
++#endif
++#ifndef PROT_EXEC
++#define PROT_EXEC 0x4
++#endif
++#ifndef MAP_SHARED
++#define MAP_SHARED 0x01
++#endif
++#ifndef MAP_PRIVATE
++#define MAP_PRIVATE 0x02
++#endif
++#ifndef MAP_FIXED
++#define MAP_FIXED 0x10
++#endif
++#ifndef MAP_ANONYMOUS
++#define MAP_ANONYMOUS 0x20
++#endif
++#ifndef MAP_ANON
++#define MAP_ANON MAP_ANONYMOUS
++#endif
++#ifndef MAP_NORESERVE
++#define MAP_NORESERVE 0x4000
++#endif
++#ifndef MAP_FAILED
++#define MAP_FAILED ((void*)-1)
++#endif
++void* mmap(void* addr, size_t len, int prot, int flags, int fildes, size_t off);
++int munmap(void* addr, size_t len);
++int mprotect(void* addr, size_t len, int prot);
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/sw2/include/sys/syscall.h b/sw2/include/sys/syscall.h
+new file mode 100644
+index 0000000..6eb378f
+--- /dev/null
++++ b/sw2/include/sys/syscall.h
+@@ -0,0 +1 @@
++/* SW2PS2: nothing here on the Switch 2 toolchain. */
+diff --git a/sw2/include/sys/uio.h b/sw2/include/sys/uio.h
+new file mode 100644
+index 0000000..ed20a85
+--- /dev/null
++++ b/sw2/include/sys/uio.h
+@@ -0,0 +1,7 @@
++/* SW2PS2: <sys/uio.h> (struct iovec only). */
++#ifndef SW2_SYS_UIO_H
++#define SW2_SYS_UIO_H
++#include <stddef.h>
++#include <sys/types.h>
++#include <sys/socket.h>
++#endif
+diff --git a/sw2/sw2_net.c b/sw2/sw2_net.c
+new file mode 100644
+index 0000000..e0030e8
+--- /dev/null
++++ b/sw2/sw2_net.c
+@@ -0,0 +1,12 @@
++/* SW2PS2: no host network adapter for the emulated PS2 network adaptor. */
++#include "../pcsx2/DEV9/AdapterUtils.h"
++#include <stddef.h>
++
++const net_adapter* net_adapter_get(void** list, const char* name) { (void)name; if (list) *list = NULL; return NULL; }
++const net_adapter* net_adapter_get_auto(void** list) { if (list) *list = NULL; return NULL; }
++void net_adapter_free(void* list) { (void)list; }
++bool net_adapter_mac(const net_adapter* adapter, u8 mac[6]) { (void)adapter; (void)mac; return false; }
++bool net_adapter_ip(const net_adapter* adapter, u8 ip[4]) { (void)adapter; (void)ip; return false; }
++bool net_adapter_netmask(const net_adapter* adapter, u8 mask[4]) { (void)adapter; (void)mask; return false; }
++int net_adapter_gateways(const net_adapter* adapter, u8* out, int max) { (void)adapter; (void)out; (void)max; return 0; }
++int net_adapter_dns(const net_adapter* adapter, u8* out, int max) { (void)adapter; (void)out; (void)max; return 0; }
+diff --git a/sw2/sw2_posix.c b/sw2/sw2_posix.c
+new file mode 100644
+index 0000000..c967ff7
+--- /dev/null
++++ b/sw2/sw2_posix.c
+@@ -0,0 +1,53 @@
++/* SW2PS2: the few POSIX memory calls the core makes, for the Switch 2
++ * homebrew toolchain. Anonymous mappings are zeroed, page-aligned heap
++ * blocks; file-backed and fixed-address mappings are refused (callers have
++ * fallbacks); page protection does not exist (the core is built with
++ * SW2_NO_FAULTS and never relies on it). */
++#include <malloc.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <switch.h>
++
++#define SW2_MAX_MAPS 256
++static struct { void* p; size_t len; } sw2_maps[SW2_MAX_MAPS];
++static Mutex sw2_maps_lock;
++
++void* mmap(void* addr, size_t len, int prot, int flags, int fildes, size_t off)
++{
++   void* p;
++   int i;
++   (void)prot; (void)off;
++   if (fildes >= 0 || (flags & MAP_FIXED) || !len)
++      return MAP_FAILED;
++   (void)addr; /* a hint only: callers that need it compare the result */
++   len = (len + 0xfff) & ~(size_t)0xfff;
++   p = memalign(0x1000, len);
++   if (!p)
++      return MAP_FAILED;
++   memset(p, 0, len);
++   mutexLock(&sw2_maps_lock);
++   for (i = 0; i < SW2_MAX_MAPS; i++)
++      if (!sw2_maps[i].p) { sw2_maps[i].p = p; sw2_maps[i].len = len; break; }
++   mutexUnlock(&sw2_maps_lock);
++   if (i == SW2_MAX_MAPS) { free(p); return MAP_FAILED; }
++   return p;
++}
++
++int munmap(void* addr, size_t len)
++{
++   int i, found = 0;
++   (void)len;
++   mutexLock(&sw2_maps_lock);
++   for (i = 0; i < SW2_MAX_MAPS; i++)
++      if (sw2_maps[i].p == addr && addr) { sw2_maps[i].p = NULL; found = 1; break; }
++   mutexUnlock(&sw2_maps_lock);
++   if (found)
++      free(addr); /* a partial unmap of a block is ignored */
++   return 0;
++}
++
++int mprotect(void* addr, size_t len, int prot)
++{
++   (void)addr; (void)len; (void)prot;
++   return 0;
++}

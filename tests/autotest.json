@@ -1,0 +1,7 @@
+{"game": "Katamari_Damacy.iso", "slot": 1, "seconds": 14, "runs": [
+  {"boost": false, "options": {"sw2_eager_frames": "enabled"}},
+  {"boost": true, "options": {"sw2_eager_frames": "enabled"}},
+  {"boost": true, "options": {"sw2_eager_frames": "disabled"}},
+  {"boost": true, "resolution": 1, "options": {"sw2_eager_frames": "enabled"}},
+  {"boost": false, "resolution": 1, "options": {"sw2_eager_frames": "enabled"}}
+]}

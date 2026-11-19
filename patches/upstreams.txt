@@ -1,0 +1,6 @@
+ouncesx2-eval/src https://github.com/nyathea/OunceSX2.git a60ba8e9037c4776425cc971910d32053d00a005
+LRPS2 https://github.com/libretro/ps2 d6bfa0e1102ad52b44b735d829c68e398ef3b47b
+armsx2-eval/src https://github.com/ARMSX2/ARMSX2.git 378e6bce00345886eb3f42851f8d8c8e7c29a99f
+armsx2-eval/nx https://github.com/PalindromicBreadLoaf/ARMSX2-NX.git 902c7c17e3a3ddc5384157d345f919c31148986b
+netherdb/pl https://github.com/Darkelf2024/PS2-Playable-Lists-for-AetherSX2-NetherSX2.git 62aa45de623463075346269557e8ac6c31debba0
+netherdb/np https://github.com/Trixarian/NetherSX2-patch.git f5f89b3b76e89a8f684da91cf5ad6e542825c0cb

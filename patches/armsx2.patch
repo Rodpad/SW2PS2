@@ -1,0 +1,208 @@
+diff --git a/pcsx2-libretro/Main.cpp b/pcsx2-libretro/Main.cpp
+index 24210fb067..7731cc8257 100644
+--- a/pcsx2-libretro/Main.cpp
++++ b/pcsx2-libretro/Main.cpp
+@@ -1144,6 +1144,9 @@ static void PopulateBiosOptions(retro_environment_t cb)
+ 
+ static void ApplyCoreOptions(bool startup)
+ {
++	// SW2PS2 evaluation hook (local only): SW2_BENCH=1 -> no fastmem (the Switch 2 cannot have it).
++	if (std::getenv("SW2_BENCH")) s_base_settings->SetBoolValue("EmuCore/CPU/Recompiler", "EnableFastmem", std::getenv("SW2_FASTMEM") != nullptr);  // SW2_FASTMEM=1: keep it
++	if (const char* it = std::getenv("SW2_IOPTHREAD")) s_base_settings->SetBoolValue("EmuCore/Speedhacks", "iopThread", std::atoi(it) != 0);
+ 	if (!s_base_settings)
+ 		return;
+ 
+@@ -2129,6 +2132,30 @@ RETRO_API void retro_unload_game(void)
+ RETRO_API void retro_run(void)
+ {
+ 	input_poll_cb();
++	if (std::getenv("SW2_PERSEC") && VMManager::HasValidVM())
++	{	// SW2PS2 evaluation hook: once a second, the VM's speed and the game's own frame rate.
++		static auto s_last = std::chrono::steady_clock::now(); static int s_sec = 0;
++		const auto now = std::chrono::steady_clock::now();
++		if (std::chrono::duration<double>(now - s_last).count() >= 1.0)
++		{
++			s_last = now;
++			std::fprintf(stdout, "[persec] %d vm %.1f game %.1f\n", ++s_sec, PerformanceMetrics::GetFPS(), PerformanceMetrics::GetInternalFPS());
++			std::fflush(stdout);
++		}
++	}
++	if (std::getenv("SW2_BENCH") && VMManager::HasValidVM())
++	{	// SW2PS2 evaluation hook: unlimited speed; time to reach fixed frame numbers.
++		static bool s_set = false; static auto s_t0 = std::chrono::steady_clock::now(); static u64 s_next = 600;
++		if (!s_set) { VMManager::SetLimiterMode(LimiterModeType::Unlimited); s_set = true; s_t0 = std::chrono::steady_clock::now(); }
++		const u64 f = PerformanceMetrics::GetFrameNumber();
++		if (f >= s_next)
++		{
++			const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_t0).count();
++			std::fprintf(stdout, "[bench] frame %llu at %.2f s (%.1f fps average)\n", (unsigned long long)f, secs, f / secs);
++			std::fflush(stdout);
++			s_next += 600;
++		}
++	}
+ 
+ 	bool options_updated = false;
+ 	if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &options_updated) && options_updated)
+diff --git a/pcsx2/GS.cpp b/pcsx2/GS.cpp
+index 2231f68a53..e9e68d39ee 100644
+--- a/pcsx2/GS.cpp
++++ b/pcsx2/GS.cpp
+@@ -1,3 +1,5 @@
++#include <cstdio>
++#include <cstdlib>
+ // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+ // SPDX-License-Identifier: GPL-3.0+
+ 
+@@ -187,8 +189,12 @@ void gsWrite64_generic( u32 mem, u64 value )
+ 	std::memcpy(PS2GS_BASE(mem), &value, sizeof(value));
+ }
+ 
++// SW2PS2 evaluation (Mac only, SW2_FLIPS): display-buffer changes, i.e. the frames the game shows.
++static u32 s_sw2Flips = 0;
+ void gsWrite64_page_00( u32 mem, u64 value )
+ {
++	if ((mem == GS_DISPFB1 || mem == GS_DISPFB2) && value != *(u64*)PS2GS_BASE(mem))
++		s_sw2Flips++;
+ 	s_GSRegistersWritten |= (mem == GS_DISPFB1 || mem == GS_DISPFB2 || mem == GS_PMODE);
+ 	bool reqUpdate = false;
+ 	if (mem == GS_SMODE1 || mem == GS_SMODE2)
+@@ -339,6 +345,16 @@ void gsPostVsyncStart()
+ 
+ 	const bool registers_written = s_GSRegistersWritten;
+ 	s_GSRegistersWritten = false;
++	{
++		static const bool s_on = std::getenv("SW2_FLIPS") != nullptr;
++		static u32 s_vsyncs = 0, s_flips0 = 0;
++		if (s_on && ++s_vsyncs % 300 == 0)
++		{
++			std::fprintf(stdout, "[flips] vsync %u: %.1f frames per 60 vsyncs\n", s_vsyncs, (s_sw2Flips - s_flips0) * 60.0 / 300.0);
++			std::fflush(stdout);
++			s_flips0 = s_sw2Flips;
++		}
++	}
+ 	MTGS::PostVsyncStart(registers_written);
+ }
+ 
+diff --git a/pcsx2/R5900.cpp b/pcsx2/R5900.cpp
+index c38f7e9475..b6e410e7fe 100644
+--- a/pcsx2/R5900.cpp
++++ b/pcsx2/R5900.cpp
+@@ -1,3 +1,7 @@
++#include <algorithm>
++#include <vector>
++#include <cstdio>
++#include <cstdlib>
+ // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+ // SPDX-License-Identifier: GPL-3.0+
+ 
+@@ -540,6 +544,35 @@ __fi void _cpuEventTest_Shared()
+ 		return;
+ 	}
+ 
++	// SW2PS2 evaluation (Mac only, SW2_BUSY): per frame, how much of the EE's time was not skipped as idle.
++	{
++		extern s64 g_sw2FfSkipDelta;
++		static const bool s_on = std::getenv("SW2_BUSY") != nullptr;
++		if (s_on)
++		{
++			static u64 s_skipped = 0, s_frameStart = 0; static u32 s_lastFrame = 0;
++			static std::vector<float> s_busy;
++			if (g_sw2FfSkipDelta < 0)
++				s_skipped += static_cast<u64>(-g_sw2FfSkipDelta);
++			g_sw2FfSkipDelta = 0;
++			if (g_FrameCount != s_lastFrame)
++			{
++				const u64 len = cpuRegs.cycle - s_frameStart;
++				if (s_frameStart != 0 && len > 0)
++					s_busy.push_back(100.0f * static_cast<float>(len - std::min(len, s_skipped)) / static_cast<float>(len));
++				s_frameStart = cpuRegs.cycle; s_skipped = 0; s_lastFrame = g_FrameCount;
++				if (s_busy.size() >= 60)
++				{
++					std::vector<float> v = s_busy; std::sort(v.begin(), v.end());
++					float sum = 0; for (float b : v) sum += b;
++					std::fprintf(stdout, "[busy] frame %u: max %.0f%% p95 %.0f%% avg %.0f%% min %.0f%%\n", g_FrameCount, v.back(), v[v.size() * 95 / 100], sum / v.size(), v.front());
++					std::fflush(stdout);
++					s_busy.clear();
++				}
++			}
++		}
++	}
++
+ 	// Lockstep and Threaded: how the EE got here. A fast-forward (a wait loop skipped to the next event) leaves its mark, which this
+ 	// event test takes. Off has no consumer and leaves it set; SyncThread clears it when a thread starts.
+ 	if constexpr (M != IopThreadMode::Off)
+diff --git a/pcsx2/VMManager.cpp b/pcsx2/VMManager.cpp
+index 106261a92a..f349240b24 100644
+--- a/pcsx2/VMManager.cpp
++++ b/pcsx2/VMManager.cpp
+@@ -58,6 +58,9 @@
+ #include "DEV9/ACRAM.h"
+ #include "DEV9/ACSRAM.h"
+ 
++#ifdef __APPLE__
++#include <sys/sysctl.h>
++#endif
+ #include "common/ARCADE.h"
+ #include "common/Console.h"
+ #include "common/Error.h"
+@@ -5066,6 +5069,15 @@ u64 VMManager::Internal::GetPerformanceCoreMask()
+ #if defined(__linux__)
+ 	EnsureCPUInfoInitialized(); // callable before the VM exists: the settings defaults and migration ask it
+ 	return GetPerformanceCoresMask();
++#elif defined(__APPLE__)
++	// SW2PS2 evaluation: the Mac's performance cores (sysctl hw.perflevel0.physicalcpu), so the
++	// IOP thread can be measured here as on the Switch 2 (whose cores are all the same).
++	static const u64 mask = []() {
++		int n = 0; size_t sz = sizeof(n);
++		if (sysctlbyname("hw.perflevel0.physicalcpu", &n, &sz, nullptr, 0) != 0 || n <= 0) n = 4;
++		return n >= 64 ? ~0ULL : ((1ULL << n) - 1);
++	}();
++	return mask;
+ #else
+ 	return 0; // no capacity source: the cores cannot be told apart, so Threaded is not offered
+ #endif
+diff --git a/pcsx2/arm64/iR5900-arm64.cpp b/pcsx2/arm64/iR5900-arm64.cpp
+index 7fc2e26c08..4d84b1befe 100644
+--- a/pcsx2/arm64/iR5900-arm64.cpp
++++ b/pcsx2/arm64/iR5900-arm64.cpp
+@@ -1996,6 +1996,7 @@ static void SetBranchBackedge()
+ // A fast-forward is about to jump to DispatcherEvent: tell the event test that is the way it is reached (eeFastForwardKind). One
+ // byte store through a scratch address register, on a path that costs a whole event test anyway. Clobbers RWSCRATCH and RSCRATCHADDR;
+ // every caller has flushed.
++s64 g_sw2FfSkipDelta = 0;
+ static void emitNoteFastForward(u8 kind)
+ {
+ 	armMoveAddressToReg(RSCRATCHADDR, &eeFastForwardKind);
+@@ -2041,6 +2042,10 @@ void SetBranchImm(u32 imm)
+ 		if (cycles != 0)
+ 			armAsm->Add(RECCYCLE, RECCYCLE, cycles);
+ 		recEeNoteChargeSite(EeChargeSite::WaitLoopFastFwd);
++		// SW2PS2 evaluation (Mac only): the cycles this fast-forward skips (-delta when negative), summed by
++		// the event test into a per-frame busy figure (SW2_BUSY).
++		armMoveAddressToReg(RSCRATCHADDR, &g_sw2FfSkipDelta);
++		armAsm->Str(RECCYCLE, a64::MemOperand(RSCRATCHADDR));
+ 		armAsm->Cmp(RECCYCLE, 0);
+ 		armAsm->Csel(RECCYCLE, RECCYCLE, a64::xzr, a64::gt);
+ 		emitNoteFastForward(IopThread::FastForward::WaitLoop); // the flags are dead: DispatcherEvent does not read them
+@@ -3669,7 +3674,11 @@ static bool memory_protect_recompiled_code(u32 startpc, u32 size)
+ 	// The EENULL thread context register is stored @ 0x81000-....
+ 	const bool contains_thread_stack = ((startpc >> 12) == 0x81) || ((startpc >> 12) == 0x80001);
+ 
+-	const vtlb_ProtectionMode PageType = contains_thread_stack ? ProtMode_Manual : mmap_GetRamPageInfo(inpage_ptr);
++	vtlb_ProtectionMode PageType = contains_thread_stack ? ProtMode_Manual : mmap_GetRamPageInfo(inpage_ptr);
++	// SW2PS2 measurement: SW2_FORCE_MANUAL=1 checks every RAM code page on entry, as the Switch 2 must.
++	static const bool sw2_no_smc_prot = getenv("SW2_FORCE_MANUAL") && atoi(getenv("SW2_FORCE_MANUAL"));
++	if (sw2_no_smc_prot && PageType != ProtMode_NotRequired)
++		PageType = ProtMode_Manual;
+ 
+ 	switch (PageType)
+ 	{
+@@ -3767,7 +3776,7 @@ static bool memory_protect_recompiled_code(u32 startpc, u32 size)
+ 
+ 			// Counted blocks: track how often this block runs. If the counter overflows,
+ 			// reset the page to write-protected mode (faster than manual checks).
+-			if (!contains_thread_stack && manual_counter[inpage_ptr >> 12] <= 3)
++			if (!contains_thread_stack && !sw2_no_smc_prot && manual_counter[inpage_ptr >> 12] <= 3)
+ 			{
+ 				armMoveAddressToReg(RSCRATCHADDR, &manual_page[inpage_ptr >> 12]);
+ 				armAsm->Ldrh(RWSCRATCH, a64::MemOperand(RSCRATCHADDR));

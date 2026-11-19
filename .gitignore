@@ -1,0 +1,26 @@
+# Allow-list: only these are part of the repository. Never commit ROMs, BIOS files, disc
+# images, memory cards, save states or build output (host/ and console-backup/ hold such files).
+/*
+!/.gitignore
+!/README.md
+!/Makefile
+!/build-switch.sh
+!/icon.png
+!/sw2ps2.jpg
+!/sw2ps2-test.jpg
+!/source/
+!/native/
+!/romfs/
+!/tools/
+!/tests/
+!/patches/
+!/probe/
+/probe/build/
+*.nro
+*.elf
+*.nacp
+*.log
+*.map
+*.lst
+__pycache__/
+.DS_Store
