@@ -15,10 +15,37 @@ BIOS (default folder `/bios/ps2`) and your own game dumps (default folder `/roms
 folders can be changed in Settings -> App. The app keeps its own files in `/switch/sw2ps2`
 (save states in `states/`, per-game settings in `settings/`).
 
-The emulator core is [OunceSX2](https://github.com/nyathea/OunceSX2) with SW2PS2's changes
-(`patches/ouncesx2.patch`): among them soft code protection for the recompiler, the BIOS
-folder setting, the memory map kept across games, fixes for crashes on a second game in a
-session and on very early state loads, and test hooks.
+## What SW2PS2 adds to OunceSX2
+
+SW2PS2 uses the [OunceSX2](https://github.com/nyathea/OunceSX2) core with its own changes
+(`patches/ouncesx2.patch`).
+
+### Performance
+
+- **Smarter detection of self-modifying code.** Under kaiHEN there is no hardware memory
+  protection, so the core otherwise re-checks every compiled block of game code each time it
+  runs. SW2PS2 tracks writes to the memory pages that hold compiled code instead, including DMA
+  transfers, and recompiles only code that was actually overwritten.
+- **ARMSX2's newer IOP thread, made to work on the Switch 2.** The PS2's I/O processor runs on
+  its own core using ARMSX2's latest IOP thread, including its lag control. SW2PS2 adds the
+  Switch 2 fixes it needs: detecting the console's CPU cores correctly (the standard check
+  reports none) and waiting without WFE instructions, which never wake on the Switch 2.
+- **Per-game speed settings built in.** Demanding games start with emulated-CPU settings
+  measured on the Switch 2, falling back to the community-tested AetherSX2/NetherSX2 lists. Any
+  game can be adjusted from the in-game menu, and the app tells you once if a game falls below
+  full speed.
+- **2x resolution by default.** It was measured to cost nothing in the games tested.
+  Resolution can be changed per game, live, from the in-game menu.
+
+### Stability
+
+- **Several games in one session.** Starting a second game and loading a state no longer
+  crashes. The cause was the core's background VU compiler, which SW2PS2 turns off; it gave no
+  measurable speed.
+- **Relaunching from hbmenu.** The emulated PS2's memory is reserved once and released when the
+  app exits; before, repeated use fragmented memory until the app could no longer start.
+- **Loading a state right after boot.** A state load is held until the game itself has
+  started; loading while the BIOS was still booting crashed God of War II.
 
 ## Layout
 
@@ -56,7 +83,7 @@ the app with the GPL text.
 - [OunceSX2](https://github.com/nyathea/OunceSX2), [ARMSX2](https://github.com/ARMSX2/ARMSX2) and
   [PCSX2](https://github.com/PCSX2/pcsx2): the emulator core (GPL-3.0+). From OunceSX2's Switch 2 app,
   `HorizonThreadWrap` and `ServiceLookupGuard` are compiled in, and its approach to setting Switch 2
-  clock rates and to cleaning up threads at exit is followed.
+  clock rates and to cleaning up threads at exit is followed. The IOP thread is ARMSX2's.
 - Per-game CPU settings adapted (converted to SW2PS2's own table) from the community-tested
   [AetherSX2/NetherSX2 playable lists](https://github.com/Darkelf2024/PS2-Playable-Lists-for-AetherSX2-NetherSX2)
   by Darkelf2024, licensed [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).

@@ -289,6 +289,7 @@ static double autoTestEnd = 0, autoWaitSince = 0, autoPollAt = 0;
 static vector<std::pair<string, string>> autoOptions;  // extra core options for the current test run
 static string autoLabel;
 static std::deque<std::pair<double, int>> autoLiveRes;  // "liveRes": [[seconds, resolution index], ...]: change resolution mid-game, as from the menu
+static bool autoPlayerStats = false;  // "playerStats": true: the stats text players see (screenshots of it)
 static double autoSaveAt = -1; static int autoSaveSlot = 4;  // "saveState": [seconds, slot]: save a state (tests the states folder)
 static double autoMenuOpenAt = -1;  // "menuOpen": seconds: open the in-game menu and leave it open (for screenshots)
 static double autoEarlyLoadAt = -1; static int autoEarlyLoadSlot = 1;  // "earlyLoad": [seconds, slot]: Load state straight after boot, no menu
@@ -678,28 +679,34 @@ static void videoFps(double& avg, double& low) {
   double worst = 0; for (int i = 0; i < k; i++) worst += gaps[i];
   avg = (n - 1) * 1000 / (last - first); low = 1000 / (worst / k);
 }
-// Frame-time graph: 240 frames, 2 px each, scrolling left; 16.7 ms in the middle.
+// Frame-time graph: the time between the game's own frames (a 30 fps game sits at 33.3 ms, a stutter
+// is a spike), 240 frames, 2 px each, scrolling left; guide lines at 16.7 and 33.3 ms, top 50 ms.
 enum { GRAPH_STEP = 2, GRAPH_FRAMES = 240, GRAPH_W = GRAPH_STEP * GRAPH_FRAMES, GRAPH_H = 40 };
-static const double GRAPH_MAX_MS = 33.4;
+static const double GRAPH_MAX_MS = 50.0;
+static bool graphGuide(int r) {
+  for (double g : {16.7, 33.3}) if (r == GRAPH_H - 1 - (int)lround(g / GRAPH_MAX_MS * (GRAPH_H - 2))) return true;
+  return false;
+}
 static uint32_t graphPix[GRAPH_W * GRAPH_H];
 static gfx::Image* graphImage = nullptr;
 static int graphPrevY = -1;
+static bool graphSkipBacklog = true;  // the next read drops game frames from before the reset
 static void resetGraph() {
-  graphPrevY = -1;
-  int mid = GRAPH_H - (int)lround(16.7 / GRAPH_MAX_MS * GRAPH_H);
-  for (int i = 0; i < GRAPH_W * GRAPH_H; i++) graphPix[i] = 0;
-  for (int x = 0; x < GRAPH_W; x++) graphPix[mid * GRAPH_W + x] = 0x4dffffff;
+  graphPrevY = -1; graphSkipBacklog = true;
+  for (int r = 0; r < GRAPH_H; r++) for (int x = 0; x < GRAPH_W; x++) graphPix[r * GRAPH_W + x] = graphGuide(r) ? 0x4dffffff : 0;
 }
+extern "C" __attribute__((weak)) int sw2_game_frame_intervals(unsigned* seq, float* out_ms, int max);
 static void drawGraph(double ms) {
-  int S = GRAPH_STEP, mid = GRAPH_H - (int)lround(16.7 / GRAPH_MAX_MS * GRAPH_H);
+  int S = GRAPH_STEP;
   int y = GRAPH_H - 1 - (int)lround(std::min(ms, GRAPH_MAX_MS) / GRAPH_MAX_MS * (GRAPH_H - 2));
   int y0 = graphPrevY < 0 ? y : graphPrevY, lo = std::min(y0, y), hi = std::max(y0, y);
   for (int r = 0; r < GRAPH_H; r++) {
     uint32_t* row = graphPix + r * GRAPH_W;
     memmove(row, row + S, (GRAPH_W - S) * 4);
     // a line: the first column joins the previous point, the second holds the new value
-    row[GRAPH_W - 2] = (r >= lo && r <= hi) ? 0xff6ee26e : r == mid ? 0x4dffffff : 0;
-    row[GRAPH_W - 1] = r == y ? 0xff6ee26e : r == mid ? 0x4dffffff : 0;
+    const uint32_t bg = graphGuide(r) ? 0x4dffffff : 0;
+    row[GRAPH_W - 2] = (r >= lo && r <= hi) ? 0xff6ee26e : bg;
+    row[GRAPH_W - 1] = r == y ? 0xff6ee26e : bg;
   }
   graphPrevY = y;
   if (graphImage) gfx::imageUpload(graphImage, graphPix);
@@ -2066,21 +2073,25 @@ static void updateStats(double t) {
   double secs = (t - statsAt) / 1000, avg, low;
   videoFps(avg, low);
   char buf[200];
-  if (statsLevel == 1) snprintf(buf, sizeof buf, "%.1f fps", avg);
+  double gameFps = 0, emuFps = emuCount / secs;
+  {  // The game's own frame rate: vsyncs with draws into the displayed buffer when the game shows
+     // any (it renders and copies), else vsyncs with display registers written, else buffer flips.
+    static unsigned long long blitPrev, regPrev, flipPrev;
+    const unsigned long long blits = sw2_gs_stats[11] - blitPrev, regs = sw2_gs_stats[12] - regPrev, flipsN = sw2_gs_stats[10] - flipPrev;
+    blitPrev = sw2_gs_stats[11]; regPrev = sw2_gs_stats[12]; flipPrev = sw2_gs_stats[10];
+    gameFps = (blits ? blits : regs ? regs : flipsN) / secs;
+    if (sw2ax_fps) { emuFps = sw2ax_fps(); gameFps = sw2ax_internal_fps(); }  // ARMSX2 core: its own counters
+  }
+  if (statsLevel == 1) snprintf(buf, sizeof buf, "%.0f fps", gameFps);
   else {
     double cpu = coreLoad(), gpu = gfx::gpuMs();
     char cpuS[24], gpuS[24];
     if (cpu >= 0) snprintf(cpuS, sizeof cpuS, "%d%%", (int)lround(cpu * 100)); else snprintf(cpuS, sizeof cpuS, "%d%%", (int)lround(100 * workMs / (t - statsAt)));
     if (gpu >= 0) snprintf(gpuS, sizeof gpuS, "%d%% (%.1f ms)", (int)lround(100 * gpu / tickMs), gpu); else snprintf(gpuS, sizeof gpuS, "n/a");
-    // The game's own frame rate: vsyncs with draws into the displayed buffer when the game shows
-    // any (it renders and copies), else vsyncs with display registers written, else buffer flips.
-    static unsigned long long blitPrev, regPrev, flipPrev;
-    const unsigned long long blits = sw2_gs_stats[11] - blitPrev, regs = sw2_gs_stats[12] - regPrev, flipsN = sw2_gs_stats[10] - flipPrev;
-    blitPrev = sw2_gs_stats[11]; regPrev = sw2_gs_stats[12]; flipPrev = sw2_gs_stats[10];
-    double gameFps = (blits ? blits : regs ? regs : flipsN) / secs;
-    double emuFps = emuCount / secs;
-    if (sw2ax_fps) { emuFps = sw2ax_fps(); gameFps = sw2ax_internal_fps(); }  // ARMSX2 core: its own counters
-    snprintf(buf, sizeof buf, "Game %.0f fps   Emu %.1f fps   Video avg %.1f fps   1%% low %.1f fps   CPU %s   GPU %s   %s", gameFps, emuFps, avg, low, cpuS, gpuS, dispLabel().c_str());
+    // Players see the game's frame rate and the load; test runs also log the emulator's own rate
+    // and the display's average and 1% low (tests/ read them from log.txt).
+    if (autoTest && !autoPlayerStats) snprintf(buf, sizeof buf, "Game %.0f fps   Emu %.1f fps   Video avg %.1f fps   1%% low %.1f fps   CPU %s   GPU %s   %s", gameFps, emuFps, avg, low, cpuS, gpuS, dispLabel().c_str());
+    else snprintf(buf, sizeof buf, "Game %.0f fps   CPU %s   GPU %s   %s", gameFps, cpuS, gpuS, dispLabel().c_str());
   }
   if (sessionLog < 120) { sessionLog++; record("t%d %s | wait %.2f block %.2f emu %.2f draw %.2f swap %.2f ms, audio q %.0f ms ratio %.4f in %.0f/s", sessionLog, buf,
                                                phase[0] / phaseN, phase[1] / phaseN, phase[2] / phaseN, phase[3] / phaseN, phase[4] / phaseN, pendEma / 48.0, audioRatio, audioInCount / secs); audioInCount = 0; }
@@ -2372,6 +2383,7 @@ static bool autoStartRun() {
   record("autotest: running (%s)", toastText.c_str());
   autoTestEnd = nowMs() + seconds * 1000; sessionLog = 0;
   autoRunStart = nowMs(); autoShots.clear();
+  { const Json* ps = j->get("playerStats"); autoPlayerStats = ps && ps->isBool() && ps->b; }
   autoMenuLoadAt = -1; autoMenuLoadStage = 0; autoLiveRes.clear(); autoEarlyLoadAt = -1; autoMenuOpenAt = -1; autoSaveAt = -1;
   if (const Json* sv = j->get("saveState")) if (sv->isArr() && sv->a.size() == 2 && sv->a[0].isNum() && sv->a[1].isNum()) { autoSaveAt = sv->a[0].n; autoSaveSlot = (int)sv->a[1].n; }
   if (const Json* mo = j->get("menuOpen")) if (mo->isNum()) autoMenuOpenAt = mo->n;
@@ -2876,7 +2888,12 @@ int main(int argc, char** argv) {
       if (gap > 5 && gap < 21) tickMs += (gap - tickMs) * 0.01;
       if (frameDrawn) noteShown(after);
     } else if (frameDrawn) noteShown(after);
-    if (frameDrawn) {  // the graph plots the time between new game frames, not between display refreshes
+    if (statsLevel == 3 && running && sw2_game_frame_intervals) {  // the time between the game's own frames (core: game_frame)
+      static unsigned gfSeq = 0; float iv[64];
+      int n = sw2_game_frame_intervals(&gfSeq, iv, 64);
+      if (graphSkipBacklog) { graphSkipBacklog = false; n = 0; }
+      for (int i = 0; i < n; i++) if (iv[i] > 0 && iv[i] < 1000) drawGraph(iv[i]);
+    } else if (frameDrawn) {  // (no game-frame times: new frames from the core)
       static double lastShownAt = 0;
       if (statsLevel == 3 && lastShownAt > 0 && after - lastShownAt < 1000) drawGraph(after - lastShownAt);
       lastShownAt = after;

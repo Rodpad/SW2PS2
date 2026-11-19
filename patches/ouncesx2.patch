@@ -4117,6 +4117,64 @@ index a58d80c321..9e2ca219d4 100644
  	SettingsWrapEntry(iopThreadLag);
  	SettingsWrapBitBool(DynamicEECycleRate);
  	SettingsWrapEntry(DynamicEECycleRateTrace);
+diff --git a/pcsx2/PerformanceMetrics.cpp b/pcsx2/PerformanceMetrics.cpp
+index 600834c53c..e3d6b98292 100644
+--- a/pcsx2/PerformanceMetrics.cpp
++++ b/pcsx2/PerformanceMetrics.cpp
+@@ -35,6 +35,11 @@ static const float UPDATE_INTERVAL = 0.5f;
+ static float s_fps = 0.0f;
+ static PerformanceMetrics::AverageFPS s_avg_vps;
+ static float s_internal_fps = 0.0f;
++// SW2PS2: when each game frame happened (a vsync where the game showed a new picture, judged as
++// the internal FPS is), for the front end's frame-time graph. Written on the CPU thread only.
++static constexpr u32 SW2_GAME_FRAMES = 64;
++static Common::Timer::Value s_sw2_game_frame_at[SW2_GAME_FRAMES];
++static std::atomic<u32> s_sw2_game_frame_seq{0};
+ static float s_minimum_frame_time = 0.0f;
+ static float s_minimum_frame_time_accumulator = 0.0f;
+ static float s_average_frame_time = 0.0f;
+@@ -349,6 +354,16 @@ void PerformanceMetrics::Update(bool gs_register_write, bool fb_blit, bool is_sk
+ 	s_gs_privileged_register_writes_since_last_update += static_cast<u32>(gs_register_write);
+ 	s_gs_framebuffer_blits_since_last_update += static_cast<u32>(fb_blit);
+ 	s_frame_number++;
++	{  // SW2PS2: a game frame, by the same method the internal FPS uses
++		const bool game_frame = s_internal_fps_method == InternalFPSMethod::GSPrivilegedRegister ? gs_register_write :
++								s_internal_fps_method == InternalFPSMethod::DISPFBBlit ? fb_blit : (gs_register_write || fb_blit);
++		if (game_frame)
++		{
++			const u32 seq = s_sw2_game_frame_seq.load(std::memory_order_relaxed);
++			s_sw2_game_frame_at[seq % SW2_GAME_FRAMES] = Common::Timer::GetCurrentValue();
++			s_sw2_game_frame_seq.store(seq + 1, std::memory_order_release);
++		}
++	}
+ 
+ 	const Common::Timer::Value now_ticks = Common::Timer::GetCurrentValue();
+ 	const Common::Timer::Value ticks_diff = now_ticks - s_last_update_time.GetStartValue();
+@@ -905,3 +920,24 @@ u32 PerformanceMetrics::GetFrameTimeHistoryPos()
+ {
+ 	return s_frame_time_history_pos;
+ }
++
++// SW2PS2: the times between game frames the caller has not had yet (in ms, oldest first, at most
++// max). *seq counts the game frames already handed over; it is advanced. Frame k's interval is
++// from frame k-1 to frame k; the ring keeps the last SW2_GAME_FRAMES times. For the front end's
++// frame-time graph, read from its own thread.
++extern "C" int sw2_game_frame_intervals(unsigned* seq, float* out_ms, int max)
++{
++	const u32 now = s_sw2_game_frame_seq.load(std::memory_order_acquire);  // frames 0 .. now-1 exist
++	u32 k = std::max<u32>(*seq, 1);
++	if (now > SW2_GAME_FRAMES - 1 && k < now - (SW2_GAME_FRAMES - 1))
++		k = now - (SW2_GAME_FRAMES - 1);  // fell behind: the oldest times are gone
++	int n = 0;
++	for (; k < now && n < max; k++)
++	{
++		const Common::Timer::Value a = s_sw2_game_frame_at[(k - 1) % SW2_GAME_FRAMES];
++		const Common::Timer::Value b = s_sw2_game_frame_at[k % SW2_GAME_FRAMES];
++		out_ms[n++] = static_cast<float>(Common::Timer::ConvertValueToMilliseconds(b - a));
++	}
++	*seq = k;
++	return n;
++}
 diff --git a/pcsx2/R5900.cpp b/pcsx2/R5900.cpp
 index 48c686a506..eb21ef5bac 100644
 --- a/pcsx2/R5900.cpp
