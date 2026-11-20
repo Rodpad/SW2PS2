@@ -6,15 +6,44 @@
 > `/switch/sw2ps2/log.txt` from the SD card.
 
 A PlayStation 2 emulator for the Nintendo Switch 2 (hbmenu / kaiHEN), built on the
-[OunceSX2](https://github.com/nyathea/OunceSX2) core (ARMSX2 / PCSX2 lineage) with a native
-front end: game list with favourites and recents, settings and an in-game menu in tabs
-(L / R), per-game settings, save-state slots, cheats, CRT shaders, live resolution switching,
-Switch 2 CPU clocking, up to four players with the PS2 Multitap, and button remapping.
+[OunceSX2](https://github.com/nyathea/OunceSX2) core (ARMSX2 / PCSX2 lineage) with its own
+native front end.
 
 No games, BIOS files or other copyrighted material are included. You need your own PS2
 BIOS (default folder `/bios/ps2`) and your own game dumps (default folder `/roms/ps2`); both
 folders can be changed in Settings -> App. The app keeps its own files in `/switch/sw2ps2`
 (save states in `states/`, per-game settings in `settings/`).
+
+## Features
+
+### Games
+- **Game list** with All / Favourites / Recent tabs (L / R). Games are found in the games
+  folder and any folders inside it: `.iso`, `.chd`, `.cso`, `.zso`, `.ciso`, `.gz`, `.m3u`, and `.cue` with its
+  `.bin`. The BIOS is found the same way, in its folder or folders inside it.
+- **Per-game settings:** a setting changed in a game's menu is kept for that game; Settings holds
+  the defaults for all games.
+- **Built-in speed settings** for demanding games, measured on the Switch 2 or taken from the
+  community AetherSX2/NetherSX2 lists, so most games start well without tuning.
+
+### In-game menu
+Opened with L + R + L3 + R3 (SL + SR + stick press on a single Joy-Con), in tabs:
+- **Game:** resume, save and load state (several slots, with optional auto-load when a game
+  starts), save screenshot, reset, quit.
+- **Emulation**, applied straight away: PS2 CPU speed and cycle skip, GPU readbacks
+  (Accurate / Fast), Switch 2 CPU clock, internal resolution (1x and up), widescreen patches,
+  and a stats overlay (FPS, full statistics, or with a frame-time graph).
+- **Picture:** aspect ratio (4:3, 16:9, stretch, 1:1), integer or fit scaling, overscan cropping,
+  shaders (sharp bilinear, Scale2x, LCD grid, and CRT shaders: CRT-Geom, CRT-Lottes, zfast CRT,
+  CRT-Easymode, CRT-Aperture, CRT-Royale), signal look (RGB, composite, composite with dot
+  crawl, S-Video), brightness boost, screen curvature, rounded corners and vignette.
+- **Controls:** see below.
+
+The menu can pause the game and dim it behind (both optional). Less common options appear with
+Settings -> App -> Advanced options.
+
+### Display and sound
+- 60 Hz, or 120 Hz with VRR on displays that support it; adjustable frame delay.
+- Volume, audio buffer size and controller vibration strength.
 
 ## Controllers
 
