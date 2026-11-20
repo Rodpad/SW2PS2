@@ -40,7 +40,7 @@ extern const char* core_rom_name;  // full path of the disc image, set before lo
 
 // PS2 extras (cores.cpp).
 struct Ps2Input { uint32_t buttons; int16_t lx, ly, rx, ry; };  // libretro joypad bits + sticks
-extern Ps2Input ps2Input[2];           // read by frame(); the int pad arguments are ignored
+extern Ps2Input ps2Input[4];           // read by frame(); the int pad arguments are ignored
 void ps2core_setup(const char* dataDir, void (*log)(const char* line));  // once at start
 void ps2core_option(const char* key, const char* value);                 // core option (pcsx2_*)
 bool ps2core_use_gpu(bool on, int scale, const char** error);            // before load(): GPU renderer target

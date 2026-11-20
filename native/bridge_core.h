@@ -29,7 +29,7 @@ int ps2_vulkan_active(void);  // the loaded game got its Vulkan display
 // One frame. Pad: buttons = libretro joypad bits (RETRO_DEVICE_ID_JOYPAD_*),
 // sticks -32768..32767 (lx, ly, rx, ry).
 typedef struct { uint32_t buttons; int16_t lx, ly, rx, ry; } ps2_pad;
-void ps2_run(const ps2_pad* p1, const ps2_pad* p2);
+void ps2_run(const ps2_pad* players);  // 4 pads: players 1-4 (3-4 only with the Multitap)
 // Last frame (RGBA, video_pitch pixels per row); frame_serial changes when the core showed a new one.
 const uint32_t* ps2_video(void);
 int ps2_video_width(void);

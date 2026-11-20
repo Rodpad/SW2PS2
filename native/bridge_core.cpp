@@ -32,13 +32,13 @@ static std::vector<uint32_t> frame;
 static int fw, fh, fpitch;
 static unsigned frameSerial;
 static std::vector<int16_t> audioBuf;
-static ps2_pad pads[2];
+static ps2_pad pads[4];  // players 1-4 (3-4 only with the Multitap)
 static double fps = 59.94;
 static float aspect = 4.0f / 3.0f;
 // Rumble: the core sets it from its emulation thread; the front end reads it each frame.
-static std::atomic<uint16_t> rumbleNow[2][2];  // [port][RETRO_RUMBLE_STRONG / WEAK]
+static std::atomic<uint16_t> rumbleNow[4][2];  // [player][RETRO_RUMBLE_STRONG / WEAK]
 static bool setRumble(unsigned port, enum retro_rumble_effect effect, uint16_t strength) {
-  if (port < 2 && (unsigned)effect < 2) rumbleNow[port][effect].store(strength, std::memory_order_relaxed);
+  if (port < 4 && (unsigned)effect < 2) rumbleNow[port][effect].store(strength, std::memory_order_relaxed);
   return true;
 }
 static std::string lastError;
@@ -169,7 +169,7 @@ static void audioSample(int16_t l, int16_t r) { audioBuf.push_back(l); audioBuf.
 static size_t audioBatch(const int16_t* d, size_t frames) { audioBuf.insert(audioBuf.end(), d, d + frames * 2); return frames; }
 static void inputPoll(void) {}
 static int16_t inputState(unsigned port, unsigned device, unsigned index, unsigned id) {
-  if (port > 1) return 0;
+  if (port > 3) return 0;
   const ps2_pad& p = pads[port];
   if (device == RETRO_DEVICE_JOYPAD) { if (id == RETRO_DEVICE_ID_JOYPAD_MASK) return (int16_t)p.buttons; return (p.buttons >> id) & 1; }
   if (device == RETRO_DEVICE_ANALOG) {
@@ -279,10 +279,9 @@ void ps2_unload(void) {
 }
 int ps2_loaded(void) { return loaded; }
 void ps2_reset(void) { if (loaded) retro_reset(); }
-void ps2_run(const ps2_pad* p1, const ps2_pad* p2) {
+void ps2_run(const ps2_pad* players) {  // 4 pads, players 1-4
   if (!loaded) return;
-  static const ps2_pad none = {0, 0, 0, 0, 0};
-  pads[0] = p1 ? *p1 : none; pads[1] = p2 ? *p2 : none;
+  for (int i = 0; i < 4; i++) pads[i] = players[i];
   retro_run();
 }
 const uint32_t* ps2_video(void) { return frame.empty() ? NULL : frame.data(); }
@@ -293,8 +292,8 @@ unsigned ps2_frame_serial(void) { return frameSerial; }
 double ps2_fps(void) { return fps; }
 float ps2_aspect(void) { return aspect; }
 void ps2_rumble(int port, uint16_t* strong, uint16_t* weak) {
-  *strong = rumbleNow[port & 1][RETRO_RUMBLE_STRONG].load(std::memory_order_relaxed);
-  *weak = rumbleNow[port & 1][RETRO_RUMBLE_WEAK].load(std::memory_order_relaxed);
+  *strong = rumbleNow[port & 3][RETRO_RUMBLE_STRONG].load(std::memory_order_relaxed);
+  *weak = rumbleNow[port & 3][RETRO_RUMBLE_WEAK].load(std::memory_order_relaxed);
 }
 static std::vector<int16_t> audioOut;
 int ps2_audio_take(const int16_t** out) { audioOut.swap(audioBuf); audioBuf.clear(); *out = audioOut.data(); return (int)(audioOut.size() / 2); }

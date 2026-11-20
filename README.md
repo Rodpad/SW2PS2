@@ -1,19 +1,41 @@
 # SW2PS2
 
 > **Early development:** SW2PS2 is new and there will be bugs. Please report them in
-> [Issues](https://github.com/Rodpad/SW2PS2/issues) with the game, what happened and, if you can,
+> [Issues](https://github.com/Rodpad/SW2PS2/issues) with the game and what happened. If you can, turn on
+> Settings -> App -> Debug logging (shown with Advanced options), make it happen again and attach
 > `/switch/sw2ps2/log.txt` from the SD card.
 
 A PlayStation 2 emulator for the Nintendo Switch 2 (hbmenu / kaiHEN), built on the
 [OunceSX2](https://github.com/nyathea/OunceSX2) core (ARMSX2 / PCSX2 lineage) with a native
 front end: game list with favourites and recents, settings and an in-game menu in tabs
 (L / R), per-game settings, save-state slots, cheats, CRT shaders, live resolution switching,
-and Switch 2 CPU clocking.
+Switch 2 CPU clocking, up to four players with the PS2 Multitap, and button remapping.
 
 No games, BIOS files or other copyrighted material are included. You need your own PS2
 BIOS (default folder `/bios/ps2`) and your own game dumps (default folder `/roms/ps2`); both
 folders can be changed in Settings -> App. The app keeps its own files in `/switch/sw2ps2`
 (save states in `states/`, per-game settings in `settings/`).
+
+## Controllers
+
+- **Up to four players.** Players 1 and 2 use the PS2's two controller ports. For games made
+  for the PS2 Multitap (TimeSplitters: Future Perfect, Tekken Tag Tournament's Pair Play and
+  others), turn on **Multitap (players 3-4)** in the in-game menu's Controls tab (saved for that
+  game) or in Settings -> Sound & controls (the default for all games). Players 1-4 are then the
+  Multitap's four slots, as on a real PS2. Some games need each player to press Start to join.
+- **Pairing.** "Pair controllers" opens the Switch's own controller screen, with four slots,
+  from Settings or mid-game. Every connected player can move around SW2PS2's menus.
+- **Button remapping.** Each player's PS2 buttons can be mapped one by one on an interactive
+  screen: press the Switch button you want for each PS2 button, or wait to leave it unmapped.
+  Stick directions can be mapped too (for example, the stick as the D-pad). Layouts made in
+  Settings apply to every game; layouts made from the in-game Controls tab apply only to that
+  game. "Reset buttons to standard" puts everyone back.
+- **Single Joy-Cons (experimental).** A Joy-Con held sideways works as its own controller: the
+  stick and buttons are turned to match, menus show position-based button hints, and its
+  default layout is SL / SR = L1 / R1, stick press = L3, - or + = Start, the four buttons the
+  PS2's by position, and the stick as both analog stick and D-pad. SL + SR + stick press opens
+  the in-game menu (L + R + L3 + R3 on other controllers). Games needing L2 / R2 / Select / R3
+  need a remap or a fuller controller.
 
 ## What SW2PS2 adds to OunceSX2
 

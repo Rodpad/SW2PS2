@@ -246,7 +246,7 @@ static int renderScale = 1;  // the running game's resolution multiplier
 static bool runningHw = false;  // the running game is on a GPU renderer (resolution can change)
 // Advanced options: hidden by default, leaving what a console's own emulator offers.
 static bool showAdvanced = false;  // default: hidden (also after Reset all settings)
-static const vector<string> ADVANCED_SETTINGS = {"Emulated CPU speed (next start)", "CPU boost mode (next start)", "Scale", "Overscan", "Signal", "Curvature", "Corner radius", "Corner softness", "Vignette", "Vignette size",
+static const vector<string> ADVANCED_SETTINGS = {"Debug logging", "Emulated CPU speed (next start)", "CPU boost mode (next start)", "Scale", "Overscan", "Signal", "Curvature", "Corner radius", "Corner softness", "Vignette", "Vignette size",
     "Brightness boost", "Stats", "Run-ahead", "Frame delay (60 Hz)", "Audio buffer", "Display", "Fast-forward speed", "Dim game in menu", "Audio filter", "Turbo speed"};
 static const vector<string> ADVANCED_MENU = {"Run-ahead", "Stats", "Scale", "Overscan", "Signal", "Curvature", "Corner radius", "Corner softness", "Vignette",
     "Vignette size", "Brightness boost", "Settings for", "Cheats...", "Resolution"};
@@ -299,6 +299,35 @@ static int settingsIndex = 0, settingsTop = 0;
 
 static double nowMs() { return armTicksToNs(armGetSystemTick()) / 1e6; }
 static FILE* logFile = nullptr;
+// Button mapping, per player: for each PS2 button (PS2_BUTTONS order) the Switch button (its
+// HidNpadButton bit) that presses it, or -1 for none. Settings -> Sound & controls remaps it.
+struct Ps2Button { const char* name; int id; int def; };  // id: libretro joypad id; def: default Switch bit
+// libretro joypad ids: B0 Y1 SELECT2 START3 UP4 DOWN5 LEFT6 RIGHT7 A8 X9 L10 R11 L2 12 R2 13 L3 14 R3 15
+static const Ps2Button PS2_BUTTONS[16] = {
+    {"Cross", 0, 1}, {"Circle", 8, 0}, {"Square", 1, 3}, {"Triangle", 9, 2},
+    {"L1", 10, 6}, {"R1", 11, 7}, {"L2", 12, 8}, {"R2", 13, 9}, {"L3", 14, 4}, {"R3", 15, 5},
+    {"Start", 3, 10}, {"Select", 2, 11}, {"D-pad up", 4, 13}, {"D-pad down", 5, 15}, {"D-pad left", 6, 12}, {"D-pad right", 7, 14}};
+static int padMap[4][16];  // players 1-4 (3-4 only with the Multitap)
+// Per-game layouts, made from the in-game menu: a game listed here uses its own instead of padMap.
+struct GamePadMap { int m[4][16]; };
+static std::map<string, GamePadMap> gamePadMaps;
+// The Multitap (players 3-4): Settings' default, and a game's own choice from the in-game menu.
+static bool multitapDefault = false;
+static std::map<string, bool> gameMultitap;
+static bool multitapFor(const string& name) { auto it = gameMultitap.find(name); return it != gameMultitap.end() ? it->second : multitapDefault; }
+static void resetPadMap(int player) { for (int i = 0; i < 16; i++) padMap[player][i] = PS2_BUTTONS[i].def; }
+static bool padMapIsDefault(int player) { for (int i = 0; i < 16; i++) if (padMap[player][i] != PS2_BUTTONS[i].def) return false; return true; }
+// The Switch inputs a mapping can use: buttons (bits 0-15), each stick's four directions (16-23, as the
+// system reports them past its threshold), and the Joy-Cons' SL / SR (24-27).
+static const u64 MAPPABLE = 0xFFFFFFull | (0xFull << 24);
+static const char* switchButtonName(int bit) {
+  static const char* N[28] = {"A", "B", "X", "Y", "Left stick press", "Right stick press", "L", "R", "ZL", "ZR", "+", "-",
+                              "D-pad left", "D-pad up", "D-pad right", "D-pad down",
+                              "Left stick left", "Left stick up", "Left stick right", "Left stick down",
+                              "Right stick left", "Right stick up", "Right stick right", "Right stick down",
+                              "SL (left Joy-Con)", "SR (left Joy-Con)", "SL (right Joy-Con)", "SR (right Joy-Con)"};
+  return bit >= 0 && bit < 28 ? N[bit] : "";
+}
 // Automated test (autotest.json, see main): overrides apply to one run and are not saved.
 static bool autoTest = false, autoAgent = false, autoWaiting = false;
 static double autoTestEnd = 0, autoWaitSince = 0, autoPollAt = 0;
@@ -307,7 +336,11 @@ static string autoLabel;
 static std::deque<std::pair<double, int>> autoLiveRes;
 struct AutoLiveSet { double at; string what; int v; };
 static std::deque<AutoLiveSet> autoLiveSet;  // "liveSet": [[seconds, "rate"|"skip"|"readback"|"clock", menu index], ...] (in memory only)  // "liveRes": [[seconds, resolution index], ...]: change resolution mid-game, as from the menu
-static bool autoPlayerStats = false;  // "playerStats": true: the stats text players see (screenshots of it)
+static bool autoPlayerStats = false;  // "playerStats": true: the stats text and log players get (to check them)
+// Detailed logging (every second, thread detail, the core's output in full): Settings -> App ->
+// Debug logging (off by default); always on in test runs, unless they ask for what players get.
+static bool debugLog = false;
+static bool verboseLog() { return autoTest ? !autoPlayerStats : debugLog; }
 static double autoSaveAt = -1; static int autoSaveSlot = 4;  // "saveState": [seconds, slot]: save a state (tests the states folder)
 static double autoMenuOpenAt = -1;  // "menuOpen": seconds: open the in-game menu and leave it open (for screenshots)
 static double autoEarlyLoadAt = -1; static int autoEarlyLoadSlot = 1;  // "earlyLoad": [seconds, slot]: Load state straight after boot, no menu
@@ -319,7 +352,16 @@ static void record(const char* fmt, ...) {
   if (!logFile) return;
   va_list ap; va_start(ap, fmt); vfprintf(logFile, fmt, ap); va_end(ap); fputc('\n', logFile); fflush(logFile);
 }
-void sw2_log_line(const char* line) { record("%s", line); }  // for other files (vkpresent.cpp)
+void sw2_log_line(const char* line) { record("%s", line); }
+// The log file; the previous session's is kept as log.prev.txt (a test's results survive a relaunch).
+static void openLog(bool append) {
+  if (logFile) return;
+  if (!append) {
+    remove((string(DATA_DIR) + "/log.prev.txt").c_str());
+    rename((string(DATA_DIR) + "/log.txt").c_str(), (string(DATA_DIR) + "/log.prev.txt").c_str());
+  }
+  logFile = fopen((string(DATA_DIR) + "/log.txt").c_str(), append ? "a" : "w");
+}  // for other files (vkpresent.cpp)
 
 /* ---------------- Files ---------------- */
 static bool readFile(const string& path, vector<uint8_t>& out, long limit = 4 * 1024 * 1024) {
@@ -431,7 +473,13 @@ static Json settingsJson(const GameVals& g) {
   j.set("ps2Renderer", Json::number(ps2Renderer)); j.set("ps2Resolution", Json::number(ps2Resolution)); j.set("ps2EeSpeed", Json::number(ps2EeSpeed)); j.set("ps2Fpu", Json::number(ps2Fpu)); j.set("ps2CycleSkip", Json::number(ps2CycleSkip));
   { Json rb = Json::object(); for (auto& kv : gameReadback) if (kv.second) rb.set(kv.first, Json::number(kv.second)); j.set("gameReadback", rb); }
   { Json r = Json::object(), k = Json::object(); for (auto& kv : gameRate) if (kv.second) r.set(kv.first, Json::number(kv.second)); for (auto& kv : gameSkip) if (kv.second) k.set(kv.first, Json::number(kv.second)); j.set("gameRate", r); j.set("gameSkip", k);
-    Json rs = Json::object(); for (auto& kv : gameRes) if (kv.second) rs.set(kv.first, Json::number(kv.second)); j.set("gameRes", rs); j.set("res1x", Json::boolean(true)); j.set("ee75", Json::boolean(true)); j.set("zfastDefault", Json::boolean(true)); } j.set("fastReadback", strings(fastReadbackGames)); j.set("cpuClock", Json::number(cpuClock)); j.set("gpuClock", Json::number(gpuClock));
+    Json rs = Json::object(); for (auto& kv : gameRes) if (kv.second) rs.set(kv.first, Json::number(kv.second)); j.set("gameRes", rs); j.set("res1x", Json::boolean(true)); j.set("debugLog", Json::boolean(debugLog));
+    for (int pl = 0; pl < 4; pl++) { Json m = Json::array(); for (int i = 0; i < 16; i++) m.a.push_back(Json::number(padMap[pl][i])); j.set("padMap" + std::to_string(pl + 1), m); }
+    j.set("multitap", Json::boolean(multitapDefault));
+    { Json g = Json::object(); for (auto& kv : gameMultitap) g.set(kv.first, Json::boolean(kv.second)); j.set("gameMultitap", g); }
+    { Json g = Json::object();
+      for (auto& kv : gamePadMaps) { Json both = Json::array(); for (int pl = 0; pl < 4; pl++) { Json m = Json::array(); for (int i = 0; i < 16; i++) m.a.push_back(Json::number(kv.second.m[pl][i])); both.a.push_back(m); } g.set(kv.first, both); }
+      j.set("gamePadMaps", g); } j.set("ee75", Json::boolean(true)); j.set("zfastDefault", Json::boolean(true)); } j.set("fastReadback", strings(fastReadbackGames)); j.set("cpuClock", Json::number(cpuClock)); j.set("gpuClock", Json::number(gpuClock));
   j.set("autoLoad", Json::boolean(autoLoadState)); j.set("pauseMenu", Json::boolean(pauseInMenu)); j.set("vibration", Json::boolean(vibLevel != 0)); j.set("vibLevel", Json::number(vibLevel)); j.set("dimMenu", Json::boolean(dimInMenu));
   return j;
 }
@@ -472,6 +520,26 @@ static void applySettingsJson(const Json& v) {
   if (const Json* r = v.get("gameReadback")) if (r->type == Json::OBJ) { gameReadback.clear(); for (auto& kv : r->o) if (kv.second.isNum()) gameReadback[kv.first] = pick(&kv.second, 3, 0); }
   if (const Json* r = v.get("gameRes")) if (r->type == Json::OBJ) { gameRes.clear(); for (auto& kv : r->o) if (kv.second.isNum()) gameRes[kv.first] = pick(&kv.second, RESOLUTIONS.size() + 1, 0); }
   if (!v.get("zfastDefault") && shader == 2) shader = 6;  // zfast CRT became the default shader (2026-11-19); once, for settings saved on the old default
+  if (const Json* d = v.get("debugLog")) if (d->isBool()) debugLog = d->b;
+  if (const Json* b = v.get("multitap")) if (b->isBool()) multitapDefault = b->b;
+  gameMultitap.clear();
+  if (const Json* g = v.get("gameMultitap")) if (g->type == Json::OBJ) for (auto& kv : g->o) if (kv.second.isBool()) gameMultitap[kv.first] = kv.second.b;
+  for (int pl = 0; pl < 4; pl++) {
+    resetPadMap(pl);
+    if (const Json* m = v.get("padMap" + std::to_string(pl + 1))) if (m->isArr() && m->a.size() == 16)
+      for (int i = 0; i < 16; i++) if (m->a[i].isNum()) { const int b = (int)m->a[i].n; padMap[pl][i] = (b >= 0 && b < 28 && (MAPPABLE >> b & 1)) ? b : -1; }
+  }
+  gamePadMaps.clear();
+  if (const Json* g = v.get("gamePadMaps")) if (g->type == Json::OBJ)
+    for (auto& kv : g->o) if (kv.second.isArr() && (kv.second.a.size() == 2 || kv.second.a.size() == 4)) {
+      GamePadMap gm; bool ok = true;
+      for (int pl = 2; pl < 4; pl++) memcpy(gm.m[pl], padMap[pl], sizeof gm.m[pl]);  // (older saves: players 1-2 only)
+      for (int pl = 0; pl < (int)kv.second.a.size() && ok; pl++) {
+        const Json& m = kv.second.a[pl]; if (!m.isArr() || m.a.size() != 16) { ok = false; break; }
+        for (int i = 0; i < 16; i++) { const int b = m.a[i].isNum() ? (int)m.a[i].n : -1; gm.m[pl][i] = (b >= 0 && b < 28 && (MAPPABLE >> b & 1)) ? b : -1; }
+      }
+      if (ok) gamePadMaps[kv.first] = gm;
+    }
   if (!v.get("res1x") && ps2Resolution == 1) ps2Resolution = 0;  // 1x is the default again (1.0.2); once, for settings saved on 1.0.0-1.0.1's 2x default
   if (const Json* r = v.get("gameSkip")) if (r->type == Json::OBJ) { gameSkip.clear(); for (auto& kv : r->o) if (kv.second.isNum()) gameSkip[kv.first] = pick(&kv.second, CYCLE_SKIPS.size() + 1, 0); }
   if (const Json* r = v.get("fastReadback")) if (r->isArr()) { fastReadbackGames.clear(); for (auto& x : r->a) if (x.isStr()) fastReadbackGames.push_back(x.s); }
@@ -486,6 +554,7 @@ static void applySettingsJson(const Json& v) {
 static Json defaultSettings;  // the built-in defaults, captured before the settings file is read
 static bool displaySaved = false;  // the file chose a display mode (otherwise 120 Hz only where available)
 static void loadSettings() {
+  for (int pl = 0; pl < 4; pl++) resetPadMap(pl);  // the standard layout, before the defaults are captured
   defaultSettings = settingsJson(gameValues());
   string t; Json v;
   if (!readText(SETTINGS(), t) || !Json::parse(t, v) || v.type != Json::OBJ) return;
@@ -1082,6 +1151,7 @@ static void startGame(const Rom& rom) {
   ps2core_option("pcsx2_ee_cycle_rate", EE_SPEED_VALUES[rate]);
   ps2core_option("pcsx2_ee_cycle_skip", CYCLE_SKIP_VALUES[skip]);
   ps2core_option("pcsx2_hw_download_mode", fastReadback(rom.name) ? "Unsynchronized" : "Accurate");
+  ps2core_option("armsx2_multitap", multitapFor(rom.name) ? "enabled" : "disabled");  // players 3-4
   ps2core_option("pcsx2_widescreen_hint", contains(widescreenGames, rom.name) ? "enabled (16:9)" : "disabled");  // the core's patch, for games without their own widescreen setting
   for (auto& o : autoOptions) ps2core_option(o.first.c_str(), o.second.c_str());
   {  // leak check across game starts
@@ -1218,23 +1288,98 @@ static int snesPad(u64 b, const int* map = faceMap) {
 // PS2 pads: every Switch button is a DualShock 2 button in the same place
 // (A = Circle, B = Cross, X = Triangle, Y = Square, L/R = L1/R1, ZL/ZR = L2/R2,
 // stick clicks = L3/R3, + = Start, - = Select), sticks are the analog sticks.
-static PadState* padStates[2];
+static PadState* padStates[4];  // players 1-4
+// An input's name as the player holds the controller: a single Joy-Con held sideways names its four
+// buttons and stick directions by where they are now (its upright names would point elsewhere).
+static string inputName(int bit, u32 style) {
+  if (style == HidNpadStyleTag_NpadJoyLeft) {
+    switch (bit) {
+      case 15: return "Right button"; case 12: return "Bottom button"; case 14: return "Top button"; case 13: return "Left button";
+      case 19: return "Stick right"; case 17: return "Stick left"; case 16: return "Stick down"; case 18: return "Stick up";
+      case 4: return "Stick press"; case 24: return "SL"; case 25: return "SR";
+    }
+  } else if (style == HidNpadStyleTag_NpadJoyRight) {
+    switch (bit) {
+      case 2: return "Right button"; case 0: return "Bottom button"; case 3: return "Top button"; case 1: return "Left button";
+      case 21: return "Stick right"; case 23: return "Stick left"; case 20: return "Stick up"; case 22: return "Stick down";
+      case 5: return "Stick press"; case 26: return "SL"; case 27: return "SR";
+    }
+  }
+  return switchButtonName(bit);
+}
+// The default layout for a single Joy-Con held sideways (used while a player's layout is the standard
+// one): SL / SR = L1 / R1, stick press = L3, its - or + = Start, the four buttons = the PS2's by
+// position (right Circle, bottom Cross, top Triangle, left Square), and the stick also the D-pad.
+// In PS2_BUTTONS order: Cross Circle Square Triangle L1 R1 L2 R2 L3 R3 Start Select Up Down Left Right.
+static const int JOY_LEFT_MAP[16] = {12, 15, 13, 14, 24, 25, -1, -1, 4, -1, 11, -1, 18, 16, 17, 19};
+static const int JOY_RIGHT_MAP[16] = {0, 2, 1, 3, 26, 27, -1, -1, 5, -1, 10, -1, 20, 22, 23, 21};
 static void setPs2Pad(int player, u64 held, bool blank) {
   Ps2Input& p = ps2Input[player];
   p.buttons = 0; p.lx = p.ly = p.rx = p.ry = 0;
   if (blank || !padStates[player]) return;
-  // libretro joypad ids: B0 Y1 SELECT2 START3 UP4 DOWN5 LEFT6 RIGHT7 A8 X9 L10 R11 L2 12 R2 13 L3 14 R3 15
-  static const struct { u64 sw; int id; } map[] = {{HidNpadButton_B, 0}, {HidNpadButton_Y, 1}, {HidNpadButton_Minus, 2}, {HidNpadButton_Plus, 3},
-      {HidNpadButton_Up, 4}, {HidNpadButton_Down, 5}, {HidNpadButton_Left, 6}, {HidNpadButton_Right, 7}, {HidNpadButton_A, 8}, {HidNpadButton_X, 9},
-      {HidNpadButton_L, 10}, {HidNpadButton_R, 11}, {HidNpadButton_ZL, 12}, {HidNpadButton_ZR, 13}, {HidNpadButton_StickL, 14}, {HidNpadButton_StickR, 15}};
-  for (auto& m : map) if (held & m.sw) p.buttons |= 1u << m.id;
+  const int* map = padMap[player];
+  bool custom = !padMapIsDefault(player);
+  if (running) { auto g = gamePadMaps.find(running->name); if (g != gamePadMaps.end()) { map = g->second.m[player]; custom = true; } }  // this game's own layout
+  if (!custom) {  // a single Joy-Con on the standard layout gets the Joy-Con one
+    const u32 st = padGetStyleSet(padStates[player]);
+    if (st == HidNpadStyleTag_NpadJoyLeft) map = JOY_LEFT_MAP;
+    else if (st == HidNpadStyleTag_NpadJoyRight) map = JOY_RIGHT_MAP;
+  }
+  for (int i = 0; i < 16; i++) { const int b = map[i]; if (b >= 0 && (held & (1ull << b))) p.buttons |= 1u << PS2_BUTTONS[i].id; }
   HidAnalogStickState l = padGetStickPos(padStates[player], 0), r = padGetStickPos(padStates[player], 1);
+  {  // a single Joy-Con held sideways: its stick, turned upright, is the PS2's left stick
+    const u32 st = padGetStyleSet(padStates[player]);
+    if (st == HidNpadStyleTag_NpadJoyLeft) l = HidAnalogStickState{-l.y, l.x};          // a quarter anticlockwise
+    else if (st == HidNpadStyleTag_NpadJoyRight) { l = HidAnalogStickState{r.y, -r.x}; r = HidAnalogStickState{}; }  // a quarter clockwise
+  }
   p.lx = (int16_t)l.x; p.ly = (int16_t)std::max(-32767, -l.y); p.rx = (int16_t)r.x; p.ry = (int16_t)std::max(-32767, -r.y);
 }
 // In-game menu: L + R with both sticks clicked (games use L3 + R3 alone, e.g.
 // Katamari Damacy); every button still belongs to the game. In the menu a lone tap of L / R
 // cycles its categories (see the "menu" input).
 static const u64 MENU_COMBO = HidNpadButton_L | HidNpadButton_R | HidNpadButton_StickL | HidNpadButton_StickR;
+// The menu combo, or on a single Joy-Con held sideways: SL + SR + its stick press.
+static bool menuCombo(u64 bits) {
+  const u64 left = HidNpadButton_LeftSL | HidNpadButton_LeftSR | HidNpadButton_StickL, right = HidNpadButton_RightSL | HidNpadButton_RightSR | HidNpadButton_StickR;
+  return (bits & MENU_COMBO) == MENU_COMBO || (bits & left) == left || (bits & right) == right;
+}
+// A controller's buttons as the menus read them. A single Joy-Con held sideways gets the layout by
+// position: its four buttons are A (right), B (bottom), X (top), Y (left), its stick moves the
+// cursor, SL / SR are L / R (tabs); + / - as they are.
+static u64 uiBits(PadState* p, u64 raw) {
+  const u32 st = padGetStyleSet(p);
+  if (st == HidNpadStyleTag_NpadJoyLeft) {
+    // held sideways it is turned a quarter anticlockwise: its stick's down is right, up left, left down, right up
+    u64 b = raw & ~(u64)(HidNpadButton_Up | HidNpadButton_Down | HidNpadButton_Left | HidNpadButton_Right | B_SL | B_SU | B_SR | B_SD);
+    if (raw & HidNpadButton_StickLDown) b |= B_SR;
+    if (raw & HidNpadButton_StickLUp) b |= B_SL;
+    if (raw & HidNpadButton_StickLLeft) b |= B_SD;
+    if (raw & HidNpadButton_StickLRight) b |= B_SU;
+    if (raw & HidNpadButton_Down) b |= B_A;
+    if (raw & HidNpadButton_Left) b |= B_B;
+    if (raw & HidNpadButton_Right) b |= B_X;
+    if (raw & HidNpadButton_Up) b |= B_Y;
+    if (raw & HidNpadButton_LeftSL) b |= B_L;
+    if (raw & HidNpadButton_LeftSR) b |= B_R;
+    return b;
+  }
+  if (st == HidNpadStyleTag_NpadJoyRight) {
+    u64 b = raw & ~(u64)(HidNpadButton_A | HidNpadButton_B | HidNpadButton_X | HidNpadButton_Y);
+    if (raw & HidNpadButton_X) b |= B_A;
+    if (raw & HidNpadButton_A) b |= B_B;
+    if (raw & HidNpadButton_Y) b |= B_X;
+    if (raw & HidNpadButton_B) b |= B_Y;
+    if (raw & HidNpadButton_RightSL) b |= B_L;
+    if (raw & HidNpadButton_RightSR) b |= B_R;
+    // turned a quarter clockwise: its stick's up is right, down left, left up, right down (as a left stick)
+    if (raw & HidNpadButton_StickRUp) b |= B_SR;
+    if (raw & HidNpadButton_StickRDown) b |= B_SL;
+    if (raw & HidNpadButton_StickRLeft) b |= B_SU;
+    if (raw & HidNpadButton_StickRRight) b |= B_SD;
+    return b;
+  }
+  return raw;
+}
 static u64 lastBits = 0;
 static int heldDirs = 0;
 static double repeatAt = 0;
@@ -1268,7 +1413,7 @@ static MenuItem opt(const string& l, std::function<vector<string>()> c, std::fun
   MenuItem m; m.label = l; m.choices = c; m.get = g; m.set = s; m.after = a; return m;
 }
 static bool menuHasTabs = false;  // the main in-game menu: its categories show as tabs (L / R)
-static const vector<string> MENU_CATS = {"Game", "Emulation", "Picture"};
+static const vector<string> MENU_CATS = {"Game", "Emulation", "Picture", "Controls"};
 static int menuCat = 0;  // menuIndex -1: the cursor is on the category tabs
 static void showMenuItems(const string& title, const vector<MenuItem>& items) { menuItems = items; menuTitle = title; menuIndex = 0; menuTop = 0; menuHasTabs = false; }
 static bool captureRequested = false;
@@ -1325,6 +1470,8 @@ static void applyReadbackLive() {
   const bool f = fastReadback(running->name); ps2core_option("pcsx2_hw_download_mode", f ? "Unsynchronized" : "Accurate");
   record("live: %s GPU readbacks %s", running->name.c_str(), f ? "Fast" : "Accurate");
 }
+static void openRemap(int player, bool forGame);
+static void pairControllers();
 // The main in-game menu's rows for one category (adv: with the advanced ones).
 static vector<MenuItem> menuItemsFor(int cat, bool adv) {
   vector<MenuItem> items = {
@@ -1374,6 +1521,25 @@ static vector<MenuItem> menuItemsFor(int cat, bool adv) {
           [] { pictureChanged(); refreshPicture(); }),
       act("Save screenshot", [] { closeMenu(); captureRequested = true; }),
       act("Cheats...", [] { openCheatsMenu(); }),
+      // Controls: a layout made here is this game's own
+      act("Pair controllers", [] { pairControllers(); }),
+      act("Player 1 buttons", [] { openRemap(0, true); }),
+      act("Player 2 buttons", [] { openRemap(1, true); }),
+      opt("Multitap (players 3-4)", [] { return OFF_ON; }, [] { return multitapFor(running->name) ? 1 : 0; }, [](int v) { gameMultitap[running->name] = v != 0; },
+          [] {  // plugged in or out now, as on a PS2; the menu's rows change (players 3-4)
+            saveSettings(); ps2core_option("armsx2_multitap", multitapFor(running->name) ? "enabled" : "disabled");
+            record("live: %s Multitap %s", running->name.c_str(), multitapFor(running->name) ? "on" : "off");
+            openMenu(); for (int i = 0; i < (int)menuItems.size(); i++) if (menuItems[i].label == "Multitap (players 3-4)") menuIndex = i;
+          }),
+      act("Player 3 buttons", [] { openRemap(2, true); }),
+      act("Player 4 buttons", [] { openRemap(3, true); }),
+      act("Use Settings buttons", [] { if (gamePadMaps.erase(running->name)) { saveSettings(); showToast("This game uses the Settings buttons again", 2500); openMenu(); } }),
+      act("Reset buttons to standard", [] {  // a second A within 4 s confirms
+        static double armedUntil = 0;
+        if (nowMs() > armedUntil) { armedUntil = nowMs() + 4000; showToast("Press {A} again to put every player's buttons back to standard", 4000); return; }
+        armedUntil = 0; gamePadMaps.erase(running->name); for (int pl = 0; pl < 4; pl++) resetPadMap(pl); saveSettings();
+        showToast("Every player's buttons are back to standard (single Joy-Cons: their own default)", 3500); openMenu();
+      }),
       opt("Advanced options", [] { return vector<string>{"Hidden", "Shown"}; }, [] { return showAdvanced ? 1 : 0; }, [](int v) { showAdvanced = v != 0; },
           [] {  // the menu's own rows change: rebuild it, the cursor staying on this row
             saveSettings(); rebuildSettings();
@@ -1387,8 +1553,11 @@ static vector<MenuItem> menuItemsFor(int cat, bool adv) {
     static const vector<string> EMU = {"PS2 CPU speed", "PS2 CPU cycle skip", "GPU readbacks", "Switch 2 CPU clock", "Resolution", "Widescreen", "Stats"};
     static const vector<string> PIC = {"Aspect", "Scale", "Overscan", "Signal", "Shader", "Brightness boost", "Curvature", "Corner radius", "Corner softness",
                                        "Vignette", "Vignette size", "Settings for"};
-    auto catOf = [](const string& l) { return contains(EMU, l) ? 1 : contains(PIC, l) ? 2 : 0; };
-    for (auto& m : items) if (m.label != "Run-ahead" && m.label != "Cheats..." && (adv || !contains(ADVANCED_MENU, m.label)) && catOf(m.label) == cat) kept.push_back(m);
+    static const vector<string> CTL = {"Pair controllers", "Player 1 buttons", "Player 2 buttons", "Multitap (players 3-4)", "Player 3 buttons", "Player 4 buttons", "Use Settings buttons", "Reset buttons to standard"};
+    auto catOf = [](const string& l) { return contains(EMU, l) ? 1 : contains(PIC, l) ? 2 : contains(CTL, l) ? 3 : 0; };
+    const bool ownLayout = running && gamePadMaps.count(running->name), multitap = running && multitapFor(running->name);
+    for (auto& m : items) if (m.label != "Run-ahead" && m.label != "Cheats..." && (m.label != "Use Settings buttons" || ownLayout) &&
+                             (multitap || (m.label != "Player 3 buttons" && m.label != "Player 4 buttons")) && (adv || !contains(ADVANCED_MENU, m.label)) && catOf(m.label) == cat) kept.push_back(m);
     items = kept;
   }
   return items;
@@ -1475,16 +1644,65 @@ static void openFolderPicker(bool bios = false) {
 }
 
 /* ---------------- Settings screen ---------------- */
+/* ---------------- Button remapping ---------------- */
+// One PS2 button at a time: the player presses the Switch button they want on their controller, or
+// waits REMAP_WAIT_MS to leave it unmapped; then Save / Start again / Cancel.
+static const double REMAP_WAIT_MS = 4000;
+static int remapWho = 0, remapStep = 0, remapPick = 0, remapNew[16];
+static bool remapForGame = false;  // opened from the in-game menu: saves this game's own layout, returns to the menu
+static double remapDeadline = 0;
+static bool remapWaitRelease = true;
+static void openRemap(int player, bool forGame) {
+  remapForGame = forGame && running;
+  remapWho = player; remapStep = 0; remapPick = 0; remapWaitRelease = true;
+  for (int i = 0; i < 16; i++) remapNew[i] = -1;
+  remapDeadline = nowMs() + REMAP_WAIT_MS;
+  mode = "remap";
+}
+static bool padConnected(int player) { return padStates[player] && padIsConnected(padStates[player]); }
+// Joy-Cons: together (two detached Joy-Cons are one controller) or separate (each one its own
+// controller, held sideways: the first is player 1, the next player 2). Joy-Cons attached to the
+// console stay one controller. (The system's controller screen can't be opened from hbmenu here.)
+// The Switch's own controller screen (connect / change grip and order, single Joy-Cons sideways).
+// From hbmenu the plain call is refused; the system variant opens it.
+static void pairControllers() {
+  HidLaControllerSupportArg arg; hidLaCreateControllerSupportArg(&arg);
+  arg.hdr.player_count_min = 0; arg.hdr.player_count_max = 4;  // every controller shows; PS2 ports 1-2 are players 1-2
+  HidLaControllerSupportResultInfo info{};
+  Result rc = hidLaShowControllerSupport(&info, &arg), rc2 = 0;
+  const bool triedSystem = R_FAILED(rc);
+  if (triedSystem) rc2 = hidLaShowControllerSupportForSystem(&info, &arg, false);
+  record("controllers: support applet rc 0x%x, system variant rc 0x%x, players %d", rc, rc2, (int)info.player_count);
+  char msg[160];
+  if (R_SUCCEEDED(rc) || (triedSystem && R_SUCCEEDED(rc2))) snprintf(msg, sizeof msg, "Controllers updated");
+  else snprintf(msg, sizeof msg, "The controller screen could not open (0x%x / 0x%x)", rc, rc2);
+  showToast(msg, 6000);
+}
+static bool resetMapArmed = false;
 static bool settingsByA = false;  // the row's action came from A (not left/right): for rows that do something
 struct SettingItem { string label; std::function<vector<string>()> choices; std::function<int()> get; std::function<void(int)> set; };
 static vector<SettingItem> settingsItems() {
   return {
       {"ROM folder", [] { return vector<string>{romDir.rfind("sdmc:", 0) == 0 ? romDir.substr(5) : romDir}; }, [] { return 0; }, [](int) { openFolderPicker(); }},
+      {"Debug logging", [] { return OFF_ON; }, [] { return debugLog ? 1 : 0; }, [](int v) {
+        debugLog = v != 0;
+        if (debugLog && !logFile) { openLog(false); record("SW2PS2 %s: debug logging turned on", APP_VERSION); }
+        else if (!debugLog && logFile && !autoTest) { fclose(logFile); logFile = nullptr; }
+      }},
       {"BIOS folder", [] { return vector<string>{biosDir.rfind("sdmc:", 0) == 0 ? biosDir.substr(5) : biosDir}; }, [] { return 0; }, [](int) { openFolderPicker(true); }},
       {"Resolution (next start)", [] { return RESOLUTIONS; }, [] { return ps2Resolution; }, [](int v) { ps2Resolution = v; }},
       {"Emulated CPU speed (next start)", [] { return EE_SPEEDS; }, [] { return ps2EeSpeed; }, [](int v) { ps2EeSpeed = v; }},
       {"Emulated CPU cycle skip (next start)", [] { return CYCLE_SKIPS; }, [] { return ps2CycleSkip; }, [](int v) { ps2CycleSkip = v; }},
       {"Vibration", [] { return VIB_LEVELS; }, [] { return vibLevel; }, [](int v) { vibLevel = v; }},
+      {"Pair controllers", [] { return vector<string>{"Press {A}"}; }, [] { return 0; }, [](int) { if (settingsByA) pairControllers(); }},
+      {"Player 1 buttons", [] { return vector<string>{padMapIsDefault(0) ? "Standard - {A} to remap" : "Custom - {A} to remap"}; }, [] { return 0; }, [](int) { if (settingsByA) openRemap(0, false); }},
+      {"Player 2 buttons", [] { return vector<string>{padMapIsDefault(1) ? "Standard - {A} to remap" : "Custom - {A} to remap"}; }, [] { return 0; }, [](int) { if (settingsByA) openRemap(1, false); }},
+      {"Multitap (players 3-4)", [] { return OFF_ON; }, [] { return multitapDefault ? 1 : 0; }, [](int v) { multitapDefault = v != 0; rebuildSettings(); }},
+      {"Player 3 buttons", [] { return vector<string>{padMapIsDefault(2) ? "Standard - {A} to remap" : "Custom - {A} to remap"}; }, [] { return 0; }, [](int) { if (settingsByA) openRemap(2, false); }},
+      {"Player 4 buttons", [] { return vector<string>{padMapIsDefault(3) ? "Standard - {A} to remap" : "Custom - {A} to remap"}; }, [] { return 0; }, [](int) { if (settingsByA) openRemap(3, false); }},
+      {"Reset button mapping", [] { return vector<string>{resetMapArmed ? "Press {A} again to confirm" : "Press {A}"}; }, [] { return 0; },
+       [](int) { if (!settingsByA) return; if (!resetMapArmed) { resetMapArmed = true; return; }
+                 resetMapArmed = false; for (int pl = 0; pl < 4; pl++) resetPadMap(pl); saveSettings(); showToast("All players back on the standard layout", 2500); }},
       {"Switch 2 CPU clock (next start)", [] { return CPU_CLOCKS; }, [] { return cpuClock; }, [](int v) { cpuClock = v; }},
       {"Aspect", [] { return ASPECTS; }, [] { return aspectMode; }, [](int v) { aspectMode = v; }},
       {"Scale", [] { return SCALES; }, [] { return scaleMode; }, [](int v) { scaleMode = v; }},
@@ -1528,7 +1746,7 @@ static int settingsCat = 0;  // settingsIndex -1: the cursor is on the category 
 static int settingsCatOf(const string& label) {
   static const vector<string> EMU = {"Resolution (next start)", "Emulated CPU speed (next start)", "Emulated CPU cycle skip (next start)", "Switch 2 CPU clock (next start)", "Auto-load save state"};
   static const vector<string> PIC = {"Aspect", "Scale", "Overscan", "Signal", "Shader", "Brightness boost", "Curvature", "Corner radius", "Corner softness", "Vignette", "Vignette size", "Display", "Frame delay (60 Hz)"};
-  static const vector<string> SND = {"Volume", "Audio buffer", "Vibration"};
+  static const vector<string> SND = {"Volume", "Audio buffer", "Vibration", "Pair controllers", "Player 1 buttons", "Player 2 buttons", "Multitap (players 3-4)", "Player 3 buttons", "Player 4 buttons", "Reset button mapping"};
   return contains(EMU, label) ? 0 : contains(PIC, label) ? 1 : contains(SND, label) ? 2 : 3;  // the rest: App
 }
 static vector<SettingItem> settingsFor(int cat, bool adv);
@@ -1551,9 +1769,10 @@ static vector<SettingItem> settingsFor(int cat, bool adv) {
   static const vector<string> NOT_HERE = {"Run-ahead", "Rewind (hold ZL)", "Fast-forward", "Fast-forward speed", "Turbo speed", "Button mapping for", "Audio filter",
       "Switch A button", "Switch B button", "Switch X button", "Switch Y button", "Switch L button", "Switch R button"};
   for (auto& it : settingsItems())
-    if (!contains(NOT_HERE, it.label) && (adv || !contains(ADVANCED_SETTINGS, it.label)) && settingsCatOf(it.label) == cat) items.push_back(it);
+    if (!contains(NOT_HERE, it.label) && (adv || !contains(ADVANCED_SETTINGS, it.label)) && settingsCatOf(it.label) == cat &&
+        (multitapDefault || (it.label != "Player 3 buttons" && it.label != "Player 4 buttons"))) items.push_back(it);
   if (adv && cat == 3)
-    items.push_back({"Reset all settings", [] { return vector<string>{"Press A", "Press A again to confirm"}; }, [] { return resetArmed ? 1 : 0; },
+    items.push_back({"Reset all settings", [] { return vector<string>{"Press {A}", "Press {A} again to confirm"}; }, [] { return resetArmed ? 1 : 0; },
                      [](int v) { if (resetArmed) { resetArmed = false; resetAllSettings(); gfx::setHighRefresh(displayMode == 1); rebuildSettings(); settingsIndex = 0; settingsTop = 0; showToast("All settings reset to defaults"); } else resetArmed = true; }});
   return items;
 }
@@ -1561,13 +1780,59 @@ static vector<SettingItem> settingsFor(int cat, bool adv) {
 /* ---------------- Drawing helpers ---------------- */
 static const float LH = 1.15f;  // CSS "normal" line height, approximately
 // Text vertically centred in a box.
+// Button names in text: "{A}" "{B}" "{X}" "{Y}" are drawn as the letter, or -- while a single Joy-Con
+// is connected, whose buttons have no letters that match -- as the position glyph Nintendo and Steam
+// use: four dots in a diamond, the one to press filled (A right, B bottom, X top, Y left).
+static bool singleJoyConConnected = false;  // updated each frame (main loop)
+static int glyphToken(const string& s, size_t i) {  // 0-3 for {A} {B} {X} {Y} at i, else -1
+  if (i + 2 >= s.size() || s[i] != '{' || s[i + 2] != '}') return -1;
+  const char* k = strchr("ABXY", s[i + 1]);
+  return k && s[i + 1] ? (int)(k - "ABXY") : -1;
+}
+static float glyphWidth(float size) { return size * 1.15f; }
+static void drawFaceGlyph(int which, float x, float y, float size, Color c) {  // in a size x size box
+  const float r = size * 0.17f, d = size * 0.31f, cx = x + glyphWidth(size) / 2, cy = y + size * 0.62f;
+  static const float DX[4] = {1, 0, 0, -1}, DY[4] = {0, 1, -1, 0};  // A right, B bottom, X top, Y left
+  for (int k = 0; k < 4; k++) {
+    const float px = cx + DX[k] * d - r, py = cy + DY[k] * d - r;
+    if (k == which) gfx::rect(px, py, r * 2, r * 2, c, r);
+    else gfx::rect(px, py, r * 2, r * 2, Color{0, 0, 0, 0}, r, std::max(1.0f, size * 0.07f), c);
+  }
+}
+static float glyphTextWidth(const string& s, float size, gfx::Font f = gfx::REGULAR) {
+  if (s.find('{') == string::npos) return gfx::textWidth(s, size, f);
+  float w = 0; string run;
+  for (size_t i = 0; i < s.size(); i++) {
+    const int g = glyphToken(s, i);
+    if (g < 0) { run += s[i]; continue; }
+    w += gfx::textWidth(run, size, f); run.clear();
+    w += singleJoyConConnected ? glyphWidth(size) : gfx::textWidth(string(1, "ABXY"[g]), size, f);
+    i += 2;
+  }
+  return w + gfx::textWidth(run, size, f);
+}
+static float glyphText(const string& s, float x, float y, float size, Color c, gfx::Font f = gfx::REGULAR) {
+  if (s.find('{') == string::npos) return gfx::text(s, x, y, size, c, f);
+  float x0 = x; string run;
+  auto flush = [&]() { if (!run.empty()) { gfx::text(run, x, y, size, c, f); x += gfx::textWidth(run, size, f); run.clear(); } };
+  for (size_t i = 0; i < s.size(); i++) {
+    const int g = glyphToken(s, i);
+    if (g < 0) { run += s[i]; continue; }
+    flush();
+    if (singleJoyConConnected) { drawFaceGlyph(g, x, y, size, c); x += glyphWidth(size); }
+    else { const string l(1, "ABXY"[g]); gfx::text(l, x, y, size, c, f); x += gfx::textWidth(l, size, f); }
+    i += 2;
+  }
+  flush();
+  return x - x0;
+}
 static float textMid(const string& s, float x, float y, float h, float size, Color c, gfx::Font f = gfx::REGULAR) {
-  return gfx::text(s, x, y + (h - size * 1.25f) / 2, size, c, f);
+  return glyphText(s, x, y + (h - size * 1.25f) / 2, size, c, f);
 }
 // "< value >" selector, right-aligned at xr; returns its width.
 static float valueBox(const string& t, float xr, float y, float h, float size, bool active) {
   Color c = col(active ? C_TEXT : C_DIM);
-  float wl = gfx::textWidth("<", size, gfx::BOLD), wt = gfx::textWidth(t, size), wr = gfx::textWidth(">", size, gfx::BOLD);
+  float wl = gfx::textWidth("<", size, gfx::BOLD), wt = glyphTextWidth(t, size), wr = gfx::textWidth(">", size, gfx::BOLD);
   float total = wl + 10 + wt + 10 + wr, x = xr - total;
   textMid("<", x, y, h, size, c, gfx::BOLD);
   textMid(t, x + wl + 10, y, h, size, c);
@@ -1611,7 +1876,7 @@ static void scrollbar(float x, float y, float h, int total, int vis, int topInde
 
 /* ---------------- Screens ---------------- */
 static const vector<string> BROWSER_BUTTONS = {"Settings", "Refresh", "Exit"};
-static const char* BROWSER_KEYS[] = {"Y", "X", "B"};  // gamepad shortcut for each button
+static const int BROWSER_KEYS[] = {3, 2, 1};  // gamepad shortcut for each button: Y, X, B (glyph index)
 static const int ROW_H = 40;
 static const float LIST_HEAD = 26;  // column headings above the game list
 // A row of tabs with small L / R shoulder-button caps either side: L and R cycle them.
@@ -1712,8 +1977,8 @@ static void drawBrowser() {
     gfx::rect(bx, cy, bw, 40, col(on ? C_SEL : C_BG), 8, 1, col(on ? C_ACCENT : C_LINE));
     float tw = gfx::textWidth(label, 18), kw = 24, lx = bx + (bw - tw - kw - 8) / 2;
     gfx::rect(lx, cy + 8, kw, kw, col(C_LINE), kw / 2);  // shortcut button badge
-    float kt = gfx::textWidth(BROWSER_KEYS[i], 15);
-    textMid(BROWSER_KEYS[i], lx + (kw - kt) / 2, cy + 8, kw, 15, col(C_TEXT));
+    if (singleJoyConConnected) drawFaceGlyph(BROWSER_KEYS[i], lx + (kw - glyphWidth(17)) / 2, cy + 8 + (kw - 17 * 1.25f) / 2, 17, col(C_TEXT));
+    else { const string k(1, "ABXY"[BROWSER_KEYS[i]]); float kt = gfx::textWidth(k, 15); textMid(k, lx + (kw - kt) / 2, cy + 8, kw, 15, col(C_TEXT)); }
     textMid(label, lx + kw + 8, cy, 40, 18, col(i == 2 && exitArmed ? C_ACCENT : C_TEXT));
   }
   gfx::text("v" APP_VERSION, x + winW - padX - gfx::textWidth("v" APP_VERSION, 14), y + padY + 10, 14, col(C_DIM));
@@ -1732,7 +1997,7 @@ static void drawFolderPicker() {
   float x = (gfx::UI_W - winW) / 2, y = roundf((gfx::UI_H - winH) / 2);
   gfx::rect(x, y, winW, winH, col(C_PANEL), 14, 1, col(C_LINE));
   float cx = x + padX, cy = y + padY;
-  panelHeader(cx, cy, pickForBios ? "BIOS folder" : "ROM folder", "A: open   B: cancel");
+  panelHeader(cx, cy, pickForBios ? "BIOS folder" : "ROM folder", "{A}: open   {B}: cancel");
   cy += 34 + 12;
   string shown = pickPath.rfind("sdmc:", 0) == 0 ? pickPath.substr(5) : pickPath;
   if (shown.empty()) shown = "/";
@@ -1754,6 +2019,45 @@ static void drawFolderPicker() {
     textMid(gfx::ellipsize(label, rw - 32, 18), rx + 16, ry, rowH, 18, c, i == 0 ? gfx::BOLD : gfx::REGULAR);
   }
   scrollbar(cx + listW + 8, cy, listH, total, vis, pickTop);
+}
+static void drawRemap() {
+  const float winW = 640, padX = 20, padY = 18, innerW = winW - 2 * padX, rowH = 34;
+  const bool done = remapStep >= 16, connected = padConnected(remapWho);
+  const float listH = 16 * rowH + 12;
+  const float winH = padY * 2 + 34 + 12 + 30 + listH + 12 + 40;
+  const float x = (gfx::UI_W - winW) / 2, y = roundf((gfx::UI_H - winH) / 2);
+  gfx::rect(x, y, winW, winH, col(C_PANEL), 14, 1, col(C_LINE));
+  float cx = x + padX, cy = y + padY;
+  panelHeader(cx, cy, "Player " + std::to_string(remapWho + 1) + " buttons", remapForGame ? "for this game" : "for all games");
+  cy += 34 + 12;
+  string hint;
+  if (!connected) hint = "No controller for player " + std::to_string(remapWho + 1) + " (connect one with Pair controllers). {B}: back";
+  else if (!done && remapWaitRelease) hint = "Let go of all buttons...";
+  else if (!done) hint = "Press the button for " + string(PS2_BUTTONS[remapStep].name) + ", or wait " +
+                         std::to_string(std::max(1, (int)ceil((remapDeadline - nowMs()) / 1000))) + " s to leave it unmapped";
+  else hint = "Save this layout?";
+  textMid(gfx::ellipsize(hint, innerW, 18), cx, cy, 26, 18, col(C_TEXT));
+  cy += 30;
+  gfx::rect(cx, cy, innerW, listH, col(C_BG), 10, 1, col(C_LINE));
+  for (int i = 0; i < 16; i++) {
+    const float rx = cx + 6, ry = cy + 6 + i * rowH, rw = innerW - 12;
+    const bool current = connected && !done && i == remapStep;
+    if (current) { gfx::rect(rx, ry, rw, rowH, col(C_SEL), 6); gfx::rect(rx, ry, 4, rowH, col(C_ACCENT), 2); }
+    textMid(PS2_BUTTONS[i].name, rx + 16, ry, rowH, 18, col(C_TEXT));
+    const u32 style = connected ? padGetStyleSet(padStates[remapWho]) : 0;
+    string v = i < remapStep ? (remapNew[i] >= 0 ? inputName(remapNew[i], style) : "Not mapped") : current ? "..." : "";
+    if (!v.empty()) { float w = gfx::textWidth(v, 18); textMid(v, rx + rw - 12 - w, ry, rowH, 18, col(i < remapStep && remapNew[i] < 0 ? C_DIM : C_TEXT)); }
+  }
+  cy += listH + 12;
+  static const char* OPTS[3] = {"Save", "Start again", "Cancel"};
+  const float bw = (innerW - 20) / 3;
+  for (int i = 0; i < 3; i++) {
+    const bool on = done && i == remapPick;
+    const float bx = cx + i * (bw + 10);
+    gfx::rect(bx, cy, bw, 40, col(on ? C_SEL : C_BG), 8, 1, col(on ? C_ACCENT : C_LINE));
+    const float tw = gfx::textWidth(OPTS[i], 18);
+    textMid(OPTS[i], bx + (bw - tw) / 2, cy, 40, 18, col(done ? C_TEXT : C_DIM));
+  }
 }
 static void drawSettings() {
   const float winW = 640, padX = 20, padY = 18, innerW = winW - 2 * padX;
@@ -1808,8 +2112,9 @@ static void drawGame(bool dim) {
     textMid(t, (gfx::UI_W - w) / 2, gfx::UI_H - 16 - h, h, 18, gfx::rgb(0xffd479));
   }
   if (hintUntil && !dim) {
-    float w = gfx::textWidth("L + R + L3 + R3: Menu", 16);
-    gfx::text("L + R + L3 + R3: Menu", gfx::UI_W - 16 - w, gfx::UI_H - 12 - 20, 16, gfx::rgb(0x8891a4));
+    const char* hint = singleJoyConConnected ? "SL + SR + stick press (or L + R + L3 + R3): Menu" : "L + R + L3 + R3: Menu";
+    float w = gfx::textWidth(hint, 16);
+    gfx::text(hint, gfx::UI_W - 16 - w, gfx::UI_H - 12 - 20, 16, gfx::rgb(0x8891a4));
   }
 }
 
@@ -1880,12 +2185,12 @@ static void drawMessage() {
   gfx::rect(x, y, w, h, col(C_PANEL), 14, 1, col(C_LINE));
   float cy = y + 30;
   for (auto& l : lines) { textMid(l, x + 30, cy, lh, 22, col(C_TEXT)); cy += lh; }
-  gfx::text("Press A or B to continue", x + 30, cy + 18 - 2, 18, col(C_DIM));
+  glyphText("Press {A} or {B} to continue", x + 30, cy + 18 - 2, 18, col(C_DIM));
 }
 
 static void drawToast() {
   if (!toastUntil) return;
-  float w = gfx::textWidth(toastText, 20) + 36, h = 20 * LH + 20;
+  float w = glyphTextWidth(toastText, 20) + 36, h = 20 * LH + 20;
   float x = roundf((gfx::UI_W - w) / 2), y = gfx::UI_H - 28 - h;
   gfx::rect(x, y, w, h, gfx::rgb(0x0a0c12, 0.85f), 8);
   textMid(toastText, x + 18, y, h, 20, col(C_TEXT));
@@ -1918,16 +2223,17 @@ static bool emulateShown(int p, int p2, int ahead, bool keepAudio) {
   return ok;
 }
 
+static bool otherPlayersMenuCombo = false;  // players 3-4 (not PS2 ports) holding the menu combo
 static void runFrame(u64 bits, u64 bits2, bool behindMenu) {
   double t0 = nowMs();
   if (!behindMenu) {
-    bool combo = (bits & MENU_COMBO) == MENU_COMBO;
+    bool combo = menuCombo(bits) || menuCombo(bits2) || otherPlayersMenuCombo;  // any player opens the menu
     if (combo && !comboLatch) { comboLatch = true; lastBits = bits; menuCat = 0; openMenu(); return; }  // (opens on Game)
     if (!combo) comboLatch = false;
   }
   // Fast-forward (ZR hold or toggle) and rewind (hold ZL); both together open
   // the menu, so each acts only while the other is not held.
-  bool both = (bits & MENU_COMBO) == MENU_COMBO;
+  bool both = menuCombo(bits);
   bool zr = false, zl = false;  // ZL/ZR are the PS2's L2/R2: no fast-forward or rewind here
   (void)both;
   if (ffMode == 2 && zr && !ffPrevHeld) ffLatched = !ffLatched;
@@ -1982,6 +2288,15 @@ static void runFrame(u64 bits, u64 bits2, bool behindMenu) {
   for (int i = 0; i < due; i++) {
     turbo++;
     setPs2Pad(0, bits, behindMenu); setPs2Pad(1, bits2, behindMenu);
+    setPs2Pad(2, padStates[2] ? padGetButtons(padStates[2]) : 0, behindMenu); setPs2Pad(3, padStates[3] ? padGetButtons(padStates[3]) : 0, behindMenu);  // (the core reads them with the Multitap)
+    if (verboseLog()) {  // debug: each player's PS2 buttons as sent, once a second while any is pressed
+      static double inputLogAt = 0;
+      const double tn = nowMs();
+      if (tn >= inputLogAt && (ps2Input[0].buttons | ps2Input[1].buttons | ps2Input[2].buttons | ps2Input[3].buttons)) {
+        inputLogAt = tn + 1000;
+        record("input: p1 %04x p2 %04x p3 %04x p4 %04x (sticks p2 %d,%d)", ps2Input[0].buttons, ps2Input[1].buttons, ps2Input[2].buttons, ps2Input[3].buttons, ps2Input[1].lx, ps2Input[1].ly);
+      }
+    }
     bool last = i == due - 1;
     bool ok;
     if (last) ok = emulateShown(p, p2, fastForward ? 0 : runAhead, !fastForward);
@@ -2040,7 +2355,7 @@ extern "C" int sw2_thread_total(void);
 extern "C" unsigned long long sw2_gs_stats[16];
 // The ARMSX2 core's own counters (native/armsx2_compat.cpp).
 extern "C" __attribute__((weak)) float sw2ax_fps();
-extern "C" __attribute__((weak)) void sw2ax_register_exit_cleanup();
+extern "C" __attribute__((weak)) void sw2ax_register_exit_cleanup(int traces);
 extern "C" __attribute__((weak)) void sw2ax_crash_watch(int);
 extern "C" __attribute__((weak)) void sw2ax_iop_stats(char*, size_t);
 extern "C" __attribute__((weak)) void sw2ax_event_stats(unsigned long long*);
@@ -2091,11 +2406,11 @@ static void logThreads() {
     static unsigned long long ps, pr, pd; unsigned long long cs, cr, cd; sw2ax_frame_counts(&cs, &cr, &cd);
     snprintf(b, sizeof b, " frames new:%llu repeat:%llu dropped:%llu", cs - ps, cr - pr, cd - pd); line += b; ps = cs; pr = cr; pd = cd;
   }
-  if (sessionLog < 120) record("  %s", line.c_str());
+  if (verboseLog() && sessionLog < 120) record("  %s", line.c_str());  // (thread detail: test runs only)
   {  // The core's wait timers (pcsx2/MTGS.c), in ms per second of wall time.
     static unsigned long long gp[16];
     auto ms = [&](int i) { return armTicksToNs(sw2_gs_stats[i] - gp[i]) / 1e6; };
-    if (sessionLog < 120) record("  waits per second: EE on GS %.0f ms (%llu times), EE at frame gate %.0f ms, GS idle %.0f ms, GS on VU1 %.0f ms, GL buffer fences %.0f ms, GL texture/finish %.0f ms, event tests %llu", ms(0), sw2_gs_stats[1] - gp[1], ms(4), ms(2), ms(3), ms(5), ms(6), sw2_gs_stats[9] - gp[9]);
+    if (verboseLog() && sessionLog < 120) record("  waits per second: EE on GS %.0f ms (%llu times), EE at frame gate %.0f ms, GS idle %.0f ms, GS on VU1 %.0f ms, GL buffer fences %.0f ms, GL texture/finish %.0f ms, event tests %llu", ms(0), sw2_gs_stats[1] - gp[1], ms(4), ms(2), ms(3), ms(5), ms(6), sw2_gs_stats[9] - gp[9]);
     memcpy(gp, sw2_gs_stats, sizeof gp);
   }
 }
@@ -2154,8 +2469,14 @@ static void updateStats(double t) {
     if (autoTest && !autoPlayerStats) snprintf(buf, sizeof buf, "Game %.0f fps   Emu %.1f fps   Video avg %.1f fps   1%% low %.1f fps   CPU %s   GPU %s   %s", gameFps, emuFps, avg, low, cpuS, gpuS, dispLabel().c_str());
     else snprintf(buf, sizeof buf, "Game %.0f fps   CPU %s   GPU %s   %s", gameFps, cpuS, gpuS, dispLabel().c_str());
   }
-  if (sessionLog < 120) { sessionLog++; record("t%d %s | wait %.2f block %.2f emu %.2f draw %.2f swap %.2f ms, audio q %.0f ms ratio %.4f in %.0f/s", sessionLog, buf,
+  // The log: test runs get every second in detail (tests/ read it); players a short line every
+  // 10 s for a game's first 2 minutes, enough for a bug report.
+  if (verboseLog() && sessionLog < 120) { sessionLog++; record("t%d %s | wait %.2f block %.2f emu %.2f draw %.2f swap %.2f ms, audio q %.0f ms ratio %.4f in %.0f/s", sessionLog, buf,
                                                phase[0] / phaseN, phase[1] / phaseN, phase[2] / phaseN, phase[3] / phaseN, phase[4] / phaseN, pendEma / 48.0, audioRatio, audioInCount / secs); audioInCount = 0; }
+  else if (!verboseLog() && sessionLog < 120) {
+    if (++sessionLog % 10 == 0) record("t%d game %.0f fps, emu %.1f fps (%.0f%%), audio %.0f ms", sessionLog, gameFps, emuFps, sw2ax_speed ? sw2ax_speed() : 0.0, pendEma / 48.0);
+    audioInCount = 0;
+  }
   for (double& x : phase) x = 0; phaseN = 0;
   swapAcc = waitAcc = swapMax = 0; swapN = 0;
   statsText = buf;
@@ -2468,7 +2789,7 @@ static bool autoStartRun() {
  * low band, the small one its high band. Devices are set up again when the controller changes. */
 extern "C" void ps2_rumble(int port, uint16_t* strong, uint16_t* weak);
 struct Vib { HidVibrationDeviceHandle h[2]; int n = 0; u32 key = 0; uint16_t s = 0, w = 0; };
-static Vib vibs[2];
+static Vib vibs[4];
 // Player 1 reads controller 1 and the attached Joy-Cons together, so rumble follows whichever of the
 // two was used last (buttons or a stick off centre), not just whether the Joy-Cons are attached.
 static PadState vibNo1, vibHandheld;
@@ -2512,7 +2833,8 @@ static void vibSend(int port, PadState* p, uint16_t strong, uint16_t weak) {
 }
 static void updateVibration(bool active) {
   vibTrackPlayer1();
-  for (int port = 0; port < 2; port++) {
+  for (int port = 0; port < 4; port++) {
+    if (!padStates[port]) continue;
     uint16_t s = 0, w = 0;
     if (active && vibLevel != 0 && !autoTest) ps2_rumble(port, &s, &w);  // never during test runs
     vibSend(port, padStates[port], s, w);
@@ -2579,13 +2901,43 @@ static void handleUi(u64 bits) {
       } else if (up && pickSel == 1) pickLoad(parentDir(pickPath));
       else pickLoad((pickAtRoot() ? string("sdmc:") : pickPath) + "/" + pickDirs[pickSel - 1 - up]);
     } else if (pressed & B_B) mode = "settings";
+  } else if (mode == "remap") {
+    if (remapStep < 16) {  // listening to the player's own controller
+      if (!padConnected(remapWho)) { if (pressed & B_B) mode = remapForGame ? "menu" : "settings"; return; }
+      const u64 held = padGetButtons(padStates[remapWho]) & MAPPABLE;
+      if (remapWaitRelease) { if (!held) { remapWaitRelease = false; remapDeadline = t + REMAP_WAIT_MS; } return; }
+      if (held) {  // this button now presses this PS2 button (and no other)
+        const int b = __builtin_ctzll(held);
+        for (int i = 0; i < 16; i++) if (remapNew[i] == b) remapNew[i] = -1;
+        remapNew[remapStep++] = b; remapWaitRelease = true;
+      } else if (t >= remapDeadline) { remapNew[remapStep++] = -1; remapDeadline = t + REMAP_WAIT_MS; }  // skipped: unmapped
+      return;
+    }
+    if (ev.up) remapPick = (remapPick + 2) % 3;
+    if (ev.down) remapPick = (remapPick + 1) % 3;
+    if (pressed & (B_LEFT)) remapPick = std::max(0, remapPick - 1);
+    if (pressed & (B_RIGHT)) remapPick = std::min(2, remapPick + 1);
+    if (pressed & B_A) {
+      if (remapPick == 0) {
+        if (remapForGame) {  // this game's own layout (the other player's starts as the Settings one)
+          auto it = gamePadMaps.find(running->name);
+          if (it == gamePadMaps.end()) { GamePadMap gm; memcpy(gm.m, padMap, sizeof gm.m); it = gamePadMaps.emplace(running->name, gm).first; }
+          memcpy(it->second.m[remapWho], remapNew, sizeof remapNew);
+        } else memcpy(padMap[remapWho], remapNew, sizeof remapNew);
+        saveSettings();
+        showToast("Player " + std::to_string(remapWho + 1) + (remapForGame ? " buttons saved for this game" : " buttons saved"), 2500);
+        mode = remapForGame ? "menu" : "settings";
+      }
+      else if (remapPick == 1) openRemap(remapWho, remapForGame);
+      else mode = remapForGame ? "menu" : "settings";
+    } else if (pressed & B_B) mode = remapForGame ? "menu" : "settings";
   } else if (mode == "settings") {
     {  // L / R (or ZL / ZR): the next / previous category
       int step = ((pressed & (B_R | HidNpadButton_ZR)) ? 1 : 0) - ((pressed & (B_L | HidNpadButton_ZL)) ? 1 : 0);
       if (step) { int n = (int)SETTINGS_CATS.size(); settingsCat = (settingsCat + step + n) % n; resetArmed = false; rebuildSettings(); if (settingsIndex >= 0) settingsIndex = 0; settingsTop = 0; return; }
     }
     int nItems = (int)SETTINGS_ITEMS.size();
-    if (ev.up || ev.down || (pressed & B_B)) resetArmed = false;
+    if (ev.up || ev.down || (pressed & B_B)) { resetArmed = false; resetMapArmed = false; }
     if (settingsIndex < 0) {  // on the category tabs, as the game list's: left / right switch straight away, down to the list
       int last = (int)SETTINGS_CATS.size() - 1;
       int v = (pressed & B_LEFT) ? std::max(0, settingsCat - 1) : (pressed & B_RIGHT) ? std::min(last, settingsCat + 1) : settingsCat;
@@ -2605,7 +2957,7 @@ static void handleUi(u64 bits) {
     } else if (pressed & B_A) { saveSettings(); mode = "browser"; return; }
     if (pressed & B_B) { saveSettings(); mode = "browser"; }
   } else if (mode == "menu") {
-    bool lr = (bits & MENU_COMBO) == MENU_COMBO;
+    bool lr = menuCombo(bits);
     if (lr && !comboLatch) { comboLatch = true; closeMenu(); return; }
     if (!lr) comboLatch = false;
     {  // L / R: the next / previous category -- on release, and only for a lone tap, so starting
@@ -2655,20 +3007,21 @@ int main(int argc, char** argv) {
   // game and BIOS folders (default /roms/ps2 and /bios/ps2) are the player's to make.
   bool firstLaunch = !exists(SETTINGS());
   if (firstLaunch) saveSettings();  // (sdmc:/roms/ps2 is the default game folder but is not created: people make their own)
-  {  // a test run restarting the app between games keeps appending to the same log
-    const string marker = string(DATA_DIR) + "/autotest.append";
-    const bool append = exists(marker);
-    if (append) remove(marker.c_str());
-    else {  // the previous session's log is kept as log.prev.txt (a test's results survive a relaunch)
-      remove((string(DATA_DIR) + "/log.prev.txt").c_str());
-      rename((string(DATA_DIR) + "/log.txt").c_str(), (string(DATA_DIR) + "/log.prev.txt").c_str());
-    }
-    logFile = fopen((string(DATA_DIR) + "/log.txt").c_str(), append ? "a" : "w");
+  // Logging only for test runs and with Settings -> App -> Debug logging on (read here, before the
+  // settings load further down); normal play writes no log files.
+  const string appendMarker = string(DATA_DIR) + "/autotest.append";
+  bool wantLog = exists(string(DATA_DIR) + "/autotest.json") || exists(appendMarker);
+  { string t; Json v; if (!wantLog && readText(SETTINGS(), t) && Json::parse(t, v) && v.type == Json::OBJ) if (const Json* d = v.get("debugLog")) wantLog = d->isBool() && d->b; }
+  if (wantLog) {  // a test run restarting the app between games keeps appending to the same log, and so
+                  // does a game started in a fresh process (launch.json): its session joins the launch that chose it
+    const bool append = exists(appendMarker) || exists(string(DATA_DIR) + "/launch.json");
+    if (exists(appendMarker)) remove(appendMarker.c_str());
+    openLog(append);
   }
   record("SW2PS2 %s", APP_VERSION);
 
   string error;
-  if (sw2ax_register_exit_cleanup) sw2ax_register_exit_cleanup();  // before the core mask change below
+  if (sw2ax_register_exit_cleanup) sw2ax_register_exit_cleanup(wantLog ? 1 : 0);  // before the core mask change below
   {
     u64 coreMask = 0; svcGetInfo(&coreMask, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0);
 #ifdef SW2_ARMSX2
@@ -2689,13 +3042,21 @@ int main(int argc, char** argv) {
   if (!sound) record("audio: %s", audioError.c_str());
 
   record("startup: pads, core setup");
-  padConfigureInput(2, HidNpadStyleSet_NpadStandard);
+  padConfigureInput(4, HidNpadStyleSet_NpadStandard);  // players 3-4 drive the menus; the PS2 has ports 1-2
   PadState pad1, pad2;
   padInitialize(&pad1, HidNpadIdType_No1, HidNpadIdType_Handheld);
   padInitialize(&pad2, HidNpadIdType_No2);
+  PadState pad3, pad4; padInitialize(&pad3, HidNpadIdType_No3); padInitialize(&pad4, HidNpadIdType_No4);
+  padStates[2] = &pad3; padStates[3] = &pad4;
   padStates[0] = &pad1; padStates[1] = &pad2;
+  // (players 3-4 are set up just below)
 
-  ps2core_setup(DATA_DIR, [](const char* line) { if (coreLogLines < 6000) { coreLogLines++; record("[core] %s", line); } });
+  // The core's own output, per game: without the shortcut-binding noise (keyboard bindings that do not
+  // exist here, ~50 lines each time settings apply); 6000 lines in test runs, 1500 otherwise.
+  ps2core_setup(DATA_DIR, [](const char* line) {
+    if (!strncmp(line, "Invalid binding", 15)) return;
+    if (coreLogLines < (verboseLog() ? 6000 : 1500)) { coreLogLines++; record("[core] %s", line); }
+  });
 
   record("startup: picture, shaders");
   W = 640; H = 448;
@@ -2893,7 +3254,7 @@ int main(int argc, char** argv) {
     loopGapMs = loopStartPrev ? tb - loopStartPrev : 16.69;  // time since the previous refresh
     loopStartPrev = tb;
     { static int glGen = 0; if (gfx::generation() != glGen) { glGen = gfx::generation(); crtKey.clear(); applyCrt(); resetGraph(); } }  // GL was built again
-    bool gameView = running && (mode == "running" || mode == "menu" || mode == "ggedit");
+    bool gameView = running && (mode == "running" || mode == "menu" || mode == "ggedit" || mode == "remap");
     gfx::beginFrame(gameView ? gfx::Color{0, 0, 0, 1} : col(C_BG));
     double tc = nowMs();
     // 120 Hz / VRR: present once per SNES frame (60.0988 Hz, the same rate as the NES) on a clock, so a
@@ -2909,26 +3270,32 @@ int main(int argc, char** argv) {
       double until = tc + FRAME_DELAY_MS[frameDelay];
       while (nowMs() < until) svcSleepThread(200000);
     }
-    padUpdate(&pad1); padUpdate(&pad2);
-    u64 bits = padGetButtons(&pad1), bits2 = padGetButtons(&pad2);
+    padUpdate(&pad1); padUpdate(&pad2); padUpdate(&pad3); padUpdate(&pad4);
+    singleJoyConConnected = false;
+    for (PadState* p : {&pad1, &pad2, &pad3, &pad4})
+      if (padIsConnected(p)) { const u32 st = padGetStyleSet(p); if (st == HidNpadStyleTag_NpadJoyLeft || st == HidNpadStyleTag_NpadJoyRight) singleJoyConConnected = true; }
+    u64 bits = padGetButtons(&pad1), bits2 = padGetButtons(&pad2), bits3 = padGetButtons(&pad3), bits4 = padGetButtons(&pad4);
     if (autoTest && running) bits |= autoPressBits();
     frameDrawn = false;
     const bool wasRunning = mode == "running";
+    otherPlayersMenuCombo = menuCombo(bits3) || menuCombo(bits4);  // players 3-4 can open the menu too
     if (wasRunning) runFrame(bits, bits2, false);
     updateVibration(mode == "running" && running);
     if (!wasRunning) {
       if (mode == "menu" && running && !pauseInMenu) runFrame(0, 0, true);
-      handleUi(bits);
+      handleUi(uiBits(&pad1, bits) | uiBits(&pad2, bits2) | uiBits(&pad3, bits3) | uiBits(&pad4, bits4));  // every player's controller drives the menus
     }
     double t = nowMs();
     if (toastUntil && t > toastUntil) toastUntil = 0;
     if (hintUntil && t > hintUntil) hintUntil = 0;
-    if (gameView != (running && (mode == "running" || mode == "menu" || mode == "ggedit"))) gfx::beginFrame(running ? gfx::Color{0, 0, 0, 1} : col(C_BG));
-    if (running && (mode == "running" || mode == "menu" || mode == "ggedit")) {
+    if (gameView != (running && (mode == "running" || mode == "menu" || mode == "ggedit" || mode == "remap"))) gfx::beginFrame(running ? gfx::Color{0, 0, 0, 1} : col(C_BG));
+    if (running && (mode == "running" || mode == "menu" || mode == "ggedit" || mode == "remap")) {
       drawGame(mode != "running");
       if (mode == "menu") drawMenu();
+      if (mode == "remap") { if (dimInMenu) gfx::rect(0, 0, gfx::UI_W, gfx::UI_H, gfx::Color{0, 0, 0, 0.6f}); drawRemap(); }
       if (mode == "ggedit") drawCodeEditor();
     } else if (mode == "settings") drawSettings();
+    else if (mode == "remap") drawRemap();
     else if (mode == "folders") drawFolderPicker();
     else drawBrowser();
     if (mode == "message") drawMessage();

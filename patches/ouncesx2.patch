@@ -102,7 +102,7 @@ index 78610d1f15..9fd64aead8 100644
  	MonitoredWait(word, expected);
  	// Charge unmeasurably short waits as one tick, not zero: the caller
 diff --git a/pcsx2-libretro/Main.cpp b/pcsx2-libretro/Main.cpp
-index 24210fb067..66172dc9fb 100644
+index 24210fb067..a8194e0c90 100644
 --- a/pcsx2-libretro/Main.cpp
 +++ b/pcsx2-libretro/Main.cpp
 @@ -80,6 +80,12 @@
@@ -118,7 +118,7 @@ index 24210fb067..66172dc9fb 100644
  #include "pcsx2/INISettingsInterface.h"
  #include "pcsx2/ImGui/FullscreenUI.h"
  #include "pcsx2/ImGui/ImGuiFullscreen.h"
-@@ -242,6 +248,30 @@ bool LibretroCore::InitializeConfig()
+@@ -242,6 +248,33 @@ bool LibretroCore::InitializeConfig()
  		// Audio goes out through retro_run pulling the stream ring; the Null
  		// backend keeps SPU2 mixing into the ring with no device thread.
  		s_base_settings->SetStringValue("SPU2/Output", "Backend", "Null");
@@ -126,6 +126,9 @@ index 24210fb067..66172dc9fb 100644
 +		s_base_settings->SetStringValue("SPU2/Output", "SyncMode", ::sw2_audio_stretch ? "TimeStretch" : "Disabled");  // SW2PS2 setting
 +		s_base_settings->SetBoolValue("EmuCore/CPU/Recompiler", "EnableVUAot", ::sw2_vuaot != 0);  // SW2PS2 test switch
 +		if (::sw2_bios_dir[0]) s_base_settings->SetStringValue("Folders", "Bios", ::sw2_bios_dir);  // SW2PS2: the BIOS folder the player chose
++		s_base_settings->SetStringValue("Pad2", "Type", "DualShock2");  // SW2PS2: a pad in port 2 too (PCSX2 leaves it empty; two-player modes need it)
++		for (const char* mt : {"Pad3", "Pad4", "Pad5"})  // the Multitap's slots B-D on port 1 (only connected while it is plugged in)
++			s_base_settings->SetStringValue(mt, "Type", "DualShock2");
 +		s_base_settings->SetBoolValue("EmuCore/GS", "HWAA1", false);  // SW2PS2: AA1 edge emulation cost SotC/FFX ~25% (2026-11-19); kept off
 +#endif
 +#ifdef __SWITCH__
@@ -149,7 +152,24 @@ index 24210fb067..66172dc9fb 100644
  	}
  
  	Error save_error;
-@@ -762,7 +792,9 @@ void LibretroCore::CPUThreadMain(VMBootParameters initial_params)
+@@ -392,8 +425,14 @@ void Host::SetPadVibration(u32 pad_index, float large_or_single_motor_intensity,
+ 
+ 	// STRONG is the large (low-frequency) motor, WEAK the small one - the same
+ 	// order this function takes them in.
+-	rumble_cb(pad_index, RETRO_RUMBLE_STRONG, to_strength(large_or_single_motor_intensity));
+-	rumble_cb(pad_index, RETRO_RUMBLE_WEAK, to_strength(small_motor_intensity));
++	// SW2PS2: per player, not per emulated slot (with the Multitap, players 1-4 are slots 0, 2, 3, 4)
++	u32 player = pad_index;
++	if (EmuConfig.Pad.MultitapPort0_Enabled)
++		player = pad_index == 0 ? 0 : (pad_index >= 2 && pad_index <= 4) ? pad_index - 1 : 99;
++	if (player > 3)
++		return;
++	rumble_cb(player, RETRO_RUMBLE_STRONG, to_strength(large_or_single_motor_intensity));
++	rumble_cb(player, RETRO_RUMBLE_WEAK, to_strength(small_motor_intensity));
+ }
+ 
+ std::optional<WindowInfo> Host::AcquireRenderWindow(bool recreate_window)
+@@ -762,7 +801,9 @@ void LibretroCore::CPUThreadMain(VMBootParameters initial_params)
  		}
  	}
  
@@ -160,7 +180,18 @@ index 24210fb067..66172dc9fb 100644
  		VMManager::Shutdown(false);
  	if (MTGS::IsOpen())
  	{
-@@ -1330,7 +1362,8 @@ static void ApplyCoreOptions(bool startup)
+@@ -1180,6 +1221,10 @@ static void ApplyCoreOptions(bool startup)
+ 		if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+ 			s_base_settings->SetBoolValue("EmuCore", "EnableFastBoot", !std::strcmp(var.value, "enabled"));
+ 
++		var = {"armsx2_multitap", nullptr};  // SW2PS2: a Multitap in port 1 (players 1-4 in its slots A-D)
++		if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
++			s_base_settings->SetBoolValue("Pad", "MultitapPort1", !std::strcmp(var.value, "enabled"));
++
+ 		var = {"armsx2_widescreen_patches", nullptr};
+ 		if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+ 			s_base_settings->SetBoolValue("EmuCore", "EnableWideScreenPatches", !std::strcmp(var.value, "enabled"));
+@@ -1330,7 +1375,8 @@ static void ApplyCoreOptions(bool startup)
  				{"Accurate", GSHardwareDownloadMode::Enabled},
  				{"Disable Readbacks", GSHardwareDownloadMode::NoReadbacks},
  				{"Unsynchronized", GSHardwareDownloadMode::Unsynchronized},
@@ -170,7 +201,7 @@ index 24210fb067..66172dc9fb 100644
  			for (const auto& [name, value] : kModes)
  			{
  				if (!std::strcmp(var.value, name))
-@@ -1880,6 +1913,9 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game)
+@@ -1880,6 +1926,9 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game)
  
  	LibretroCore::s_hw_render_gl = false;
  	LibretroCore::s_hw_render_vulkan = false;
@@ -180,7 +211,7 @@ index 24210fb067..66172dc9fb 100644
  
  #ifdef ENABLE_OPENGL
  	const auto request_gl = [&]() -> bool {
-@@ -2101,13 +2137,18 @@ RETRO_API void retro_unload_game(void)
+@@ -2101,13 +2150,18 @@ RETRO_API void retro_unload_game(void)
  #ifdef ENABLE_OPENGL
  	GLLibretro::AbortPacing(); // same, for the GL handoff
  #endif
@@ -199,7 +230,7 @@ index 24210fb067..66172dc9fb 100644
  	s_base_settings.reset();
  	s_secrets_settings.reset();
  	LibretroCore::s_content_path.clear();
-@@ -2119,9 +2160,11 @@ RETRO_API void retro_unload_game(void)
+@@ -2119,9 +2173,11 @@ RETRO_API void retro_unload_game(void)
  	VKLibretro::Active = false;
  #endif
  #ifdef ENABLE_OPENGL
@@ -211,6 +242,63 @@ index 24210fb067..66172dc9fb 100644
  	LibretroCore::s_context_ready.store(false, std::memory_order_release);
  	LibretroCore::s_cpu_thread_initialized.store(false, std::memory_order_release);
  }
+@@ -2134,11 +2190,31 @@ RETRO_API void retro_run(void)
+ 	if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &options_updated) && options_updated)
+ 		ApplyCoreOptions(false);
+ 
++	if (VMManager::HasValidVM())
++	{  // SW2PS2: once per game, what each port holds (two-player modes need a pad in port 2)
++		static int s_pad_log_frames = 0;
++		if (++s_pad_log_frames % 600 == 120)  // 2 s into a game, then every 10 s (the Multitap can change mid-game)
++		{
++			Console.WriteLn("SW2PS2 pads: Multitap on port 1 %s", EmuConfig.Pad.MultitapPort0_Enabled ? "ON" : "off");
++			for (unsigned slot = 0; slot < 5; slot++)  // 0 = port 1 (A), 1 = port 2, 2-4 = Multitap B-D on port 1
++			{
++				PadBase* pad = Pad::GetPad(slot);
++				Console.WriteLn("SW2PS2 pad slot %u: config type %d, pad %s (type %d)", slot,
++					static_cast<int>(EmuConfig.Pad.Ports[slot].Type), pad ? "present" : "none", pad ? static_cast<int>(pad->GetType()) : -1);
++			}
++		}
++	}
+ 	// M3 input: forward the libretro joypad straight into the DualShock2
+-	// bind slots (bypasses InputManager entirely).
++	// bind slots (bypasses InputManager entirely). SW2PS2: every player (port 2 was never read): players
++	// 1-2 in ports 1-2, or with a Multitap in port 1 players 1-4 in its slots A-D (unified 0, 2, 3, 4).
+ 	if (VMManager::HasValidVM())
++	for (unsigned port = 0; port < 4; port++)
+ 	{
+-		if (PadBase* pad = Pad::GetPad(0))
++		static constexpr u32 MULTITAP_SLOTS[4] = {0, 2, 3, 4};
++		const bool multitap = EmuConfig.Pad.MultitapPort0_Enabled;
++		if (!multitap && port >= 2)
++			break;
++		if (PadBase* pad = Pad::GetPad(multitap ? MULTITAP_SLOTS[port] : port))
+ 		{
+ 			static constexpr struct
+ 			{
+@@ -2163,17 +2239,17 @@ RETRO_API void retro_run(void)
+ 				{RETRO_DEVICE_ID_JOYPAD_R3, PadDualshock2::Inputs::PAD_R3},
+ 			};
+ 			for (const auto& m : bmap)
+-				pad->Set(m.ds2, input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, m.retro) ? 1.0f : 0.0f);
++				pad->Set(m.ds2, input_state_cb(port, RETRO_DEVICE_JOYPAD, 0, m.retro) ? 1.0f : 0.0f);
+ 
+ 			// Analog sticks: split each axis into the two directional slots.
+ 			const auto axis = [](s16 v, bool positive) {
+ 				const float f = std::clamp(static_cast<float>(v) / 32767.0f, -1.0f, 1.0f);
+ 				return positive ? std::max(f, 0.0f) : std::max(-f, 0.0f);
+ 			};
+-			const s16 lx = input_state_cb(0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X);
+-			const s16 ly = input_state_cb(0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_Y);
+-			const s16 rx = input_state_cb(0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_X);
+-			const s16 ry = input_state_cb(0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y);
++			const s16 lx = input_state_cb(port, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X);
++			const s16 ly = input_state_cb(port, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_Y);
++			const s16 rx = input_state_cb(port, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_X);
++			const s16 ry = input_state_cb(port, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y);
+ 			pad->Set(PadDualshock2::Inputs::PAD_L_RIGHT, axis(lx, true));
+ 			pad->Set(PadDualshock2::Inputs::PAD_L_LEFT, axis(lx, false));
+ 			pad->Set(PadDualshock2::Inputs::PAD_L_DOWN, axis(ly, true));
 diff --git a/pcsx2/CMakeLists.txt b/pcsx2/CMakeLists.txt
 index 58cef9de0d..683d07b404 100644
 --- a/pcsx2/CMakeLists.txt

@@ -58,10 +58,18 @@ extern "C" float sw2ax_gs_usage() { return PerformanceMetrics::GetGSThreadUsage(
 extern "C" void (*__stdio_exit_handler)(void);
 static u64 s_sw2_initial_mask = 0; static s32 s_sw2_initial_core = -1;
 extern "C" void sw2ax_crash_watch(int on);
-extern "C" void sw2ax_register_exit_cleanup()
+extern "C" void sw2ax_register_exit_cleanup(int traces)
 {
 	svcGetThreadCoreMask(&s_sw2_initial_core, &s_sw2_initial_mask, CUR_THREAD_HANDLE);
-	Horizon::BreadcrumbInit("sdmc:/switch/sw2ps2");  // exit trace: sdmc:/switch/sw2ps2/exit.txt
+	// exit trace: sdmc:/switch/sw2ps2/exit.txt, one launch's worth (the previous launch's kept as exit.prev.txt;
+	// it used to grow forever)
+	// (traces only with logging on -- debug logging or a test run: normal play writes no files)
+	if (traces)
+	{
+		remove("sdmc:/switch/sw2ps2/exit.prev.txt");
+		rename("sdmc:/switch/sw2ps2/exit.txt", "sdmc:/switch/sw2ps2/exit.prev.txt");
+		Horizon::BreadcrumbInit("sdmc:/switch/sw2ps2");
+	}
 	Horizon::ExitTrace("---- SW2PS2 ARMSX2 started");
 	std::atexit([]() {
 		Horizon::ExitTrace("atexit clean-up: begin");

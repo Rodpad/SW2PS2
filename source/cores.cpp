@@ -12,7 +12,7 @@
 #include "../native/bridge_core.h"
 
 const char* core_rom_name = "";
-Ps2Input ps2Input[2];
+Ps2Input ps2Input[4];
 static std::string dataDir, loadError;
 static void (*logLine)(const char*);
 static bool gpuOn;
@@ -114,9 +114,9 @@ static void unload() { { InCore in; ps2_unload(); } gfx::coreDestroy(); gpuOn = 
 static void noop() {}
 static void reset(int) { InCore in; ps2_reset(); }
 static int frame(int, int, int) {
-  ps2_pad a = {ps2Input[0].buttons, ps2Input[0].lx, ps2Input[0].ly, ps2Input[0].rx, ps2Input[0].ry};
-  ps2_pad b = {ps2Input[1].buttons, ps2Input[1].lx, ps2Input[1].ly, ps2Input[1].rx, ps2Input[1].ry};
-  { InCore in; ps2_run(&a, &b); }
+  ps2_pad p[4];
+  for (int i = 0; i < 4; i++) p[i] = {ps2Input[i].buttons, ps2Input[i].lx, ps2Input[i].ly, ps2Input[i].rx, ps2Input[i].ry};
+  { InCore in; ps2_run(p); }
   pumpAudio();
   return 0;
 }

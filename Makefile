@@ -19,7 +19,7 @@ endif
 
 APP_TITLE	:=	SW2PS2
 APP_AUTHOR	:=	Rodpad
-APP_VERSION	:=	1.0.2
+APP_VERSION	:=	1.1.0
 
 TARGET		:=	sw2ps2
 BUILD		:=	build
@@ -100,6 +100,6 @@ else
 DEPENDS	:=	$(OFILES:.o=.d)
 all	:	$(OUTPUT).nro
 $(OUTPUT).nro	:	$(OUTPUT).elf $(OUTPUT).nacp
-$(OUTPUT).elf	:	$(OFILES)
+$(OUTPUT).elf	:	$(OFILES) $(AXWRAP) $(AX)/pcsx2/libPCSX2_LTO.a  # relink when the core is rebuilt
 -include $(DEPENDS)
 endif
