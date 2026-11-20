@@ -66,7 +66,7 @@ Settings -> App -> Advanced options.
   the in-game menu (L + R + L3 + R3 on other controllers). Games needing L2 / R2 / Select / R3
   need a remap or a fuller controller.
 
-## What SW2PS2 adds to OunceSX2
+## SW2PS2 core improvements
 
 SW2PS2 uses the [OunceSX2](https://github.com/nyathea/OunceSX2) core with its own changes
 (`patches/ouncesx2.patch`).
