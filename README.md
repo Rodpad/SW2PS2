@@ -28,7 +28,7 @@ folders can be changed in Settings -> App. The app keeps its own files in `/swit
 ### In-game menu
 Opened with L + R + L3 + R3 (SL + SR + stick press on a single Joy-Con), in tabs:
 - **Game:** resume, save and load state (several slots, with optional auto-load when a game
-  starts), save screenshot, reset, quit.
+  starts), save screenshot, cheats, reset, quit.
 - **Emulation**, applied straight away: PS2 CPU speed and cycle skip, GPU readbacks
   (Accurate / Fast), Switch 2 CPU clock, internal resolution (1x and up), widescreen patches,
   and a stats overlay (FPS, full statistics, or with a frame-time graph).
@@ -40,6 +40,18 @@ Opened with L + R + L3 + R3 (SL + SR + stick press on a single Joy-Con), in tabs
 
 The menu can pause the game and dim it behind (both optional). Less common options appear with
 Settings -> App -> Advanced options.
+
+### Cheats
+
+Open **Game → Cheats…** while playing. SW2PS2 lists the codes for the disc's serial and ELF CRC
+and remembers the codes you enable for that revision. The starting database covers Final Fantasy X
+International (Japan) and Final Fantasy X (North America).
+
+To add your own codes, copy a PCSX2 PNACH file with `[named cheat]` sections to the exact path shown
+under **Add a PNACH file…**, then restart the game. The default folder is
+`/switch/sw2ps2/system/pcsx2/cheats/` and the filename is `SERIAL_CRC.pnach`.
+For Final Fantasy X International, enable **All Al Bhed Primers** after loading your save, resume
+the game, and check **Items → Key Items** for volumes I–XXVI. Save in-game to keep the primers.
 
 ### Display and sound
 - 60 Hz, or 120 Hz with VRR on displays that support it; adjustable frame delay.
@@ -103,7 +115,7 @@ SW2PS2 uses the [OunceSX2](https://github.com/nyathea/OunceSX2) core with its ow
 | `source/` | the front end (game list, menus, settings, video/audio output, test harness) |
 | `native/` | glue between the front end and the core (libretro bridge, Horizon helpers; two files of OunceSX2's own app compiled in) |
 | `patches/` | SW2PS2's changes to the emulator cores, against the upstream commits in `patches/upstreams.txt` |
-| `romfs/` | fonts (with their licences) and picture shaders |
+| `romfs/` | fonts (with their licences), picture shaders and the bundled PNACH cheat database |
 | `icon.png`, `sw2ps2.jpg` | the app icon: the lossless master and the JPEG the build uses (`sw2ps2-test.jpg`: test builds) |
 | `tools/` | speed-list generator, profiling helpers, third-party setup |
 | `tests/` | on-console test runner (`remote_test.sh`) and its log summariser |

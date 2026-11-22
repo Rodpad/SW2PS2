@@ -13,6 +13,10 @@
 #include <vector>
 
 #include "libretro.h"
+#include "core.h"
+#include "Host.h"
+#include "Patch.h"
+#include "VMManager.h"
 #ifdef SW2_VK
 #include "../source/vkpresent.h"
 // Vulkan display (ps2_set_vulkan): the core renders on a device made through its negotiation
@@ -236,6 +240,7 @@ const char* ps2_load(const char* path) {
 #ifdef SW2_VK
   vkGranted = false; vkNegotiation = nullptr;
 #endif
+  ps2_set_option("armsx2_cheats", "enabled");
   logLine(1, "bridge: retro_init");
   retro_init();
   struct retro_game_info gi; memset(&gi, 0, sizeof gi); gi.path = path;
@@ -301,4 +306,25 @@ long ps2_state_size(void) { return loaded ? (long)retro_serialize_size() : 0; }
 int ps2_state_save(void* buf, long size) { return loaded && retro_serialize(buf, (size_t)size); }
 int ps2_state_load(const void* buf, long size) { return loaded && retro_unserialize(buf, (size_t)size); }
 
+}
+
+std::string ps2core_cheats(std::vector<Ps2Cheat>& cheats) {
+  cheats.clear();
+  if (!loaded) return {};
+  const auto serial = VMManager::GetDiscSerial();
+  const auto crc = VMManager::GetDiscCRC();
+  if (serial.empty() || !crc) return {};
+
+  for (const auto& patch : Patch::GetPatchInfo(serial, crc, true, false, nullptr))
+    cheats.push_back({patch.name, patch.place == Patch::PPT_ONCE_ON_LOAD});
+
+  return Patch::GetPnachFilename(serial, crc, true);
+}
+
+void ps2core_reload_cheats() {
+  if (!loaded) return;
+  Host::RunOnCPUThread([] {
+    if (VMManager::HasValidVM())
+      Patch::UpdateActivePatches(true, false, false, VMManager::Internal::HasBootedELF());
+  }, false);
 }

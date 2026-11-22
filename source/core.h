@@ -1,9 +1,11 @@
 // SW2PS2: the OunceSX2 core (native/bridge_core.cpp, ps2_*) behind the same
 // function table the SW2NES/SW2SNES front end uses, so the front end keeps its
-// structure. See cores.cpp. Run-ahead, rewind and cheats do not exist here
-// (a PS2 state is ~46 MB): their entries report "unavailable".
+// structure. See cores.cpp. Run-ahead and rewind are unavailable
+// (a PS2 state is ~46 MB).
 #pragma once
 #include <stdint.h>
+#include <string>
+#include <vector>
 
 struct CoreApi {
   const char* name;
@@ -32,8 +34,6 @@ struct CoreApi {
   char* (*state_buffer)(long);
   int (*state_load)(long);
   int (*runahead)(int, int, int);
-  int (*set_cheats)(const char** codes, int n);
-  int (*cheat_valid)(const char* code);
 };
 extern const CoreApi PS2_CORE;
 extern const char* core_rom_name;  // full path of the disc image, set before load()
@@ -51,6 +51,12 @@ bool ps2core_vulkan();                // the loaded game shows through the Vulka
 bool ps2core_is_gpu();                 // the last frame is in the GPU target (video() is stale)
 double ps2core_fps();                  // 59.94 (NTSC) or 50 (PAL) for the loaded game
 bool ps2core_find_bios(const char* dir, char* path, int size);  // a BIOS file (4-8 MB) in dir or its subfolders: its full path
+
+// Cheats for the current disc revision. Returns the matching custom PNACH path,
+// or an empty string until the core identifies the disc.
+struct Ps2Cheat { std::string name; bool bootOnly; };
+std::string ps2core_cheats(std::vector<Ps2Cheat>& cheats);
+void ps2core_reload_cheats();
 
 // Rewind history (delta-compressed states; see cores.cpp).
 bool rewind_init(long budgetBytes);

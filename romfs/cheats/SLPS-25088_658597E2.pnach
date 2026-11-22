@@ -1,0 +1,21 @@
+gametitle=Final Fantasy X International (Japan)
+
+[All Al Bhed Primers]
+description=Adds volumes I through XXVI to Key Items and unlocks all 26 translations.
+// Runtime translation address from Rebecca, Tomo, Shin and Karat Corporation's code.
+// FFXED offsets: translation flags at 15696 (bits 0-25), Key Items at 17612 (bits 4-29).
+// https://github.com/gabacode/FFXED/blob/main/src/ffxed/FFXSaveEditor.java
+// Extended OR writes preserve the unrelated bits in both fields.
+patch=1,EE,7031CE60,extended,0010FFFF
+patch=1,EE,7031CE62,extended,001003FF
+patch=1,EE,7031D5DC,extended,0010FFF0
+patch=1,EE,7031D5DE,extended,00103FFF
+
+[Force English]
+description=Keeps the game language set to English.
+// https://github.com/vcx33/Final-Fantasy-X-International-Cheat-Codes-PCSX2
+patch=1,EE,0031CE5E,byte,00000001
+
+[999,999,999 Gil]
+description=Sets the party's Gil to 999,999,999.
+patch=1,EE,0031CE98,word,3B9AC9FF

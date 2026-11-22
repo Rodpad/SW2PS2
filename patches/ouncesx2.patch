@@ -4282,8 +4282,8 @@ index 48c686a506..eb21ef5bac 100644
  // sets a branch test to occur some time from an arbitrary starting point.
 +#ifdef __SWITCH__
 +u64 g_sw2EvStats[4];
-+// SW2PS2 measurement: who set the event the next test runs for (return address of the setter's call),
-+// and the interrupt bits pending at each test.
++bool sw2_trace_ee_events = false;
++// Optional diagnostics for the event setter and pending interrupt bits.
 +uptr g_sw2EvSetter;
 +u64 g_sw2EvIntBits[32];
 +struct Sw2EvSrc { uptr addr; u64 n; };
@@ -4293,7 +4293,7 @@ index 48c686a506..eb21ef5bac 100644
 +	if( (int)(cpuRegs.nextEventCycle - startCycle) > delta )
 +	{
 +		cpuRegs.nextEventCycle = startCycle + delta;
-+		g_sw2EvSetter = reinterpret_cast<uptr>(__builtin_return_address(0));
++		if (sw2_trace_ee_events) g_sw2EvSetter = reinterpret_cast<uptr>(__builtin_return_address(0));
 +	}
 +}
 +#else
@@ -4331,12 +4331,13 @@ index 48c686a506..eb21ef5bac 100644
  	if constexpr (M == IopThreadMode::Threaded)
  		IopThread::EeEventTestBegin(cpuRegs.cycle);
  
-@@ -550,6 +579,28 @@ __fi void _cpuEventTest_Shared()
+@@ -550,6 +579,29 @@ __fi void _cpuEventTest_Shared()
  	// ---- IOP -------------
  	iopRunSliceForEE<M>();
  
 +#ifdef __SWITCH__
-+	{	// SW2PS2 measurement: event tests per second, and what was due (sw2ax_event_stats).
++	if (sw2_trace_ee_events) // Event tests per second and their sources (sw2ax_event_stats).
++	{
 +		extern u64 g_sw2EvStats[4];
 +		g_sw2EvStats[0]++;
 +		const bool counter_due = cpuTestCycle(nextStartCounter, nextDeltaCounter);
@@ -6144,3 +6145,153 @@ index 0000000000..e62f35076c
 +		s32 m_last_rule = -1;
 +	};
 +} // namespace IopThread
+diff --git a/pcsx2/Patch.cpp b/pcsx2/Patch.cpp
+index 842ba4717c..e5aad14797 100644
+--- a/pcsx2/Patch.cpp
++++ b/pcsx2/Patch.cpp
+@@ -144,6 +144,9 @@ namespace Patch
+ 	static std::vector<std::string> s_just_enabled_cheats;
+ 	static std::vector<std::string> s_just_enabled_patches;
+ 	static u32 s_patches_crc;
++#if defined(__SWITCH__) && defined(ENABLE_LIBRETRO)
++	static std::string s_cheat_serial;
++#endif
+ 	static std::optional<float> s_override_aspect_ratio;
+ 	static std::optional<GSInterlaceMode> s_override_interlace_mode;
+ 
+@@ -393,6 +396,23 @@ bool Patch::ContainsPatchName(const std::vector<PatchInfo>& patches, const std::
+ template <typename F>
+ void Patch::EnumeratePnachFiles(const std::string_view serial, u32 crc, bool cheats, bool for_ui, const F& f)
+ {
++#if defined(__SWITCH__) && defined(ENABLE_LIBRETRO)
++	// SW2PS2 presents individually selected cheats for the exact disc revision.
++	if (cheats)
++	{
++		if (serial.empty() || crc == 0 || (!for_ui && Achievements::IsHardcoreModeActive()))
++			return;
++
++		const std::string filename = GetPnachTemplate(serial, crc, true, false, false);
++		for (const std::string& dir : {EmuFolders::Cheats, std::string("romfs:/cheats")})
++		{
++			const std::string path = Path::Combine(dir, filename);
++			if (const auto contents = FileSystem::ReadFileToString(path.c_str()))
++				f(path, *contents);
++		}
++		return;
++	}
++#endif
+ 	// Prefer files on disk over the zip.
+ 	//
+ 	// Hardcore blocks CHEATS, not fixes. The old condition dropped every on-disk pnach,
+@@ -644,10 +664,24 @@ std::string Patch::GetPnachFilename(const std::string_view serial, u32 crc, bool
+ void Patch::ReloadEnabledLists()
+ {
+ 	const std::vector<std::string> prev_enabled_cheats = std::move(s_enabled_cheats);
++	s_enabled_cheats.clear();
+ 	if (EmuConfig.EnableCheats && !Achievements::IsHardcoreModeActive())
++	{
++#if defined(__SWITCH__) && defined(ENABLE_LIBRETRO)
++		if (!s_cheat_serial.empty() && s_patches_crc != 0)
++		{
++			const std::string selection = GetPnachFilename(s_cheat_serial, s_patches_crc, true) + ".enabled";
++			if (const auto contents = FileSystem::ReadFileToString(selection.c_str()))
++			{
++				std::istringstream input(*contents);
++				for (std::string name; std::getline(input, name);)
++					s_enabled_cheats.push_back(std::move(name));
++			}
++		}
++#else
+ 		s_enabled_cheats = Host::GetStringListSetting(CHEATS_CONFIG_SECTION, PATCH_ENABLE_CONFIG_KEY);
+-	else
+-		s_enabled_cheats = {};
++#endif
++	}
+ 
+ 	const std::vector<std::string> prev_enabled_patches = std::exchange(s_enabled_patches, Host::GetStringListSetting(PATCHES_CONFIG_SECTION, PATCH_ENABLE_CONFIG_KEY));
+ 	const std::vector<std::string> disabled_patches = Host::GetStringListSetting(PATCHES_CONFIG_SECTION, PATCH_DISABLE_CONFIG_KEY);
+@@ -877,6 +911,11 @@ void Patch::ReloadPatches(const std::string& serial, u32 crc, bool reload_files,
+ 	bool verbose_if_changed)
+ {
+ 	reload_files |= (s_patches_crc != crc);
++#if defined(__SWITCH__) && defined(ENABLE_LIBRETRO)
++	reload_files |= (s_cheat_serial != serial);
++	reload_enabled_list |= (s_cheat_serial != serial || s_patches_crc != crc);
++	s_cheat_serial = serial;
++#endif
+ 	s_patches_crc = crc;
+ 
+ 	if (reload_files)
+@@ -912,6 +951,10 @@ void Patch::ReloadPatches(const std::string& serial, u32 crc, bool reload_files,
+ 				if (patch_count > 0)
+ 					Console.WriteLn(Color_Green, fmt::format("Found {} cheats in {}.", patch_count, filename));
+ 			});
++#if defined(__SWITCH__) && defined(ENABLE_LIBRETRO)
++		// Legacy unlabelled codes auto-enable in PCSX2. Here every cheat is opt-in.
++		std::erase_if(s_cheat_patches, [](const PatchGroup& group) { return group.name.empty(); });
++#endif
+ 	}
+ 
+ 	UpdateActivePatches(reload_enabled_list, verbose, verbose_if_changed, false);
+diff --git a/pcsx2/Host/AudioStream.cpp b/pcsx2/Host/AudioStream.cpp
+--- a/pcsx2/Host/AudioStream.cpp
++++ b/pcsx2/Host/AudioStream.cpp
+@@ -4,6 +4,7 @@
+ #include "Host/AudioStream.h"
+ #include "FreeSurroundDecoder.h"
+ #include "Host.h"
++#include "Config.h"
+ #include "GS/GSVector.h"
+ 
+ #include "common/Assertions.h"
+@@ -26,6 +27,9 @@
+ //#define LOG_UNDERRUN(...) DEV_LOG(__VA_ARGS__)
+ #define LOG_UNDERRUN(...) (void)0
+ static constexpr bool LOG_TIMESTRETCH_STATS = false;
++#if defined(__SWITCH__) && defined(ENABLE_LIBRETRO)
++std::atomic<float> sw2_output_tempo{1.0f};
++#endif
+ 
+ static constexpr const std::array<std::pair<u8, u8>, static_cast<size_t>(AudioExpansionMode::Count)>
+ 	s_expansion_channel_count = {{
+@@ -130,6 +134,17 @@
+ #endif
+ 
+ 		case AudioBackend::Null:
++#if defined(__SWITCH__) && defined(ENABLE_LIBRETRO)
++			if (stretch_enabled)
++			{
++				// The frontend pulls this stream into its own device queue.
++				AudioStreamParameters params = parameters;
++				params.expansion_mode = AudioExpansionMode::Disabled;
++				std::unique_ptr<AudioStream> stream(new AudioStream(sample_rate, params));
++				stream->BaseInitialize(&StereoSampleReaderImpl, true);
++				return stream;
++			}
++#endif
+ 			return CreateNullStream(sample_rate, parameters.buffer_ms);
+ 
+ 		default:
+@@ -651,6 +666,11 @@
+ {
+ 	if (IsStretchEnabled())
+ 	{
++#if defined(__SWITCH__) && defined(ENABLE_LIBRETRO)
++		const bool frontend_clock = EmuConfig.SPU2.Backend == AudioBackend::Null;
++		if (frontend_clock)
++			m_soundtouch->setTempo(sw2_output_tempo.load(std::memory_order_relaxed));
++#endif
+ 		m_soundtouch->putSamples(block, CHUNK_SIZE);
+ 
+ 		u32 tempProgress;
+@@ -659,7 +679,9 @@
+ 			InternalWriteFrames(m_staging_buffer.get(), tempProgress);
+ 		}
+ 
+-		if (IsStretchEnabled())
++#if defined(__SWITCH__) && defined(ENABLE_LIBRETRO)
++		if (!frontend_clock)
++#endif
+ 			UpdateStretchTempo();
+ 	}
+ 	else

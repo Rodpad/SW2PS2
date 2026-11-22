@@ -13,6 +13,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <algorithm>
+#include <atomic>
 #include <map>
 #include <malloc.h>
 #include <functional>
@@ -31,6 +32,8 @@ static const CoreApi* C = &PS2_CORE;
 extern int sw2_osd_stats;  // native/armsx2_compat.cpp
 #endif
 #include "json.h"
+#include <memory>
+#include <sstream>
 #include <minizip/unzip.h>
 
 #ifndef APP_VERSION
@@ -249,7 +252,7 @@ static bool showAdvanced = false;  // default: hidden (also after Reset all sett
 static const vector<string> ADVANCED_SETTINGS = {"Debug logging", "Emulated CPU speed (next start)", "CPU boost mode (next start)", "Scale", "Overscan", "Signal", "Curvature", "Corner radius", "Corner softness", "Vignette", "Vignette size",
     "Brightness boost", "Stats", "Run-ahead", "Frame delay (60 Hz)", "Audio buffer", "Display", "Fast-forward speed", "Dim game in menu", "Audio filter", "Turbo speed"};
 static const vector<string> ADVANCED_MENU = {"Run-ahead", "Stats", "Scale", "Overscan", "Signal", "Curvature", "Corner radius", "Corner softness", "Vignette",
-    "Vignette size", "Brightness boost", "Settings for", "Cheats...", "Resolution"};
+    "Vignette size", "Brightness boost", "Settings for", "Resolution"};
 static int cornerRadius = 0, cornerSoftness = 1, vignette = 0, vignetteSize = 0, curvature = 0, shader = 6, signalMode = 0, boost = 0;
 // Button mapping per player (Switch A, B, X, Y, L, R -> FACE_CHOICES).
 static int faceMap[NFACE] = {0, 1, 2, 3, 4, 5}, faceMap2[NFACE] = {0, 1, 2, 3, 4, 5};
@@ -260,31 +263,36 @@ static bool autoLoadState = false, pauseInMenu = false, dimInMenu = false;
 // At most one frame in flight: input is read only after the previous frame
 // finished on the GPU (the driver default let frames queue up: 100+ ms lag).
 static const int frameQueue = 1;
-static vector<string> recentGames, favourites;
+static vector<string> recentGames, favourites, playHistory;
+static Json lastPlayedDates = Json::object();
 static const vector<string> VIB_LEVELS = {"Off", "Low", "Normal", "High"};
 static const float VIB_GAIN[4] = {0.0f, 0.5f, 1.0f, 1.6f};
 static int vibLevel = 2;  // index into VIB_LEVELS: Normal by default
 static bool vibration = true;  // (settings before vibLevel: on = Normal, off = Off)
 static vector<string> widescreenGames;  // games shown at 16:9, with the core's widescreen patch from their next start
 
-struct Rom { string name, dir; };  // file name (.sfc, .smc or .zip) and its folder
+enum RomSort { DefaultOrder, NameAsc, NameDesc, PlayedAsc, PlayedDesc, AddedAsc, AddedDesc };
+static const vector<string> ROM_SORT_LABELS = {
+    "Default order", "Name (A-Z)", "Name (Z-A)", "Last played (oldest first)",
+    "Last played (newest first)", "Date added (oldest first)", "Date added (newest first)"
+};
+static const vector<int> DEFAULT_ROM_SORT_BY_VIEW = {NameAsc, NameAsc, PlayedDesc};
+static vector<int> romSortByView = DEFAULT_ROM_SORT_BY_VIEW;
+
+struct Rom { string name, dir; u64 added = 0; };
 static vector<Rom> allRoms, roms;
 static int selected = 0, top = 0, listView = 0, btnIndex = 0;
 static string focusArea = "list";
 static double exitArmed = 0;
 
 struct GameVals { int aspect, scale, crop, crt, palette, faces[NFACE], faces2p[NFACE], turbo, volume, filter, corner, cornerSoft, vignette, vignetteSize, curve, shader, signal, boost; };
-struct Cheat { string code, desc; bool on; };
-struct Patch { long offset; uint8_t orig; };
 struct Running {
-  string name, base, stateBase, settingsBase;  // base: <data>/<game> (cheats, saves); states and per-game settings in their own folders
+  string name, base, stateBase, settingsBase;  // base: <data>/<game> (saves); states and per-game settings in their own folders
   bool battery = false, perGame = false;
   uint32_t sramHash = 0;
   double sramCheck = 0;
   GameVals globalVals;
   Json slots = Json::object();
-  vector<Cheat> cheats;
-  vector<Patch> patches;
 };
 static Running* running = nullptr;
 static string mode = "browser";
@@ -330,7 +338,11 @@ static const char* switchButtonName(int bit) {
 }
 // Automated test (autotest.json, see main): overrides apply to one run and are not saved.
 static bool autoTest = false, autoAgent = false, autoWaiting = false;
+static string autoReuseLogPath;
 static double autoTestEnd = 0, autoWaitSince = 0, autoPollAt = 0;
+static double autoMeasureSeconds = 0;
+static bool autoAwaitingState = false;
+static unsigned autoMeasuredFrames = 0;
 static vector<std::pair<string, string>> autoOptions;  // extra core options for the current test run
 static string autoLabel;
 static std::deque<std::pair<double, int>> autoLiveRes;
@@ -465,6 +477,10 @@ static Json settingsJson(const GameVals& g) {
   j.set("facesP2", f2); j.set("turbo", Json::number(g.turbo)); j.set("palette", Json::number(g.palette));
   j.set("volume", Json::number(g.volume)); j.set("filter", Json::number(g.filter));
   j.set("corner", Json::number(g.corner)); j.set("cornerSoft", Json::number(g.cornerSoft)); j.set("vignette", Json::number(g.vignette)); j.set("vignetteSize", Json::number(g.vignetteSize)); j.set("curvature", Json::number(g.curve)); j.set("shader", Json::number(g.shader)); j.set("signal", Json::number(g.signal)); j.set("boost", Json::number(g.boost));
+  Json sorts = Json::array();
+  for (int sort : romSortByView) sorts.a.push_back(Json::number(sort));
+  j.set("romSortByView", sorts); j.set("playHistory", strings(playHistory));
+  j.set("lastPlayedDates", lastPlayedDates);
   j.set("recent", strings(recentGames)); j.set("favourites", strings(favourites)); j.set("widescreen", strings(widescreenGames));
   j.set("romDir", Json::string(romDir)); j.set("biosDir", Json::string(biosDir));
   j.set("advanced", Json::boolean(showAdvanced));
@@ -496,6 +512,18 @@ static void applySettingsJson(const Json& v) {
   for (const char* k : {"turbo", "palette", "volume", "filter", "aspect", "scale", "crop", "corner", "cornerSoft", "vignette", "vignetteSize", "curvature", "shader", "signal", "boost"}) if (const Json* x = v.get(k)) gv.set(k, *x);
   setGameValuesJson(gv);
   if (const Json* r = v.get("recent")) if (r->isArr()) { recentGames.clear(); for (auto& x : r->a) if (x.isStr() && (int)recentGames.size() < RECENT_MAX) recentGames.push_back(x.s); }
+  romSortByView = DEFAULT_ROM_SORT_BY_VIEW;
+  const int legacySort = pick(v.get("romSort"), ROM_SORT_LABELS.size(), -1);
+  if (legacySort >= 0) std::fill(romSortByView.begin(), romSortByView.end(), legacySort);
+  if (const Json* sorts = v.get("romSortByView"); sorts && sorts->isArr()) {
+    for (size_t i = 0; i < std::min(sorts->a.size(), romSortByView.size()); i++)
+      romSortByView[i] = pick(&sorts->a[i], ROM_SORT_LABELS.size(), romSortByView[i]);
+  }
+  playHistory = recentGames;  // seed from the existing Recent tab on upgrade
+  if (const Json* h = v.get("playHistory"); h && h->isArr()) {
+    playHistory.clear();
+    for (const auto& entry : h->a) if (entry.isStr()) playHistory.push_back(entry.s);
+  }
   if (const Json* r = v.get("favourites")) if (r->isArr()) { favourites.clear(); for (auto& x : r->a) if (x.isStr()) favourites.push_back(x.s); }
   if (const Json* r = v.get("widescreen")) if (r->isArr()) { widescreenGames.clear(); for (auto& x : r->a) if (x.isStr()) widescreenGames.push_back(x.s); }
   if (const Json* b = v.get("autoLoad")) if (b->isBool()) autoLoadState = b->b;
@@ -510,7 +538,8 @@ static void applySettingsJson(const Json& v) {
   runAhead = pick(v.get("runAhead"), RUN_AHEADS.size(), runAhead); frameDelay = pick(v.get("frameDelay"), FRAME_DELAYS.size(), frameDelay);
   audioBuffer = pick(v.get("audioBuffer"), AUDIO_BUFFERS.size(), audioBuffer); displayMode = pick(v.get("display"), DISPLAY_MODES.size(), displayMode);
   ffMode = pick(v.get("ffMode"), FF_MODES.size(), ffMode); ffSpeed = pick(v.get("ffSpeed"), FF_SPEEDS.size(), ffSpeed);
-  ps2Renderer = 0;  // always the GPU (Vulkan) renderer: software was far too slow to be worth offering ps2Resolution = pick(v.get("ps2Resolution"), RESOLUTIONS.size(), ps2Resolution);
+  ps2Renderer = 0;  // always the GPU (Vulkan) renderer
+  ps2Resolution = pick(v.get("ps2Resolution"), RESOLUTIONS.size(), ps2Resolution);
   ps2EeSpeed = pick(v.get("ps2EeSpeed"), EE_SPEEDS.size(), ps2EeSpeed);
   if (!v.get("ee75") && ps2EeSpeed == 0) ps2EeSpeed = 1;  // 75% became the default (1.0.2); once, for settings saved on the old 100% default
   ps2Fpu = pick(v.get("ps2Fpu"), FPU_MODES.size(), ps2Fpu);
@@ -551,6 +580,7 @@ static void applySettingsJson(const Json& v) {
   runAhead = 0; ffMode = 0; rewindOn = false;  // not on this core
   // ("crt": the CRT strip styles were replaced by shaders in 2.5.0; old values are ignored.)
 }
+static void orderRoms();
 static Json defaultSettings;  // the built-in defaults, captured before the settings file is read
 static bool displaySaved = false;  // the file chose a display mode (otherwise 120 Hz only where available)
 static void loadSettings() {
@@ -559,15 +589,18 @@ static void loadSettings() {
   string t; Json v;
   if (!readText(SETTINGS(), t) || !Json::parse(t, v) || v.type != Json::OBJ) return;
   applySettingsJson(v);
+  if (const Json* dates = v.get("lastPlayedDates"); dates && dates->type == Json::OBJ)
+    lastPlayedDates = *dates;
   displaySaved = v.get("display") != nullptr;
   if (const Json* d = v.get("frameDelay")) if (d->isNum() && d->n >= FRAME_DELAYS.size()) frameDelay = (int)FRAME_DELAYS.size() - 1;  // 12 ms -> 8 ms cap
 }
 // Settings -> Reset all settings: back to the built-in defaults (recent games,
 // favourites and per-game settings files are kept).
 static void resetAllSettings() {
-  vector<string> rec = recentGames, fav = favourites, ws = widescreenGames, fr = fastReadbackGames;
+  vector<string> rec = recentGames, fav = favourites, ws = widescreenGames, fr = fastReadbackGames, history = playHistory;
   applySettingsJson(defaultSettings);
-  recentGames = rec; favourites = fav; widescreenGames = ws; fastReadbackGames = fr;
+  recentGames = rec; favourites = fav; widescreenGames = ws; fastReadbackGames = fr; playHistory = history;
+  orderRoms();
   saveSettings();
 }
 
@@ -590,6 +623,7 @@ static bool naturalLess(const string& a0, const string& b0) {
   return a.size() - i < b.size() - j;
 }
 static void orderRoms() {
+  const int romSort = romSortByView[listView];
   string cur = selected < (int)roms.size() ? roms[selected].name : "";
   vector<Rom> list;
   if (listView == 1) {
@@ -610,6 +644,28 @@ static void orderRoms() {
       return naturalLess(a.name, b.name);
     });
   }
+  if (romSort != DefaultOrder) {
+    std::map<string, size_t> playedRank;
+    if (romSort == PlayedAsc || romSort == PlayedDesc) {
+      for (size_t i = 0; i < playHistory.size(); i++) playedRank.emplace(playHistory[i], i);
+    }
+    const auto rank = [&](const Rom& r) {
+      auto it = playedRank.find(r.name);
+      return it == playedRank.end() ? playHistory.size() : it->second;
+    };
+    std::stable_sort(list.begin(), list.end(), [&](const Rom& a, const Rom& b) {
+      if (romSort == PlayedAsc || romSort == PlayedDesc) {
+        const size_t x = rank(a), y = rank(b);
+        if ((x == playHistory.size()) != (y == playHistory.size())) return x < y;
+        if (x != y) return romSort == PlayedDesc ? x < y : x > y;
+      } else if (romSort == AddedAsc || romSort == AddedDesc) {
+        if ((a.added == 0) != (b.added == 0)) return a.added != 0;
+        if (a.added != b.added) return romSort == AddedAsc ? a.added < b.added : a.added > b.added;
+      }
+      const string an = stripNes(a.name), bn = stripNes(b.name);
+      return romSort == NameDesc ? naturalLess(bn, an) : naturalLess(an, bn);
+    });
+  }
   roms = list; selected = 0; top = 0;
   if (!cur.empty()) for (size_t i = 0; i < roms.size(); i++) if (roms[i].name == cur) selected = (int)i;
 }
@@ -624,6 +680,64 @@ static void loadPlaytime() {
   if (readText(PLAYTIME(), t) && Json::parse(t, j) && j.type == Json::OBJ) playtime = j;
 }
 static double playSeconds(const string& name) { const Json* v = playtime.get(name); return v && v->isNum() ? v->n : 0; }
+static string dateFormat = "%Y-%m-%d";
+static std::map<string, string> lastPlayedLabels;
+static void loadDateFormat() {
+  u64 code = 0;
+  if (R_FAILED(setInitialize())) return;
+  const Result rc = setGetSystemLanguage(&code);
+  setExit();
+  if (R_FAILED(rc)) return;
+  char language[sizeof code + 1]{};
+  memcpy(language, &code, sizeof code);
+  string patterns;
+  if (!readText("romfs:/date-patterns.tsv", patterns)) return;
+  patterns.insert(0, 1, '\n');
+  for (string locale = language; !locale.empty();) {
+    const string key = "\n" + locale + "\t";
+    const size_t match = patterns.find(key);
+    if (match != string::npos) {
+      const size_t start = match + key.size();
+      dateFormat = patterns.substr(start, patterns.find('\n', start) - start);
+      return;
+    }
+    const size_t parent = locale.rfind('-');
+    if (parent == string::npos) break;
+    locale.resize(parent);
+  }
+}
+static string formatLastPlayedDate(const Json* saved) {
+  if (!saved) return "";
+  struct tm date{};
+  if (saved->isNum() && saved->n > 0 && saved->n < 253402300800.0) {
+    TimeCalendarTime local{};
+    TimeCalendarAdditionalInfo info{};
+    if (R_SUCCEEDED(timeToCalendarTimeWithMyRule((u64)saved->n, &local, &info))) {
+      date.tm_year = local.year - 1900;
+      date.tm_mon = local.month - 1;
+      date.tm_mday = local.day;
+    } else {
+      const time_t when = (time_t)saved->n;
+      if (!gmtime_r(&when, &date)) return "";
+    }
+  } else if (saved->isStr() && saved->s.size() == 8) {
+    int year, month, day;
+    if (sscanf(saved->s.c_str(), "%2d/%2d/%2d", &year, &month, &day) != 3 ||
+        year < 0 || month < 1 || month > 12 || day < 1 || day > 31) return "";
+    date.tm_year = year + 100;  // the old UTC date stores only the year within this century
+    date.tm_mon = month - 1;
+    date.tm_mday = day;
+  } else {
+    return "";
+  }
+  char label[64];
+  return strftime(label, sizeof label, dateFormat.c_str(), &date) ? label : "";
+}
+static const string& lastPlayedLabel(const string& name) {
+  auto [it, inserted] = lastPlayedLabels.try_emplace(name);
+  if (inserted) it->second = formatLastPlayedDate(lastPlayedDates.get(name));
+  return it->second;
+}
 static string playLabel(const string& name) {
   double sec = playSeconds(name);
   if (sec <= 0) return "";
@@ -637,6 +751,14 @@ static void flushPlaytime(const string& name) {
   playAccumSec = 0;
   if (!writeText(PLAYTIME(), playtime.dump())) record("Play time save failed");
 }
+static u64 romAddedTime(const string& path) {
+  FsFileSystem* fs = nullptr;
+  char translated[FS_MAX_PATH];
+  FsTimeStampRaw stamp{};
+  if (fsdevTranslatePath(path.c_str(), &fs, translated) != 0 ||
+      R_FAILED(fsFsGetFileTimeStampRaw(fs, translated, &stamp)) || !stamp.is_valid) return 0;
+  return stamp.created;
+}
 // Games in dir and its subfolders (hidden folders skipped; at most 6 levels; from the SD card's
 // root the app and system folders are left out).
 static void scanGames(const string& dir, int depth, vector<Rom>& found) {
@@ -649,7 +771,7 @@ static void scanGames(const string& dir, int depth, vector<Rom>& found) {
     bool isDir = e->d_type == DT_DIR;
     if (e->d_type == DT_UNKNOWN) { struct stat st; isDir = stat((dir + "/" + n).c_str(), &st) == 0 && S_ISDIR(st.st_mode); }
     if (isDir) subdirs.push_back(n);
-    else if (isRomExt(n)) found.push_back(Rom{n, dir});
+    else if (isRomExt(n)) found.push_back(Rom{n, dir, romAddedTime(dir + "/" + n)});
   }
   closedir(d);
   if (depth >= 6) return;
@@ -821,6 +943,11 @@ static int phaseN = 0, sessionLog = 0;
 static double swapAcc = 0, waitAcc = 0, swapMax = 0;
 static int swapN = 0;
 static double audioInCount = 0;  // audio frames the core produced (per-second stats)
+static bool adaptiveAudio = true;
+static double outputTempo = 1.0, minAudioQueue = 0;
+static unsigned audioRefills = 0;
+extern std::atomic<float> sw2_output_tempo __attribute__((weak));
+extern int sw2_audio_stretch __attribute__((weak));
 static double lastSwap = 0, tickMs = 1000.0 / 60, audioRatio = 1, pendEma = 2, statsAt = 0, workMs = 0, startedAt = 0;
 static int emuCount = 0, ratioTicks = 0;
 static string statsText;
@@ -856,6 +983,15 @@ static bool highRefresh() {
 }
 static void resetRewind() { rewind_clear(); }
 static void setAudioRatio(double r) { if (r != audioRatio) { audioRatio = r; C->set_audio_ratio(r); } }
+static void setOutputTempo(double tempo) {
+  outputTempo = tempo;
+  if (&sw2_output_tempo) sw2_output_tempo.store((float)tempo, std::memory_order_relaxed);
+}
+static void resetAudioMeasurements() {
+  audioRefills = 0;
+  minAudioQueue = AUDIO_TARGET_FRAMES[audioBuffer];
+}
+
 static void resetClock() { shownHead = shownCount = 0; resetGraph(); lastSwap = 0; }
 
 /* ---------------- Battery saves and save states ---------------- */
@@ -929,56 +1065,6 @@ static int newestSlot() {
   int best = 0; double bestT = 0;
   for (int n = 1; n <= SLOT_COUNT; n++) { double t = slotTime(n); if (t > bestT) { bestT = t; best = n; } }
   return best ? best : 1;
-}
-
-/* ---------------- Cheats ---------------- */
-// SNES Game Genie ("XXXX-XXXX") and Pro Action Replay ("XXXXXXXX") codes,
-// decoded and applied by Snes9x's cheat engine.
-static string normCode(const string& in) {
-  string t;
-  for (char c : in) if (isxdigit((unsigned char)c) || c == '-' || c == ':') t += (char)toupper((unsigned char)c);
-  return t;
-}
-static bool codeValid(const string& c) { return !c.empty() && C->cheat_valid(c.c_str()); }
-static int applyCheats() {
-  if (!running) return 0;
-  vector<string> on; vector<const char*> ptrs;
-  for (auto& c : running->cheats) if (c.on && codeValid(c.code)) on.push_back(c.code);
-  for (auto& c : on) ptrs.push_back(c.c_str());
-  return C->set_cheats(ptrs.data(), (int)ptrs.size());
-}
-static void saveCheats() {
-  Json a = Json::array();
-  for (auto& c : running->cheats) { Json o = Json::object(); o.set("code", Json::string(c.code)); o.set("desc", Json::string(c.desc)); o.set("on", Json::boolean(c.on)); a.a.push_back(o); }
-  if (!writeText(running->base + ".cheats.json", a.dump())) record("Cheats save failed");
-}
-static void loadCheats(const string& romName, const string& romDir) {
-  running->cheats.clear(); running->patches.clear();
-  string t; Json j;
-  if (readText(running->base + ".cheats.json", t) && Json::parse(t, j) && j.isArr())
-    for (auto& c : j.a) {
-      const Json* code = c.get("code");
-      if (!code || !code->isStr() || !codeValid(code->s)) continue;
-      const Json* d = c.get("desc"); const Json* on = c.get("on");
-      running->cheats.push_back(Cheat{code->s, d && d->isStr() ? d->s : "", on && on->isBool() && on->b});
-    }
-  // Codes next to the ROM: <game>.gg, one "CODE description" per line.
-  if (readText(romDir + "/" + stripNes(romName) + ".gg", t)) {
-    size_t pos = 0;
-    while (pos <= t.size()) {
-      size_t e = t.find('\n', pos); if (e == string::npos) e = t.size();
-      string line = t.substr(pos, e - pos); pos = e + 1;
-      while (!line.empty() && isspace((unsigned char)line.back())) line.pop_back();
-      size_t s = 0; while (s < line.size() && isspace((unsigned char)line[s])) s++;
-      size_t k = s; while (k < line.size() && !isspace((unsigned char)line[k])) k++;
-      string code = normCode(line.substr(s, k - s));
-      if (!codeValid(code)) continue;
-      string desc = line.substr(k); size_t ds = desc.find_first_not_of(" \t"); desc = ds == string::npos ? "" : desc.substr(ds);
-      if (desc.size() > 40) desc.resize(40);
-      bool have = false; for (auto& c : running->cheats) if (c.code == code) have = true;
-      if (!have) running->cheats.push_back(Cheat{code, desc, false});
-    }
-  }
 }
 
 /* ---------------- ROM checks ---------------- */
@@ -1233,18 +1319,24 @@ static void startGame(const Rom& rom) {
   if (readText(running->settingsBase + ".settings.json", t) && Json::parse(t, j) && j.type == Json::OBJ) { setGameValuesJson(j); running->perGame = true; }
   recentGames.erase(std::remove(recentGames.begin(), recentGames.end(), rom.name), recentGames.end());
   recentGames.insert(recentGames.begin(), rom.name);
+  playHistory.erase(std::remove(playHistory.begin(), playHistory.end(), rom.name), playHistory.end());
+  playHistory.insert(playHistory.begin(), rom.name);
+  const time_t playedAt = time(nullptr);
+  if (playedAt > 0) {
+    lastPlayedDates.set(rom.name, Json::number((double)playedAt));
+    lastPlayedLabels.erase(rom.name);
+  }
   if ((int)recentGames.size() > RECENT_MAX) recentGames.resize(RECENT_MAX);
   saveSettings();
   applyEmuOptions();
-  loadCheats(rom.name, rom.dir);
-  if (applyCheats()) showToast("Cheats active");
   fitPicture(); crtKey.clear(); applyCrt();
   hintUntil = nowMs() + 6000;
   bootedFrames = 0;
   if (autoLoadState) loadState(true, newestSlot());
   resetClock(); mode = "running"; comboLatch = true;
   resetRewind(); emuAcc = 0; ffLatched = false; fastForward = false;
-  setAudioRatio(1); audioInteg = 0; pendEma = AUDIO_TARGET_FRAMES[audioBuffer];
+  setAudioRatio(1); setOutputTempo(1); resetAudioMeasurements();
+  audioInteg = 0; pendEma = AUDIO_TARGET_FRAMES[audioBuffer];
   audio::prefill(AUDIO_TARGET_FRAMES[audioBuffer]); ratioTicks = 0; emuCount = 0; workMs = 0; statsAt = nowMs(); startedAt = statsAt;
   frameDrawn = false; statsText.clear(); sessionLog = 0;
   running->sramCheck = nowMs();
@@ -1429,18 +1521,46 @@ static int crtChoiceIndex() { for (size_t i = 0; i < CRT_CHOICES.size(); i++) if
 static vector<string> crtChoiceNames() { vector<string> v; for (int id : CRT_CHOICES) v.push_back(CRT_STYLES[id]); return v; }
 
 static void openMenu();
-static void openCodeEditor();
 static void rebuildSettings();
 static void openCheatsMenu() {
-  vector<MenuItem> items;
-  for (size_t i = 0; i < running->cheats.size(); i++) {
-    Cheat& c = running->cheats[i];
-    items.push_back(opt(c.code + (c.desc.empty() ? "" : "  " + c.desc), [] { return OFF_ON; },
-                        [i] { return running->cheats[i].on ? 1 : 0; }, [i](int v) { running->cheats[i].on = v != 0; },
-                        [] { applyCheats(); saveCheats(); }));
+  vector<Ps2Cheat> catalog;
+  const string pnachPath = ps2core_cheats(catalog);
+  if (pnachPath.empty()) {
+    showToast("Cheats are available once the PS2 disc is identified");
+    return;
   }
-  items.push_back(act("Add code", [] { openCodeEditor(); }));
-  if (!running->cheats.empty()) items.push_back(act("Remove last code", [] { running->cheats.pop_back(); applyCheats(); saveCheats(); openCheatsMenu(); }));
+
+  const string selectionPath = pnachPath + ".enabled";
+  string text;
+  readText(selectionPath, text);
+  auto enabled = std::make_shared<vector<string>>();
+  std::istringstream input(text);
+  for (string name; std::getline(input, name);) enabled->push_back(std::move(name));
+
+  vector<MenuItem> items;
+  for (const auto& cheat : catalog) {
+    items.push_back(opt(cheat.name, [] { return OFF_ON; },
+      [enabled, cheat] { return contains(*enabled, cheat.name) ? 1 : 0; },
+      [enabled, cheat, selectionPath](int value) {
+        auto selected = *enabled;
+        selected.erase(std::remove(selected.begin(), selected.end(), cheat.name), selected.end());
+        if (value) selected.push_back(cheat.name);
+        string text;
+        for (const auto& name : selected) text += name + "\n";
+        if (!writeText(selectionPath, text)) {
+          showToast("Could not save cheat selection");
+          return;
+        }
+        *enabled = std::move(selected);
+        ps2core_reload_cheats();
+        if (cheat.bootOnly && value) showToast("This cheat applies when the game restarts");
+      }));
+  }
+  items.push_back(act(catalog.empty() ? "No matching cheats. Add a PNACH file" : "Add a PNACH file...",
+    [pnachPath] {
+      showMessage("Copy a PNACH file with [named cheat] sections to:\n\n" +
+                  pnachPath + "\n\nThen restart the game.", [] { mode = "menu"; });
+    }));
   items.push_back(act("Back", [] { openMenu(); }));
   showMenuItems("Cheats", items);
 }
@@ -1556,7 +1676,7 @@ static vector<MenuItem> menuItemsFor(int cat, bool adv) {
     static const vector<string> CTL = {"Pair controllers", "Player 1 buttons", "Player 2 buttons", "Multitap (players 3-4)", "Player 3 buttons", "Player 4 buttons", "Use Settings buttons", "Reset buttons to standard"};
     auto catOf = [](const string& l) { return contains(EMU, l) ? 1 : contains(PIC, l) ? 2 : contains(CTL, l) ? 3 : 0; };
     const bool ownLayout = running && gamePadMaps.count(running->name), multitap = running && multitapFor(running->name);
-    for (auto& m : items) if (m.label != "Run-ahead" && m.label != "Cheats..." && (m.label != "Use Settings buttons" || ownLayout) &&
+    for (auto& m : items) if (m.label != "Run-ahead" && (m.label != "Use Settings buttons" || ownLayout) &&
                              (multitap || (m.label != "Player 3 buttons" && m.label != "Player 4 buttons")) && (adv || !contains(ADVANCED_MENU, m.label)) && catOf(m.label) == cat) kept.push_back(m);
     items = kept;
   }
@@ -1582,31 +1702,6 @@ static void cycleMenuOption(int dir) {
   o.set((o.get() + dir + n) % n);
   auto after = o.after;  // a copy: it may rebuild the menu (Advanced options), freeing o
   if (after) after();
-}
-
-/* ---------------- Cheat code editor ---------------- */
-// Eight hex digits; Y switches between Game Genie (XXXX-XXXX) and Pro Action
-// Replay (XXXXXXXX). Left/Right move, Up/Down change the digit.
-static const char* HEX = "0123456789ABCDEF";
-static int ggLetters[8], ggPos = 0, ggType = 0;  // 0 Game Genie, 1 Pro Action Replay
-static void openCodeEditor() { for (int i = 0; i < 8; i++) ggLetters[i] = 0; ggPos = 0; ggType = 0; mode = "ggedit"; }
-static string ggEditCode() {
-  string s; for (int i = 0; i < 8; i++) { if (ggType == 0 && i == 4) s += '-'; s += HEX[ggLetters[i]]; }
-  return s;
-}
-static void closeCodeEditor() { mode = "menu"; openCheatsMenu(); }
-static void handleCodeEditor(const Nav& ev) {
-  if (ev.pressed & B_LEFT) ggPos = std::max(0, ggPos - 1);
-  if (ev.pressed & B_RIGHT) ggPos = std::min(7, ggPos + 1);
-  if (ev.up) ggLetters[ggPos] = (ggLetters[ggPos] + 1) % 16;
-  if (ev.down) ggLetters[ggPos] = (ggLetters[ggPos] + 15) % 16;
-  if (ev.pressed & B_Y) ggType ^= 1;
-  if (ev.pressed & B_A) {
-    string code = ggEditCode();
-    if (!codeValid(code)) { showToast("That code is not valid"); return; }
-    running->cheats.push_back(Cheat{code, "", true}); applyCheats(); saveCheats(); showToast("Code " + code + " added");
-    closeCodeEditor();
-  } else if (ev.pressed & B_B) closeCodeEditor();
 }
 
 /* ---------------- ROM folder picker ---------------- */
@@ -1690,7 +1785,7 @@ static vector<SettingItem> settingsItems() {
         else if (!debugLog && logFile && !autoTest) { fclose(logFile); logFile = nullptr; }
       }},
       {"BIOS folder", [] { return vector<string>{biosDir.rfind("sdmc:", 0) == 0 ? biosDir.substr(5) : biosDir}; }, [] { return 0; }, [](int) { openFolderPicker(true); }},
-      {"Resolution (next start)", [] { return RESOLUTIONS; }, [] { return ps2Resolution; }, [](int v) { ps2Resolution = v; }},
+      {"Resolution", [] { return RESOLUTIONS; }, [] { return ps2Resolution; }, [](int v) { ps2Resolution = v; }},
       {"Emulated CPU speed (next start)", [] { return EE_SPEEDS; }, [] { return ps2EeSpeed; }, [](int v) { ps2EeSpeed = v; }},
       {"Emulated CPU cycle skip (next start)", [] { return CYCLE_SKIPS; }, [] { return ps2CycleSkip; }, [](int v) { ps2CycleSkip = v; }},
       {"Vibration", [] { return VIB_LEVELS; }, [] { return vibLevel; }, [](int v) { vibLevel = v; }},
@@ -1744,7 +1839,7 @@ static bool resetArmed = false;
 static const vector<string> SETTINGS_CATS = {"Emulation", "Picture", "Sound & controls", "App"};
 static int settingsCat = 0;  // settingsIndex -1: the cursor is on the category tabs
 static int settingsCatOf(const string& label) {
-  static const vector<string> EMU = {"Resolution (next start)", "Emulated CPU speed (next start)", "Emulated CPU cycle skip (next start)", "Switch 2 CPU clock (next start)", "Auto-load save state"};
+  static const vector<string> EMU = {"Resolution", "Emulated CPU speed (next start)", "Emulated CPU cycle skip (next start)", "Switch 2 CPU clock (next start)", "Auto-load save state"};
   static const vector<string> PIC = {"Aspect", "Scale", "Overscan", "Signal", "Shader", "Brightness boost", "Curvature", "Corner radius", "Corner softness", "Vignette", "Vignette size", "Display", "Frame delay (60 Hz)"};
   static const vector<string> SND = {"Volume", "Audio buffer", "Vibration", "Pair controllers", "Player 1 buttons", "Player 2 buttons", "Multitap (players 3-4)", "Player 3 buttons", "Player 4 buttons", "Reset button mapping"};
   return contains(EMU, label) ? 0 : contains(PIC, label) ? 1 : contains(SND, label) ? 2 : 3;  // the rest: App
@@ -1923,17 +2018,19 @@ static void drawBrowser() {
   float cx = x + padX, cy = y + padY;
   panelHeader(cx, cy, "SW2PS2", roms.empty() ? "" : std::to_string(roms.size()) + (roms.size() == 1 ? " game" : " games"));
   cy += 34 + 12;
+  const string sortHint = string(singleJoyConConnected ? "Press stick: " : "Press Left Stick: ") + ROM_SORT_LABELS[romSortByView[listView]];
+  textMid(sortHint, cx + innerW - gfx::textWidth(sortHint, 16), cy, 36, 16, col(C_DIM));
   drawTabBar(cx, cy, LIST_VIEWS, listView, focusArea == "tabs" ? listView : -1);  // (L and R cycle them)
   cy += 36 + 10;
   // Column headings
-  // Columns from the right: Time played, Recent, Favourite (centred tags).
-  const float TIME_W = 150, REC_W = 100, FAV_W = 110;
-  const float colR = cx + listInnerW - 18, recC = colR - TIME_W - REC_W / 2, favC = recC - REC_W / 2 - FAV_W / 2;
+  // Columns from the right: Time played, Last Played, Favourite.
+  const float metadataW = 128;
+  const float timeC = cx + listInnerW - 18 - metadataW / 2;
+  const float playedC = timeC - metadataW, favC = playedC - metadataW;
   if (!roms.empty()) {
     gfx::text("Game", cx + 22, cy + 1, 14, col(C_DIM), gfx::BOLD);
-    float hw = gfx::textWidth("Time played", 14, gfx::BOLD);
-    gfx::text("Time played", colR - hw, cy + 1, 14, col(C_DIM), gfx::BOLD);
-    gfx::text("Recent", recC - gfx::textWidth("Recent", 14, gfx::BOLD) / 2, cy + 1, 14, col(C_DIM), gfx::BOLD);
+    gfx::text("Time Played", timeC - gfx::textWidth("Time Played", 14, gfx::BOLD) / 2, cy + 1, 14, col(C_DIM), gfx::BOLD);
+    gfx::text("Last Played", playedC - gfx::textWidth("Last Played", 14, gfx::BOLD) / 2, cy + 1, 14, col(C_DIM), gfx::BOLD);
     gfx::text("Favourite", favC - gfx::textWidth("Favourite", 14, gfx::BOLD) / 2, cy + 1, 14, col(C_DIM), gfx::BOLD);
   }
   cy += head;  // (kept with no games too: the window keeps its size)
@@ -1949,20 +2046,17 @@ static void drawBrowser() {
       float ry = cy + 6 + i * ROW_H, rx = cx + 6, rw = listInnerW - 12;
       bool active = top + i == selected && focusArea == "list";
       if (active) { gfx::rect(rx, ry, rw, ROW_H, col(C_SEL), 6); gfx::rect(rx, ry, 4, ROW_H, col(C_ACCENT), 2); }
-      bool fav = contains(favourites, r.name), rec = contains(recentGames, r.name);
+      bool fav = contains(favourites, r.name);
       string played = playLabel(r.name);
-      if (!played.empty()) { float pw = gfx::textWidth(played, 16); textMid(played, rx + rw - 12 - pw, ry, ROW_H, 16, col(C_DIM)); }
+      if (!played.empty()) textMid(played, timeC - gfx::textWidth(played, 16) / 2, ry, ROW_H, 16, col(C_DIM));
       if (fav) {
         float tw = gfx::textWidth("Favourite", 14) + 16;
         gfx::rect(favC - tw / 2, ry + 9, tw, 22, gfx::rgb(0xf2c94c), 4);
         textMid("Favourite", favC - tw / 2 + 8, ry + 9, 22, 14, gfx::rgb(0x1a1300));
       }
-      if (rec) {
-        float tw = gfx::textWidth("Recent", 14) + 16;
-        gfx::rect(recC - tw / 2, ry + 9, tw, 22, Color{0, 0, 0, 0}, 4, 1, col(C_LINE));
-        textMid("Recent", recC - tw / 2 + 8, ry + 9, 22, 14, col(C_DIM));
-      }
-      textMid(gfx::ellipsize(stripNes(r.name), favC - FAV_W / 2 - rx - 28, 20), rx + 16, ry, ROW_H, 20, col(C_TEXT));
+      const string& date = lastPlayedLabel(r.name);
+      if (!date.empty()) textMid(date, playedC - gfx::textWidth(date, 16) / 2, ry, ROW_H, 16, col(C_DIM));
+      textMid(gfx::ellipsize(stripNes(r.name), favC - metadataW / 2 - rx - 28, 20), rx + 16, ry, ROW_H, 20, col(C_TEXT));
     }
     gfx::noClip();
     scrollbar(cx + listInnerW + 8, cy, listH, (int)roms.size(), VIS, top);
@@ -2155,28 +2249,6 @@ static void drawMenu() {
   if (n > vis) scrollbar(cx + listW + 8, cy, listH, n, vis, menuTop);
 }
 
-static void drawCodeEditor() {
-  gfx::rect(0, 0, gfx::UI_W, gfx::UI_H, gfx::Color{0, 0, 0, 0.6f});
-  string code = ggEditCode();
-  string info = string(ggType == 0 ? "Game Genie" : "Pro Action Replay") + "   " + code + (codeValid(code) ? "" : "   (not valid)");
-  string help = "Left/Right: move   Up/Down: digit   Y: code type   A: save   B: cancel";
-  float cellsW = 8 * 52, w = std::max(cellsW, gfx::textWidth(help, 16)) + 56, h = 24 + 24 * LH + 16 + 54 + 14 + 2 * 16 * LH + 24;
-  float x = (gfx::UI_W - w) / 2, y = roundf((gfx::UI_H - h) / 2);
-  gfx::rect(x, y, w, h, col(C_PANEL), 14, 1, col(C_LINE));
-  string title = "Enter cheat code";
-  gfx::text(title, x + (w - gfx::textWidth(title, 24, gfx::BOLD)) / 2, y + 22, 24, col(C_TEXT), gfx::BOLD);
-  float cy = y + 24 + 24 * LH + 16, cx = x + (w - cellsW) / 2;
-  for (int i = 0; i < 8; i++) {
-    float bx = cx + i * 52 + 4;
-    gfx::rect(bx, cy, 44, 54, col(C_BG), 6, 2, col(i == ggPos ? C_ACCENT : C_LINE));
-    string s(1, HEX[ggLetters[i]]);
-    textMid(s, bx + (44 - gfx::textWidth(s, 30, gfx::MONO)) / 2, cy, 54, 30, col(C_TEXT), gfx::MONO);
-  }
-  cy += 54 + 14;
-  gfx::text(info, x + (w - gfx::textWidth(info, 16)) / 2, cy, 16, col(C_DIM));
-  gfx::text(help, x + (w - gfx::textWidth(help, 16)) / 2, cy + 16 * LH, 16, col(C_DIM));
-}
-
 static void drawMessage() {
   gfx::rect(0, 0, gfx::UI_W, gfx::UI_H, gfx::Color{0, 0, 0, 0.75f});
   vector<string> lines = wrap(messageText, 700, 22);
@@ -2210,7 +2282,23 @@ static bool emulateShown(int p, int p2, int ahead, bool keepAudio) {
   if (pendingLoadSlot && !stateLoadReady()) {
     if (++pendingLoadTries > 3600) { record("state: slot %d not loaded: the game had not started after 60 s", pendingLoadSlot); showToast("State load failed"); pendingLoadSlot = 0; }
   } else if (pendingLoadSlot) {
-    if (C->state_load(pendingLoadSize)) { C->audio_reset(); record("state: slot %d loaded after %d frames", pendingLoadSlot, pendingLoadTries); showToast("Loaded slot " + std::to_string(pendingLoadSlot)); pendingLoadSlot = 0; }
+    if (C->state_load(pendingLoadSize)) {
+      C->audio_reset();
+      record("state: slot %d loaded after %d frames", pendingLoadSlot, pendingLoadTries);
+      showToast("Loaded slot " + std::to_string(pendingLoadSlot));
+      pendingLoadSlot = 0;
+      if (autoTest && autoAwaitingState) {
+        autoAwaitingState = false;
+        autoRunStart = statsAt = nowMs();
+        autoTestEnd = autoRunStart + autoMeasureSeconds * 1000;
+        sessionLog = emuCount = 0;
+        workMs = audioInCount = 0;
+        resetAudioMeasurements();
+        for (double& stage : phase) stage = 0;
+        phaseN = 0;
+        record("autotest: measuring %.1f s from loaded state", autoMeasureSeconds);
+      }
+    }
     else if (++pendingLoadTries > 4800) { record("state: slot %d refused for 20 s", pendingLoadSlot); showToast("State load failed"); pendingLoadSlot = 0; }
   }
   if (!keepAudio) C->set_audio_discard(1);
@@ -2303,6 +2391,7 @@ static void runFrame(u64 bits, u64 bits2, bool behindMenu) {
     else { C->set_audio_discard(1); ok = C->frame(p, p2, 0) >= 0; C->audio_take(); C->set_audio_discard(0); }
     if (!ok) { quitGame(); showMessage("Something went wrong:\nEmulation stopped.", [] { mode = "browser"; }); return; }
     emuCount++;
+    if (autoTest && !autoAwaitingState) autoMeasuredFrames++;
     // Rewind history: every frame.
     if (rewindOn && snapsReady) rewind_push();
   }
@@ -2312,14 +2401,23 @@ static void runFrame(u64 bits, u64 bits2, bool behindMenu) {
     // base ratio (60 Hz: display/NES rate difference; 120 Hz: 1, emulation
     // follows the clock). Corrections stay within +-0.5%, inaudible as pitch.
     double target = AUDIO_TARGET_FRAMES[audioBuffer];
-    pendEma += (audio::queuedFrames() - pendEma) * 0.05;
+    const double queued = audio::queuedFrames();
+    pendEma += (queued - pendEma) * 0.05;
     double err = (target - pendEma) / target;
     audioInteg = std::max(-0.004, std::min(0.004, audioInteg + err * 0.00002));
     double base = (hz120 || highRefresh()) ? 1.0 : NES_RATE / std::max(59.5, std::min(60.5, 1000.0 / tickMs));
     double r = base * (1 + std::max(-0.005, std::min(0.005, err * 0.004 + audioInteg)));
     if (++ratioTicks >= 4) { ratioTicks = 0; setAudioRatio(round(r * 1e5) / 1e5); }
-    // Ran dry (a long stall): refill with a little silence instead of crackling.
-    if (audio::queuedFrames() < 200) { audio::prefill((int)target / 2); pendEma = target / 2; }
+    // A sustained shortage is larger than the drift trim can cover. Ask SoundTouch
+    // to extend playback while preserving pitch and leave the emulation clock alone.
+    if (adaptiveAudio && &sw2_output_tempo && &sw2_audio_stretch && sw2_audio_stretch && !fastForward) {
+      const double pressure = pendEma / target - 0.8;
+      const double correction = std::abs(pressure) > 0.08 ? pressure * 0.32 : 0;
+      setOutputTempo(std::clamp(outputTempo + correction * std::min(loopGapMs, 50.0) / 1000.0, 0.78, 1.0));
+    }
+    minAudioQueue = std::min(minAudioQueue, queued);
+    // Refill after a long stall.
+    if (queued < 200) { audioRefills++; audio::prefill((int)target / 2); pendEma = target / 2; }
   }
   emuFrames += 1;
   showFrame();
@@ -2360,11 +2458,11 @@ extern "C" __attribute__((weak)) void sw2ax_crash_watch(int);
 extern "C" __attribute__((weak)) void sw2ax_iop_stats(char*, size_t);
 extern "C" __attribute__((weak)) void sw2ax_event_stats(unsigned long long*);
 extern "C" __attribute__((weak)) void sw2ax_event_sources(char*, size_t);
+extern bool sw2_trace_ee_events __attribute__((weak));
 extern "C" __attribute__((weak)) void sw2ax_memory(unsigned*, unsigned*, unsigned*);
 extern "C" __attribute__((weak)) void sw2ax_frame_counts(unsigned long long*, unsigned long long*, unsigned long long*);
 extern "C" __attribute__((weak)) int sw2_smc_off;
 extern "C" __attribute__((weak)) int sw2_softprot;
-extern int sw2_audio_stretch __attribute__((weak));
 extern "C" __attribute__((weak)) unsigned long long sw2_softprot_stats[4];
 extern int sw2_iop_thread __attribute__((weak));
 extern int sw2_iop_lag __attribute__((weak));
@@ -2706,11 +2804,13 @@ static u64 autoButtonBits(const string& n) {
 static int autoRun = 0;
 static void startGame(const Rom& rom);
 static int autoShaderPrev = -1;  // the player's shader while a test run overrides it
+static int autoAudioBufferDefault = 1;
 static bool autoStartRun() {
   const Json* runs = autoJson.get("runs");
   Json one = Json::object();
   const Json* j = runs && runs->isArr() ? (autoRun < (int)runs->a.size() ? &runs->a[autoRun] : nullptr) : (autoRun == 0 ? &one : nullptr);
   if (!j) return false;
+  audioBuffer = pick(j->get("audioBuffer"), AUDIO_BUFFERS.size(), autoAudioBufferDefault);
   const Json* g = j->get("game") ? j->get("game") : autoJson.get("game"); const Json* sl = j && j->get("slot") ? j->get("slot") : autoJson.get("slot"); const Json* sec = autoJson.get("seconds");
   int slot = sl && sl->isNum() ? (int)sl->n : 1; double seconds = sec && sec->isNum() ? sec->n : 20;
   ps2Renderer = pick(j->get("renderer"), RENDERERS.size(), 0); ps2Resolution = pick(j->get("resolution"), RESOLUTIONS.size(), 0);
@@ -2720,6 +2820,10 @@ static bool autoStartRun() {
   cpuClock = pick(j->get("clock"), CPU_CLOCKS.size(), 2);  // 0 normal, 1 boost mode, 2 maximum
   gpuClock = pick(j->get("gpu"), GPU_CLOCKS.size(), 0);
   if (&sw2_prof_gs) { const Json* pg = j->get("profgs"); sw2_prof_gs = pg && pg->isBool() && pg->b; }
+  if (&sw2_trace_ee_events) {
+    const Json* trace = j->get("traceEvents");
+    sw2_trace_ee_events = trace && trace->isBool() && trace->b;
+  }
   if (sw2ax_crash_watch) { const Json* cw = j->get("crashwatch"); sw2ax_crash_watch(cw && cw->isBool() && cw->b ? autoRunBase + autoRun + 1 : 0); }  // file per run
   { const Json* mc = j->get("memclock"); memClockMax = mc && mc->isBool() && mc->b; memClockMhz = mc && mc->isNum() ? (int)mc->n : 0; }
   { const Json* gm = j->get("gpumhz"); gpuClockMhz = gm && gm->isNum() ? (int)gm->n : 0; }
@@ -2731,7 +2835,8 @@ static bool autoStartRun() {
   if (&sw2_iop_thread) { const Json* it = j->get("iopthread"); sw2_iop_thread = !(it && it->isBool() && !it->b); }  // default on
   if (&sw2_smc_off) { const Json* so = j->get("smcoff"); sw2_smc_off = so && so->isBool() && so->b; }  // test only
   if (&sw2_vuaot) { const Json* va = j->get("vuaot"); sw2_vuaot = va && va->isBool() && va->b; }
-  if (&sw2_audio_stretch) { const Json* st = j->get("stretch"); if (st && st->isBool()) sw2_audio_stretch = st->b ? 1 : 0; }
+  { const Json* adapt = j->get("adaptiveAudio"); adaptiveAudio = !adapt || !adapt->isBool() || adapt->b; }
+  if (&sw2_audio_stretch) { const Json* st = j->get("stretch"); sw2_audio_stretch = st && st->isBool() ? st->b : adaptiveAudio; }
   { const Json* ms = j->get("measured"); skipMeasured = ms && ms->isBool() && !ms->b; }
   { const Json* at = j->get("autotune"); autoTuneTest = at && at->isBool() ? (at->b ? 1 : 0) : -1; }
   if (&sw2_softprot) { const Json* sp = j->get("softprot"); sw2_softprot = !(sp && sp->isBool() && !sp->b); }  // default on
@@ -2763,8 +2868,20 @@ static bool autoStartRun() {
     record("autotest: shader %s", SHADERS[shader].c_str());
   }
   record("autotest: running (%s)", toastText.c_str());
-  autoTestEnd = nowMs() + seconds * 1000; sessionLog = 0;
-  autoRunStart = nowMs(); autoShots.clear();
+  const Json* measure = j->get("measureAfterLoad");
+  const bool measureAfterLoad = slot > 0 && measure && measure->isBool() && measure->b;
+  if (measureAfterLoad && !pendingLoadSlot && toastText != "Loaded slot " + std::to_string(slot)) {
+    record("autotest: failed to load slot %d for measurement", slot);
+    quitGame();
+    return false;
+  }
+  autoMeasureSeconds = seconds;
+  autoAwaitingState = measureAfterLoad && pendingLoadSlot;
+  autoMeasuredFrames = 0;
+  autoRunStart = nowMs();
+  autoTestEnd = autoRunStart + (autoAwaitingState ? 65 : seconds) * 1000;
+  sessionLog = 0;
+  autoShots.clear();
   { const Json* ps = j->get("playerStats"); autoPlayerStats = ps && ps->isBool() && ps->b; }
   autoMenuLoadAt = -1; autoMenuLoadStage = 0; autoLiveRes.clear(); autoEarlyLoadAt = -1; autoMenuOpenAt = -1; autoSaveAt = -1;
   if (const Json* sv = j->get("saveState")) if (sv->isArr() && sv->a.size() == 2 && sv->a[0].isNum() && sv->a[1].isNum()) { autoSaveAt = sv->a[0].n; autoSaveSlot = (int)sv->a[1].n; }
@@ -2846,6 +2963,14 @@ static void handleUi(u64 bits) {
   u64 pressed = ev.pressed;
   double t = nowMs();
   if (mode == "browser") {
+    if (pressed & (HidNpadButton_StickL | (singleJoyConConnected ? (u64)HidNpadButton_StickR : 0))) {
+      exitArmed = 0;
+      int& romSort = romSortByView[listView];
+      romSort = (romSort + 1) % ROM_SORT_LABELS.size();
+      orderRoms();
+      saveSettings();
+      return;
+    }
     // L/ZL and R/ZR cycle the All/Favourites/Recent tabs from anywhere.
     int tabStep = ((pressed & (B_R | HidNpadButton_ZR)) ? 1 : 0) - ((pressed & (B_L | HidNpadButton_ZL)) ? 1 : 0);
     if (tabStep) {
@@ -2992,9 +3117,10 @@ static void handleUi(u64 bits) {
       if (pressed & B_LEFT) cycleMenuOption(-1);
       if (pressed & (B_RIGHT | B_A)) cycleMenuOption(1);
     } else if (pressed & B_A) item.action();
-    if ((pressed & B_B) && mode == "menu") closeMenu();
-  } else if (mode == "ggedit") {
-    handleCodeEditor(ev);
+    if ((pressed & B_B) && mode == "menu") {
+      if (menuHasTabs) closeMenu();
+      else openMenu();
+    }
   } else if (mode == "message") {
     if (pressed & (B_A | B_B)) { mode = "browser"; auto then = messageThen; messageThen = nullptr; if (then) then(); }
   }
@@ -3097,6 +3223,8 @@ int main(int argc, char** argv) {
     }
   }
   loadSettings();
+  autoAudioBufferDefault = audioBuffer;
+  loadDateFormat();
   loadPlaytime();
   rebuildSettings();
   scan();
@@ -3189,9 +3317,18 @@ int main(int argc, char** argv) {
       captureName = nm; captureRequested = true; autoShots.erase(autoShots.begin());
     }
     if (autoTest && !autoWaiting && (!running || nowMs() > autoTestEnd)) {
+      const double elapsed = (nowMs() - autoRunStart) / 1000;
       profStop();
+      if (autoAwaitingState || !running)
+        record("autotest: run %d measurement incomplete", autoRun);
+      else {
+        record("autotest: run %d measured %.3f s, %u frame calls (%.3f calls/s)",
+               autoRun, elapsed, autoMeasuredFrames, autoMeasuredFrames / elapsed);
+        record("autotest: audio refills %u, minimum queue %.1f ms, final tempo %.3f",
+               audioRefills, minAudioQueue / 48.0, outputTempo);
+      }
       record("autotest: run %d done", autoRun);
-      if (sw2ax_event_sources) { char es[900]; sw2ax_event_sources(es, sizeof es); record("%s", es); }
+      if (sw2ax_event_sources && (!&sw2_trace_ee_events || sw2_trace_ee_events)) { char es[900]; sw2ax_event_sources(es, sizeof es); record("%s", es); }
       if (&sw2_softprot_stats) record("softprot: %s, pages protected %llu, write-map hits %llu, DMA clears %llu, queued clears %llu", sw2_softprot ? "on" : "off", sw2_softprot_stats[0], sw2_softprot_stats[1], sw2_softprot_stats[2], sw2_softprot_stats[3]);
       if (autoShaderPrev >= 0) { shader = autoShaderPrev; autoShaderPrev = -1; }  // before quitGame saves anything
       if (running) quitGame();
@@ -3218,7 +3355,9 @@ int main(int argc, char** argv) {
         if (!autoAgent) { quitApp = true; break; }
         // Agent: release the log for reading, say so with a marker file, and wait for the next test.
         if (logFile) { fclose(logFile); logFile = nullptr; }
-        writeText(string(DATA_DIR) + "/autotest.finished", "done\n");
+        const Json* testId = autoJson.get("testId");
+        const string marker = testId && testId->isStr() ? "done " + testId->s : "done";
+        writeText(string(DATA_DIR) + "/autotest.finished", marker + " reuse-log\n");
         autoWaiting = true; autoWaitSince = nowMs(); autoPollAt = 0;
       }
     }
@@ -3231,8 +3370,33 @@ int main(int argc, char** argv) {
         autoPollAt = tw + 700;
         string nt; Json nj;
         if (readText(string(DATA_DIR) + "/autotest.json", nt) && Json::parse(nt, nj) && nj.type == Json::OBJ) {
-          // Start again from the top (in the named build, or this one) to run it.
           const Json* nro = nj.get("nro");
+          const Json* reuse = nj.get("reuse");
+          if (!nro && reuse && reuse->isBool() && reuse->b) {
+            const Json* testId = nj.get("testId");
+            if (!testId || !testId->isStr() || testId->s.empty() || testId->s.size() > 32 ||
+                testId->s.find_first_not_of("0123456789-") != string::npos) continue;
+            const string request = string(DATA_DIR) + "/autotest.json";
+            const string consumed = string(DATA_DIR) + "/autotest.done.json";
+            remove(consumed.c_str());
+            if (rename(request.c_str(), consumed.c_str()) != 0) continue;
+            const string path = string(DATA_DIR) + "/autotest-" + testId->s + ".log";
+            logFile = fopen(path.c_str(), "w");
+            if (!logFile) {
+              writeText(string(DATA_DIR) + "/autotest.finished", "cannot write test log " + testId->s + "\n");
+              continue;
+            }
+            if (!autoReuseLogPath.empty()) remove(autoReuseLogPath.c_str());
+            autoReuseLogPath = path;
+            autoJson = std::move(nj);
+            autoRun = autoRunBase = 0;
+            autoWaiting = false;
+            record("autotest: request %s", autoJson.get("testId")->s.c_str());
+            record("autotest: reusing running build '%s' (agent)", appSelfPath.c_str());
+            autoStartRun();
+            continue;
+          }
+          // A request naming a different build requires a Homebrew Loader handoff.
           string self = argc > 0 && argv[0] ? argv[0] : "", want = nro && nro->isStr() && !nro->s.empty() ? string(DATA_DIR) + "/" + nro->s : self;
           Result rc = envHasNextLoad() ? envSetNextLoad(want.c_str(), ("\"" + want + "\"").c_str()) : -1;
           if (R_FAILED(rc)) writeText(string(DATA_DIR) + "/autotest.finished", "cannot restart: the homebrew loader has no next-load support\n");
@@ -3240,8 +3404,8 @@ int main(int argc, char** argv) {
         }
       }
       gfx::beginFrame(col(C_BG));
-      gfx::text("SW2PS2 test agent", 60, 60, 34, col(C_TEXT), gfx::BOLD);
-      gfx::text("Waiting for the next test from the computer. Hold + to exit.", 60, 120, 22, col(C_DIM));
+      gfx::text("SW2PS2 tests complete", 60, 60, 34, col(C_TEXT), gfx::BOLD);
+      gfx::text("Waiting for another test request. Press + to exit.", 60, 120, 22, col(C_DIM));
       gfx::endFrame(0);
       continue;
     }
@@ -3254,7 +3418,7 @@ int main(int argc, char** argv) {
     loopGapMs = loopStartPrev ? tb - loopStartPrev : 16.69;  // time since the previous refresh
     loopStartPrev = tb;
     { static int glGen = 0; if (gfx::generation() != glGen) { glGen = gfx::generation(); crtKey.clear(); applyCrt(); resetGraph(); } }  // GL was built again
-    bool gameView = running && (mode == "running" || mode == "menu" || mode == "ggedit" || mode == "remap");
+    bool gameView = running && (mode == "running" || mode == "menu" || mode == "remap");
     gfx::beginFrame(gameView ? gfx::Color{0, 0, 0, 1} : col(C_BG));
     double tc = nowMs();
     // 120 Hz / VRR: present once per SNES frame (60.0988 Hz, the same rate as the NES) on a clock, so a
@@ -3288,12 +3452,11 @@ int main(int argc, char** argv) {
     double t = nowMs();
     if (toastUntil && t > toastUntil) toastUntil = 0;
     if (hintUntil && t > hintUntil) hintUntil = 0;
-    if (gameView != (running && (mode == "running" || mode == "menu" || mode == "ggedit" || mode == "remap"))) gfx::beginFrame(running ? gfx::Color{0, 0, 0, 1} : col(C_BG));
-    if (running && (mode == "running" || mode == "menu" || mode == "ggedit" || mode == "remap")) {
+    if (gameView != (running && (mode == "running" || mode == "menu" || mode == "remap"))) gfx::beginFrame(running ? gfx::Color{0, 0, 0, 1} : col(C_BG));
+    if (running && (mode == "running" || mode == "menu" || mode == "remap")) {
       drawGame(mode != "running");
       if (mode == "menu") drawMenu();
       if (mode == "remap") { if (dimInMenu) gfx::rect(0, 0, gfx::UI_W, gfx::UI_H, gfx::Color{0, 0, 0, 0.6f}); drawRemap(); }
-      if (mode == "ggedit") drawCodeEditor();
     } else if (mode == "settings") drawSettings();
     else if (mode == "remap") drawRemap();
     else if (mode == "folders") drawFolderPicker();
@@ -3342,7 +3505,8 @@ int main(int argc, char** argv) {
     lastSwap = after;
     if (!vrrNext && lastGapForFree > 3 && lastGapForFree < 40) freeTickMs = freeTickMs ? freeTickMs + (lastGapForFree - freeTickMs) * 0.05 : lastGapForFree;
     pollDisplay(after);
-    if (running && (mode == "running" || (mode == "menu" && !pauseInMenu))) playAccumSec += std::min(loopGapMs, 100.0) / 1000.0;
+    if (!autoTest && running && (mode == "running" || (mode == "menu" && !pauseInMenu)))
+      playAccumSec += std::min(loopGapMs, 100.0) / 1000.0;
     if (running && after - playSavedAt >= 300000) { playSavedAt = after; flushPlaytime(running->name); }
     swapAcc += gfx::swapMs; waitAcc += gfx::waitMs; swapN++; if (gfx::swapMs > swapMax) swapMax = gfx::swapMs;
     updateStats(after);

@@ -144,8 +144,6 @@ static long stateSave() {
 static char* stateBuffer(long n) { if (n <= 0) return NULL; state.resize(n); return state.data(); }
 static int stateLoad(long n) { InCore in; return ps2_state_load(state.data(), n); }
 static int runahead(int, int, int) { return -1; }
-static int setCheats(const char**, int) { return 0; }
-static int cheatValid(const char*) { return 0; }
 
 const CoreApi PS2_CORE = {
     "ARMSX2", ".armsx2",  // (state files carry the tag: the earlier LRPS2 core's were another format)
@@ -153,7 +151,7 @@ const CoreApi PS2_CORE = {
     setAudio, setAudioRatio, audioTake, audioData, audioReset, setAudioDiscard,
     video, videoPitch, width, height,
     hasBattery, sram, sramSize, stateSave, stateBuffer, stateLoad,
-    runahead, setCheats, cheatValid,
+    runahead,
 };
 
 // Rewind does not exist on this core (see core.h).

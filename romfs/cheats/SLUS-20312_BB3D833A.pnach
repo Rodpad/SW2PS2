@@ -1,0 +1,11 @@
+gametitle=Final Fantasy X (North America)
+// https://gamehacking.org/?format=cb1&game=103736&hacker=all
+
+[Translate Al Bhed Dialogue]
+description=Unlocks all 26 translations.
+patch=1,EE,70319FF0,extended,0010FFFF
+patch=1,EE,70319FF2,extended,001003FF
+
+[99,999,999 Gil]
+description=Sets the party's Gil to 99,999,999.
+patch=1,EE,0031A028,word,05F5E0FF
