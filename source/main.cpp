@@ -2581,6 +2581,7 @@ extern "C" __attribute__((weak)) int sw2_smc_off;
 extern "C" int sw2_mfifo_precise_notify __attribute__((weak));
 extern "C" int sw2_vu_kick_light __attribute__((weak));
 extern "C" int sw2_iop_ee_nofence __attribute__((weak));
+extern "C" int sw2_no_gs_hooks __attribute__((weak));
 extern "C" __attribute__((weak)) int sw2_softprot;
 extern "C" __attribute__((weak)) unsigned long long sw2_softprot_stats[4];
 extern int sw2_iop_thread __attribute__((weak));
@@ -3052,6 +3053,7 @@ static bool autoStartRun() {
   const Json* preciseMfifo = j->get("mfifoPreciseNotify");
   if (&sw2_mfifo_precise_notify) sw2_mfifo_precise_notify = !preciseMfifo || !preciseMfifo->isBool() || preciseMfifo->b;
   const Json* kickLight = j->get("vuKickLight");
+  { const Json* gh = j->get("noGsHooks"); if (&sw2_no_gs_hooks) sw2_no_gs_hooks = gh && gh->isBool() && gh->b; }
   { const Json* nf = j->get("iopNoFence"); if (&sw2_iop_ee_nofence) sw2_iop_ee_nofence = !(nf && nf->isBool() && !nf->b); }
   if (&sw2_vu_kick_light) sw2_vu_kick_light = kickLight && kickLight->isNum() ? (int)kickLight->n : kickLight && kickLight->isBool() && !kickLight->b ? 0 : 2;  // 2 default, 1 fenced, 0 always kick
   if (&sw2_softprot) { const Json* sp = j->get("softprot"); sw2_softprot = !(sp && sp->isBool() && !sp->b); }  // default on

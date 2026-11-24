@@ -390,6 +390,8 @@ extern "C" void sw2ax_frame_counts(unsigned long long* shown, unsigned long long
 // so after a crash that kills the app the file says where every thread was. Image addresses are
 // given as offsets from the module base (0x8000000 at run time, as the ELF is linked at 0).
 #include <malloc.h>
+#include "pcsx2/R5900.h"
+#include "pcsx2/R3000A.h"
 static Thread s_cw_thread; static volatile bool s_cw_on = false; static Handle s_cw_main = 0; static int s_cw_run = 0;
 static void CrashWatchMain(void*)
 {
@@ -423,6 +425,9 @@ static void CrashWatchMain(void*)
 					(unsigned long long)(used >> 20), (unsigned long long)(total >> 20), mi.uordblks >> 20, mi.fordblks >> 20);
 				for (const Sample& smp : last)
 					fprintf(f, "thread %x pc %llx lr %llx\n", smp.h, (unsigned long long)smp.pc, (unsigned long long)smp.lr);
+				// The emulated CPUs (racy reads, for a hint only): where the game's own code was.
+				fprintf(f, "ee pc %08x cycle %u ra %08x | iop pc %08x cycle %u\n", cpuRegs.pc, cpuRegs.cycle,
+					cpuRegs.GPR.n.ra.UL[0], psxRegs.pc, psxRegs.cycle);
 				fclose(f);
 			}
 		}
