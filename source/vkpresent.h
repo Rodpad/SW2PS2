@@ -12,5 +12,12 @@ bool active();                // a device is up
 // The core's latest frame in host memory (RGBA, w pixels per row), copied when it is new.
 const uint32_t* grab(int* w, int* h);  // nullptr: nothing newer finished yet (keep the picture)
 unsigned slotWaits();         // times a new frame found both copy slots busy
+struct HandoffStats {
+  uint64_t copies, bytes, uploads, submitsNs, waitsNs, mapNs, uploadNs, maxUploadNs;
+};
+void measureHandoff(bool enabled);
+bool measuringHandoff();
+void recordUpload(uint64_t ns);
+HandoffStats handoffStats();
 void end();                   // after the core unloads: the device and what was made on it
 }

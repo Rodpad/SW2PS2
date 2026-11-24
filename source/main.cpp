@@ -20,6 +20,12 @@
 #include <string>
 #include <vector>
 
+#if __has_include("iteration_build_id.h")
+#include "iteration_build_id.h"
+#else
+#define SW2_ITERATION_ID "manual"
+#endif
+
 #include "audio.h"
 #include "core.h"
 
@@ -111,12 +117,16 @@ static const vector<string> VOLUMES = {"0%", "10%", "20%", "30%", "40%", "50%", 
 static const vector<string> FILTERS = {"Off", "Soft", "Strong"};
 static const vector<string> LIST_VIEWS = {"All", "Favourites", "Recent"};
 static const int RECENT_MAX = 5, SLOT_COUNT = 4;
+static const vector<string> EE_WAIT_CHOICES = {"0.125x (384)", "0.25x (768)", "0.5x (1536)", "0.75x (2304)", "1x (3072)", "2x (6144)", "4x (12288)", "8x (24576)", "16x (49152)", "32x (98304)"};
+static const vector<uint32_t> EE_WAIT_VALUES = {384, 768, 1536, 2304, 3072, 6144, 12288, 24576, 49152, 98304};
+extern "C" uint32_t sw2_ee_wait_cycles;
 
 /* ---------------- State ---------------- */
 // Defaults (the author's chosen setup, 2026-11-14).
 static int aspectMode = 2, scaleMode = 1, cropMode = 0, crtStyle = 0, paletteMode = 0, statsLevel = 0;
 static int runAhead = 0, frameDelay = 0, audioBuffer = 1, displayMode = 1, ffMode = 0, ffSpeed = 1;
 static bool rewindOn = false;
+static bool sw2_audio_panic_refill = true;
 // PS2 options (apply when a game starts).
 #ifdef SW2_VK
 static const vector<string> RENDERERS = {"GPU (Vulkan)", "Software", "GPU (OpenGL)"};  // Vulkan first: the default (a saved "GPU" becomes Vulkan)
@@ -128,6 +138,9 @@ static const char* RESOLUTION_VALUES[3] = {"1x (Native)", "2x", "4x"};
 static const int RESOLUTION_SCALE[3] = {1, 2, 4};
 static const vector<string> EE_SPEEDS = {"100%", "75%", "60%", "50%"};
 static const vector<string> FPU_MODES = {"Fast", "Exact"};
+static const vector<string> BLENDING_LEVELS = {"Minimum", "Basic", "Medium", "High", "Full", "Maximum"};
+static std::map<string, int> gameBlending;  // 0 = default, 1-6 = BLENDING_LEVELS
+extern int sw2_blending_explicit __attribute__((weak));
 // GPU readbacks, per game: Accurate (default) waits for the GPU each time; Fast is the core's
 // "Unsynchronized" download mode (Armored Core 3 28 -> 38 fps) but breaks games that build effects
 // from read-back frames (Ico's glow came out as dark horizontal bars).
@@ -251,7 +264,7 @@ static bool runningHw = false;  // the running game is on a GPU renderer (resolu
 static bool showAdvanced = false;  // default: hidden (also after Reset all settings)
 static const vector<string> ADVANCED_SETTINGS = {"Debug logging", "Emulated CPU speed (next start)", "CPU boost mode (next start)", "Scale", "Overscan", "Signal", "Curvature", "Corner radius", "Corner softness", "Vignette", "Vignette size",
     "Brightness boost", "Stats", "Run-ahead", "Frame delay (60 Hz)", "Audio buffer", "Display", "Fast-forward speed", "Dim game in menu", "Audio filter", "Turbo speed"};
-static const vector<string> ADVANCED_MENU = {"Run-ahead", "Stats", "Scale", "Overscan", "Signal", "Curvature", "Corner radius", "Corner softness", "Vignette",
+static const vector<string> ADVANCED_MENU = {"Run-ahead", "Stats", "Scale", "Overscan", "Signal", "Curvature", "Corner radius", "Corner softness", "Vignette", "Blending accuracy",
     "Vignette size", "Brightness boost", "Settings for", "Resolution"};
 static int cornerRadius = 0, cornerSoftness = 1, vignette = 0, vignetteSize = 0, curvature = 0, shader = 6, signalMode = 0, boost = 0;
 // Button mapping per player (Switch A, B, X, Y, L, R -> FACE_CHOICES).
@@ -338,11 +351,45 @@ static const char* switchButtonName(int bit) {
 }
 // Automated test (autotest.json, see main): overrides apply to one run and are not saved.
 static bool autoTest = false, autoAgent = false, autoWaiting = false;
+static double autoActivityNext = 0;
+static bool autoActivityLogged = false;
+static bool autoFixedSettings = false;
+static int autoCycleSkip = 0;
+extern "C" void sw2ax_vk_test_options(bool, unsigned, bool, bool, bool, bool) __attribute__((weak));
+extern "C" void sw2ax_vk_test_counters(uint64_t*) __attribute__((weak));
+extern "C" void sw2ax_vk_trace_pass_ends(bool) __attribute__((weak));
+extern "C" uint64_t sw2ax_vk_pass_end_summary(unsigned*, unsigned*, unsigned) __attribute__((weak));
+extern "C" void sw2ax_vk_target_break_summary(unsigned*, unsigned*) __attribute__((weak));
+extern "C" void sw2ax_trace_vu0_blocks(bool) __attribute__((weak));
+extern "C" void sw2ax_trace_spr(bool) __attribute__((weak));
+extern "C" void sw2ax_spr_counts(uint64_t*) __attribute__((weak));
+extern "C" void sw2ax_trace_frame_work(bool) __attribute__((weak));
+extern "C" uint64_t sw2ax_frame_work_counts(uint64_t*) __attribute__((weak));
+extern "C" void sw2ax_trace_vif_copies(bool) __attribute__((weak));
+extern "C" void sw2ax_vif_copy_counts(uint64_t*) __attribute__((weak));
+extern "C" void sw2ax_trace_vu_notifications(bool) __attribute__((weak));
+extern "C" void sw2ax_vu_notification_counts(uint64_t*) __attribute__((weak));
+static bool autoMeasureVulkan = false;
+static bool autoTraceVuNotifications = false;
+static bool autoTraceVifCopies = false;
+static bool autoTraceFrameWork = false;
+static bool autoTraceSpr = false;
+static bool autoTracePassEnds = false;
+static bool autoMeasureHandoff = false;
+static uint64_t autoVulkanStart[9];
 static string autoReuseLogPath;
 static double autoTestEnd = 0, autoWaitSince = 0, autoPollAt = 0;
+static unsigned long long autoHeartbeat = 0;
 static double autoMeasureSeconds = 0;
 static bool autoAwaitingState = false;
+static bool autoProfileAfterLoad = false;
+static void profStart();
 static unsigned autoMeasuredFrames = 0;
+static vector<float> autoFrameGaps;
+static vector<float> autoGameIntervals;
+static double autoPrevSwap = 0;
+static constexpr double AUTO_LOW_WARMUP_MS = 3000;
+static bool autoLowWindowStarted = false, autoSkipFirstGameInterval = false;
 static vector<std::pair<string, string>> autoOptions;  // extra core options for the current test run
 static string autoLabel;
 static std::deque<std::pair<double, int>> autoLiveRes;
@@ -358,6 +405,8 @@ static double autoMenuOpenAt = -1;  // "menuOpen": seconds: open the in-game men
 static double autoEarlyLoadAt = -1; static int autoEarlyLoadSlot = 1;  // "earlyLoad": [seconds, slot]: Load state straight after boot, no menu
 static double autoMenuLoadAt = -1; static int autoMenuLoadSlot = 1, autoMenuLoadStage = 0;  // "menuLoad": [seconds, slot]: open the menu, then Load state from it
 static vector<double> autoShots;  // seconds into the run at which to take screenshots ("shots")
+static int autoGameShotTarget = 0, autoGameShotFrames = 0;
+static bool autoGameShotPriming = false;
 static double autoRunStart = 0;  // shown at the bottom of the screen during a test run
 static int coreLogLines = 0;
 static void record(const char* fmt, ...) {
@@ -488,6 +537,7 @@ static Json settingsJson(const GameVals& g) {
   j.set("display", Json::number(displayMode)); j.set("rewind", Json::boolean(rewindOn)); j.set("ffMode", Json::number(ffMode)); j.set("ffSpeed", Json::number(ffSpeed));
   j.set("ps2Renderer", Json::number(ps2Renderer)); j.set("ps2Resolution", Json::number(ps2Resolution)); j.set("ps2EeSpeed", Json::number(ps2EeSpeed)); j.set("ps2Fpu", Json::number(ps2Fpu)); j.set("ps2CycleSkip", Json::number(ps2CycleSkip));
   { Json rb = Json::object(); for (auto& kv : gameReadback) if (kv.second) rb.set(kv.first, Json::number(kv.second)); j.set("gameReadback", rb); }
+  { Json b = Json::object(); for (auto& kv : gameBlending) if (kv.second) b.set(kv.first, Json::number(kv.second)); j.set("gameBlending", b); }
   { Json r = Json::object(), k = Json::object(); for (auto& kv : gameRate) if (kv.second) r.set(kv.first, Json::number(kv.second)); for (auto& kv : gameSkip) if (kv.second) k.set(kv.first, Json::number(kv.second)); j.set("gameRate", r); j.set("gameSkip", k);
     Json rs = Json::object(); for (auto& kv : gameRes) if (kv.second) rs.set(kv.first, Json::number(kv.second)); j.set("gameRes", rs); j.set("res1x", Json::boolean(true)); j.set("debugLog", Json::boolean(debugLog));
     for (int pl = 0; pl < 4; pl++) { Json m = Json::array(); for (int i = 0; i < 16; i++) m.a.push_back(Json::number(padMap[pl][i])); j.set("padMap" + std::to_string(pl + 1), m); }
@@ -547,6 +597,7 @@ static void applySettingsJson(const Json& v) {
 
   if (const Json* r = v.get("gameRate")) if (r->type == Json::OBJ) { gameRate.clear(); for (auto& kv : r->o) if (kv.second.isNum()) gameRate[kv.first] = pick(&kv.second, EE_SPEEDS.size() + 1, 0); }
   if (const Json* r = v.get("gameReadback")) if (r->type == Json::OBJ) { gameReadback.clear(); for (auto& kv : r->o) if (kv.second.isNum()) gameReadback[kv.first] = pick(&kv.second, 3, 0); }
+  if (const Json* r = v.get("gameBlending")) if (r->type == Json::OBJ) { gameBlending.clear(); for (auto& kv : r->o) if (kv.second.isNum()) gameBlending[kv.first] = pick(&kv.second, BLENDING_LEVELS.size() + 1, 0); }
   if (const Json* r = v.get("gameRes")) if (r->type == Json::OBJ) { gameRes.clear(); for (auto& kv : r->o) if (kv.second.isNum()) gameRes[kv.first] = pick(&kv.second, RESOLUTIONS.size() + 1, 0); }
   if (!v.get("zfastDefault") && shader == 2) shader = 6;  // zfast CRT became the default shader (2026-11-19); once, for settings saved on the old default
   if (const Json* d = v.get("debugLog")) if (d->isBool()) debugLog = d->b;
@@ -820,7 +871,7 @@ static void fitPicture() {
   int vw = gfx::SCREEN_W, vh = gfx::SCREEN_H;
   int lw = logW(), lh = logH(), kx = W / lw, ky = H / lh;
   int cx = cropMode >= 1 ? 8 : 0, cy = cropMode >= 2 ? 8 : 0, cw = lw - 2 * cx, ch = lh - 2 * cy;
-  const bool wide = running && contains(widescreenGames, running->name) && aspectMode == 2;  // 4:3 becomes 16:9 for a widescreen game
+  const bool wide = running && !autoFixedSettings && contains(widescreenGames, running->name) && aspectMode == 2;  // 4:3 becomes 16:9 for a widescreen game
   double par = (aspectMode == 1 || wide) ? (16.0 / 9.0) * ch / cw : aspectMode == 2 ? (4.0 / 3.0) * ch / cw : 1, sx, sy;
   if (scaleMode == 0 && vh >= ch && vw >= cw) {
     int maxX = vw / cw, maxY = vh / ch;
@@ -851,7 +902,12 @@ static void showFrame() {
 #ifdef SW2_VK
   if (ps2core_vulkan()) {  // the core's Vulkan frame, copied to host memory (vkpresent)
     int vw = 0, vh = 0;
-    if (const uint32_t* px = vkp::grab(&vw, &vh)) gfx::pictureUpload(picture, px, vw, vh, vw);
+    if (const uint32_t* px = vkp::grab(&vw, &vh)) {
+      const bool measure = vkp::measuringHandoff();
+      const uint64_t start = measure ? armGetSystemTick() : 0;
+      gfx::pictureUpload(picture, px, vw, vh, vw);
+      if (measure) vkp::recordUpload(armTicksToNs(armGetSystemTick() - start));
+    }
     gfx::pictureSetFrameCount(picture, (float)emuFrames);
     return;
   }
@@ -1221,7 +1277,7 @@ static void startGame(const Rom& rom) {
   bool gpu = ps2Renderer == 0;
   const bool vulkan = false;
 #endif
-  const int res = effectiveRes(rom.name);
+  const int res = autoFixedSettings ? ps2Resolution : effectiveRes(rom.name);
   renderScale = gpu || vulkan ? RESOLUTION_SCALE[res] : 1;
   const char* gpuErr = nullptr;
   if (gpu && !ps2core_use_gpu(true, renderScale, &gpuErr)) { record("GPU renderer unavailable: %s", gpuErr ? gpuErr : "?"); gpu = false; renderScale = 1; }
@@ -1232,14 +1288,21 @@ static void startGame(const Rom& rom) {
   ps2core_option("pcsx2_renderer", gpu ? "OpenGL" : "Software (SW)");
   ps2core_option("pcsx2_upscale_multiplier", gpu || vulkan ? RESOLUTION_VALUES[res] : "1x (Native)");
   ps2core_option("pcsx2_sw_renderer_threads", "3");
-  int rate = effectiveRate(rom.name), skip = effectiveSkip(rom.name);
+  const int rate = autoFixedSettings ? ps2EeSpeed : effectiveRate(rom.name);
+  const int skip = autoFixedSettings ? autoCycleSkip : effectiveSkip(rom.name);
   tuneQuietUntil = nowMs() + 12000; slowNoticeShown = false; tuneWin.clear();
   ps2core_option("pcsx2_ee_cycle_rate", EE_SPEED_VALUES[rate]);
   ps2core_option("pcsx2_ee_cycle_skip", CYCLE_SKIP_VALUES[skip]);
   ps2core_option("pcsx2_hw_download_mode", fastReadback(rom.name) ? "Unsynchronized" : "Accurate");
-  ps2core_option("armsx2_multitap", multitapFor(rom.name) ? "enabled" : "disabled");  // players 3-4
-  ps2core_option("pcsx2_widescreen_hint", contains(widescreenGames, rom.name) ? "enabled (16:9)" : "disabled");  // the core's patch, for games without their own widescreen setting
+  { auto it = gameBlending.find(rom.name); int b = !autoFixedSettings && it != gameBlending.end() ? it->second : 0;
+    // Default: the game database decides (its recommended level, minimum and caps) over a Basic base;
+    // a level the player chose is used as it is
+    if (&sw2_blending_explicit) sw2_blending_explicit = b > 0 ? 1 : 0;
+    ps2core_option("armsx2_blending_accuracy", b > 0 ? BLENDING_LEVELS[b - 1].c_str() : "Basic"); }
+  ps2core_option("armsx2_multitap", !autoFixedSettings && multitapFor(rom.name) ? "enabled" : "disabled");  // players 3-4
+  ps2core_option("pcsx2_widescreen_hint", !autoFixedSettings && contains(widescreenGames, rom.name) ? "enabled (16:9)" : "disabled");
   for (auto& o : autoOptions) ps2core_option(o.first.c_str(), o.second.c_str());
+  if (autoFixedSettings) ps2core_option("armsx2_cheats", "disabled");
   {  // leak check across game starts
     size_t jb = 0; int jn = memjit_live_regions(&jb);
     u64 used = 0, total = 0;
@@ -1316,7 +1379,7 @@ static void startGame(const Rom& rom) {
   if (readText(slotsPath(), t) && Json::parse(t, j) && j.type == Json::OBJ) running->slots = j;
   stateSlot = autoLoadState ? newestSlot() : 1;
   running->globalVals = gameValues(); running->perGame = false;
-  if (readText(running->settingsBase + ".settings.json", t) && Json::parse(t, j) && j.type == Json::OBJ) { setGameValuesJson(j); running->perGame = true; }
+  if (!autoFixedSettings && readText(running->settingsBase + ".settings.json", t) && Json::parse(t, j) && j.type == Json::OBJ) { setGameValuesJson(j); running->perGame = true; }
   recentGames.erase(std::remove(recentGames.begin(), recentGames.end(), rom.name), recentGames.end());
   recentGames.insert(recentGames.begin(), rom.name);
   playHistory.erase(std::remove(playHistory.begin(), playHistory.end(), rom.name), playHistory.end());
@@ -1332,7 +1395,7 @@ static void startGame(const Rom& rom) {
   fitPicture(); crtKey.clear(); applyCrt();
   hintUntil = nowMs() + 6000;
   bootedFrames = 0;
-  if (autoLoadState) loadState(true, newestSlot());
+  if (autoLoadState && !autoTest) loadState(true, newestSlot());
   resetClock(); mode = "running"; comboLatch = true;
   resetRewind(); emuAcc = 0; ffLatched = false; fastForward = false;
   setAudioRatio(1); setOutputTempo(1); resetAudioMeasurements();
@@ -1590,6 +1653,17 @@ static void applyReadbackLive() {
   const bool f = fastReadback(running->name); ps2core_option("pcsx2_hw_download_mode", f ? "Unsynchronized" : "Accurate");
   record("live: %s GPU readbacks %s", running->name.c_str(), f ? "Fast" : "Accurate");
 }
+static void applyBlendingChoice(int b) {
+  if (&sw2_blending_explicit) sw2_blending_explicit = b > 0 ? 1 : 0;  // Default (0): the game database decides, over Basic
+  const string& level = BLENDING_LEVELS[b > 0 ? b - 1 : 1];
+  ps2core_option("armsx2_blending_accuracy", level.c_str());
+  record("live: %s blending accuracy %s", running->name.c_str(), b > 0 ? level.c_str() : "Default (game database, base Basic)");
+  if (b == 1) showToast("Minimum blending may change visual effects", 3500);
+}
+static void applyBlendingLive() {
+  const auto it = gameBlending.find(running->name);
+  applyBlendingChoice(it == gameBlending.end() ? 0 : it->second);
+}
 static void openRemap(int player, bool forGame);
 static void pairControllers();
 // The main in-game menu's rows for one category (adv: with the advanced ones).
@@ -1615,10 +1689,25 @@ static vector<MenuItem> menuItemsFor(int cat, bool adv) {
           [] { auto it = gameSkip.find(running->name); return it == gameSkip.end() ? 0 : it->second; },
           [](int v) { gameSkip[running->name] = v; },
           [] { saveSettings(); applySkipLive(); }),
+      opt("EE event wait", [] { return EE_WAIT_CHOICES; },
+          [] {
+            for (size_t i = 0; i < EE_WAIT_VALUES.size(); i++)
+              if (sw2_ee_wait_cycles == EE_WAIT_VALUES[i]) return (int)i;
+            return 4;
+          },
+          [](int v) {
+            if (v >= 0 && v < (int)EE_WAIT_VALUES.size()) {
+              sw2_ee_wait_cycles = EE_WAIT_VALUES[v];
+              record("live: %s EE event wait %s", running->name.c_str(), EE_WAIT_CHOICES[v].c_str());
+            }
+          }),
       opt("GPU readbacks", [] { return vector<string>{"Auto (Fast)", "Accurate", "Fast"}; },
           [] { auto it = gameReadback.find(running->name); return it != gameReadback.end() ? it->second : 0; },
           [](int v) { fastReadbackGames.erase(std::remove(fastReadbackGames.begin(), fastReadbackGames.end(), running->name), fastReadbackGames.end()); gameReadback[running->name] = v; },
           [] { saveSettings(); applyReadbackLive(); }),
+      opt("Blending accuracy", [] { vector<string> a = {"Default (game database)"}; for (const auto& x : BLENDING_LEVELS) a.push_back(x); return a; },
+          [] { auto it = gameBlending.find(running->name); return it == gameBlending.end() ? 0 : it->second; },
+          [](int v) { gameBlending[running->name] = v; }, [] { saveSettings(); applyBlendingLive(); }),
       opt("Switch 2 CPU clock", [] { return CPU_CLOCKS; }, [] { return cpuClock; }, [](int v) { cpuClock = v; },
           [] { saveSettings(); applySwitchClock(); record("live: Switch 2 CPU clock %s", CPU_CLOCKS[cpuClock].c_str()); }),
       opt("Resolution", [] { vector<string> a = {"Auto (" + RESOLUTIONS[ps2Resolution] + ")"}; for (auto& x : RESOLUTIONS) a.push_back(x); return a; },
@@ -1670,7 +1759,7 @@ static vector<MenuItem> menuItemsFor(int cat, bool adv) {
   };
   {
     vector<MenuItem> kept;
-    static const vector<string> EMU = {"PS2 CPU speed", "PS2 CPU cycle skip", "GPU readbacks", "Switch 2 CPU clock", "Resolution", "Widescreen", "Stats"};
+    static const vector<string> EMU = {"PS2 CPU speed", "PS2 CPU cycle skip", "EE event wait", "GPU readbacks", "Blending accuracy", "Switch 2 CPU clock", "Resolution", "Widescreen", "Stats"};
     static const vector<string> PIC = {"Aspect", "Scale", "Overscan", "Signal", "Shader", "Brightness boost", "Curvature", "Corner radius", "Corner softness",
                                        "Vignette", "Vignette size", "Settings for"};
     static const vector<string> CTL = {"Pair controllers", "Player 1 buttons", "Player 2 buttons", "Multitap (players 3-4)", "Player 3 buttons", "Player 4 buttons", "Use Settings buttons", "Reset buttons to standard"};
@@ -2288,15 +2377,38 @@ static bool emulateShown(int p, int p2, int ahead, bool keepAudio) {
       showToast("Loaded slot " + std::to_string(pendingLoadSlot));
       pendingLoadSlot = 0;
       if (autoTest && autoAwaitingState) {
+        autoActivityNext = 0;  // refresh during warmup, away from the measured window
         autoAwaitingState = false;
         autoRunStart = statsAt = nowMs();
-        autoTestEnd = autoRunStart + autoMeasureSeconds * 1000;
+        autoTestEnd = autoRunStart + AUTO_LOW_WARMUP_MS + autoMeasureSeconds * 1000;
         sessionLog = emuCount = 0;
         workMs = audioInCount = 0;
         resetAudioMeasurements();
+        pendEma = AUDIO_TARGET_FRAMES[audioBuffer];
+        audio::prefill(AUDIO_TARGET_FRAMES[audioBuffer]);
+        autoFrameGaps.clear();
+        autoGameIntervals.clear();
+        autoPrevSwap = 0;
+        autoLowWindowStarted = false;
+        autoSkipFirstGameInterval = false;
+        autoGameShotFrames = 0;
+        autoGameShotPriming = true;
+        if (autoMeasureVulkan && sw2ax_vk_test_counters) sw2ax_vk_test_counters(autoVulkanStart);
+        if (autoTracePassEnds && sw2ax_vk_trace_pass_ends) sw2ax_vk_trace_pass_ends(true);
+        if (autoTraceVuNotifications && sw2ax_trace_vu_notifications) sw2ax_trace_vu_notifications(true);
+        if (autoTraceVifCopies && sw2ax_trace_vif_copies) sw2ax_trace_vif_copies(true);
+        if (autoTraceFrameWork && sw2ax_trace_frame_work) sw2ax_trace_frame_work(true);
+        if (autoTraceSpr && sw2ax_trace_spr) sw2ax_trace_spr(true);
+#ifdef SW2_VK
+        if (autoMeasureHandoff) vkp::measureHandoff(true);
+#endif
         for (double& stage : phase) stage = 0;
         phaseN = 0;
-        record("autotest: measuring %.1f s from loaded state", autoMeasureSeconds);
+        record("autotest: measuring %.1f s after %.1f s warmup from loaded state", autoMeasureSeconds, AUTO_LOW_WARMUP_MS / 1000);
+        if (autoProfileAfterLoad) {
+          autoProfileAfterLoad = false;
+          profStart();
+        }
       }
     }
     else if (++pendingLoadTries > 4800) { record("state: slot %d refused for 20 s", pendingLoadSlot); showToast("State load failed"); pendingLoadSlot = 0; }
@@ -2411,13 +2523,17 @@ static void runFrame(u64 bits, u64 bits2, bool behindMenu) {
     // A sustained shortage is larger than the drift trim can cover. Ask SoundTouch
     // to extend playback while preserving pitch and leave the emulation clock alone.
     if (adaptiveAudio && &sw2_output_tempo && &sw2_audio_stretch && sw2_audio_stretch && !fastForward) {
-      const double pressure = pendEma / target - 0.8;
-      const double correction = std::abs(pressure) > 0.08 ? pressure * 0.32 : 0;
-      setOutputTempo(std::clamp(outputTempo + correction * std::min(loopGapMs, 50.0) / 1000.0, 0.78, 1.0));
+      const double ratio = std::clamp(pendEma / target, 0.80, 1.0);
+      const double targetTempo = ratio < 0.95 ? ratio : 1.0;
+      const double rate = (targetTempo < outputTempo) ? 2.5 : 0.8;
+      setOutputTempo(std::clamp(outputTempo + (targetTempo - outputTempo) * rate * std::min(loopGapMs, 50.0) / 1000.0, 0.80, 1.0));
     }
     minAudioQueue = std::min(minAudioQueue, queued);
-    // Refill after a long stall.
-    if (queued < 200) { audioRefills++; audio::prefill((int)target / 2); pendEma = target / 2; }
+    // Refill only on near-empty buffer with a small cushion to avoid silence blasts.
+    if (queued < 100) {
+      audioRefills++;
+      audio::prefill(240);
+    }
   }
   emuFrames += 1;
   showFrame();
@@ -2462,6 +2578,9 @@ extern bool sw2_trace_ee_events __attribute__((weak));
 extern "C" __attribute__((weak)) void sw2ax_memory(unsigned*, unsigned*, unsigned*);
 extern "C" __attribute__((weak)) void sw2ax_frame_counts(unsigned long long*, unsigned long long*, unsigned long long*);
 extern "C" __attribute__((weak)) int sw2_smc_off;
+extern "C" int sw2_mfifo_precise_notify __attribute__((weak));
+extern "C" int sw2_vu_kick_light __attribute__((weak));
+extern "C" int sw2_iop_ee_nofence __attribute__((weak));
 extern "C" __attribute__((weak)) int sw2_softprot;
 extern "C" __attribute__((weak)) unsigned long long sw2_softprot_stats[4];
 extern int sw2_iop_thread __attribute__((weak));
@@ -2471,7 +2590,7 @@ extern int sw2_no_pacing __attribute__((weak));
 extern int sw2_db_effects __attribute__((weak));
 extern int sw2_shader_log __attribute__((weak));
 extern "C" __attribute__((weak)) int sw2_prof_gs;
-extern "C" __attribute__((weak)) void sw2ax_classify_batch(const unsigned long long*, unsigned*, size_t);
+extern "C" __attribute__((weak)) void sw2ax_classify_batch(const unsigned long long*, const u32*, unsigned*, size_t);
 extern "C" __attribute__((weak)) void sw2ax_exit_trace(const char*);
 extern "C" __attribute__((weak)) void sw2ax_list_threads(const char*);
 extern "C" __attribute__((weak)) float sw2ax_internal_fps();
@@ -2644,7 +2763,13 @@ static void probeAliasing() {
 // (pcsx2/sw2_prof.h); this thread samples that, and the emulated program counter, about 5000
 // times a second from 4 s into a run. The totals go to the log when the run ends.
 #include <unordered_map>
-extern "C" { extern volatile unsigned sw2_prof_region; unsigned sw2_prof_pc(int iop); }
+extern "C" {
+extern volatile unsigned sw2_prof_region;
+unsigned sw2_prof_pc(int iop);
+extern bool sw2_gs_spin_wait;
+extern uint32_t sw2_ee_wait_cycles;
+void sw2_profiler_reset_handle();
+}
 extern "C" unsigned long long sw2_int_bits[33];
 static Thread profThread;
 static volatile bool profOn = false;
@@ -2657,8 +2782,12 @@ static std::unordered_map<u32, u32> profPc[2];
 extern "C" unsigned sw2_thread_handle(int i);
 extern "C" void sw2_absmem_stats(unsigned long long*, unsigned long long*, unsigned long long*, unsigned long long*);
 static std::unordered_map<u32, u32> profHost;
+static std::unordered_map<u64, u32> profHostCallers;
+static bool autoProfileCallers = false;
 static u64 profHostOut = 0, profHostTotal = 0;
 static std::unordered_map<u64, u32> profJit;  // host pcs outside the image (JIT)
+static std::unordered_map<u64, u32> profVu0Instructions;
+extern "C" bool sw2ax_vu0_sample(u64, u32*, u32*) __attribute__((weak));
 extern "C" u32 sw2_jit_guest_pc(u64 host, u64* block_start);
 static Handle profEE = 0;
 static Result profRc1 = 0, profRc2 = 0; static int profCtx = -1;
@@ -2687,10 +2816,21 @@ static void profMain(void*) {
         svcSetThreadActivity(profEE, ThreadActivity_Runnable);
         if (R_SUCCEEDED(r)) {
           u64 pc = tc.pc.x; profHostTotal++;
+          u32 vuOffset, vuInstruction;
+          if (sw2ax_vu0_sample && sw2ax_vu0_sample(pc, &vuOffset, &vuInstruction))
+            profVu0Instructions[(static_cast<u64>(vuOffset) << 32) | vuInstruction]++;
           // offsets from this function's runtime address (tools/hostpcs.py adds its link address)
           const u64 anchor = (u64)(void*)&profMain;
-          if (pc + 0x10000000ULL > anchor && pc < anchor + 0x10000000ULL) profHost[(u32)(pc - anchor + 0x10000000ULL)]++;
-          else { profHostOut++; profJit[pc]++; }
+          if (pc + 0x10000000ULL > anchor && pc < anchor + 0x10000000ULL) {
+            const u32 pcOffset = (u32)(pc - anchor + 0x10000000ULL);
+            profHost[pcOffset]++;
+            if (autoProfileCallers) {
+              const u64 lr = tc.lr;
+              const u32 lrOffset = lr + 0x10000000ULL > anchor && lr < anchor + 0x10000000ULL
+                  ? (u32)(lr - anchor + 0x10000000ULL) : 0xffffffffu;
+              profHostCallers[(u64(pcOffset) << 32) | lrOffset]++;
+            }
+          } else { profHostOut++; profJit[pc]++; }
         }
       }
     }
@@ -2703,7 +2843,8 @@ static void profMain(void*) {
 }
 static void profStart() {
   if (profStarted) return;
-  memset(profRegion, 0, sizeof profRegion); profPc[0].clear(); profPc[1].clear(); profHost.clear(); profJit.clear(); profHostOut = profHostTotal = 0; profEE = 0;
+  sw2_profiler_reset_handle();
+  memset(profRegion, 0, sizeof profRegion); profPc[0].clear(); profPc[1].clear(); profHost.clear(); profHostCallers.clear(); profJit.clear(); profVu0Instructions.clear(); profHostOut = profHostTotal = 0; profEE = 0;
   profOn = true;
   if (R_SUCCEEDED(threadCreate(&profThread, profMain, nullptr, nullptr, 0x10000, 0x20, 0)) && R_SUCCEEDED(threadStart(&profThread))) profStarted = true;
   else profOn = false;
@@ -2726,6 +2867,16 @@ static void profStop() {
   }
   { unsigned long long a, b3, c, d; sw2_absmem_stats(&a, &b3, &c, &d); record("adrp addressing: %llu near, %llu far; code %llx, data %llx", a, b3, c, d); }
   record("host pc sampling: ctx %d, thread %x, pause rc %x, context rc %x, samples %llu, anchor %p", profCtx, (unsigned)profEE, profRc1, profRc2, (unsigned long long)profHostTotal, (void*)&profMain);
+  if (!profVu0Instructions.empty()) {
+    vector<std::pair<u64, u32>> v(profVu0Instructions.begin(), profVu0Instructions.end());
+    std::sort(v.begin(), v.end(), [](auto& a, auto& c) { return a.second > c.second; });
+    line = "VU0 host instructions:";
+    for (size_t i = 0; i < v.size() && i < 100; i++) {
+      snprintf(b, sizeof b, " %x/%08x:%u", (unsigned)(v[i].first >> 32), (unsigned)v[i].first, v[i].second);
+      line += b;
+    }
+    record("%s", line.c_str());
+  }
   if (profHostTotal) {
     vector<std::pair<u32, u32>> v(profHost.begin(), profHost.end());
     std::sort(v.begin(), v.end(), [](auto& a, auto& c) { return a.second > c.second; });
@@ -2733,12 +2884,22 @@ static void profStop() {
     for (size_t i = 0; i < v.size() && i < 400; i++) { snprintf(b, sizeof b, " %x:%u", v[i].first, v[i].second); line += b; }
     record("%s", line.c_str());
   }
+  if (autoProfileCallers && !profHostCallers.empty()) {
+    vector<std::pair<u64, u32>> v(profHostCallers.begin(), profHostCallers.end());
+    std::sort(v.begin(), v.end(), [](auto& a, auto& c) { return a.second > c.second; });
+    line = "host caller pairs:";
+    for (size_t i = 0; i < v.size() && i < 3000; i++) {
+      snprintf(b, sizeof b, " %x/%x:%u", unsigned(v[i].first >> 32), unsigned(v[i].first), v[i].second);
+      line += b;
+    }
+    record("%s", line.c_str());
+  }
   if (!profJit.empty()) {  // JIT samples by block (EE blocks only; others show as guest 0)
     std::unordered_map<u64, std::pair<u32, u32>> byBlock;  // block start -> (guest pc, samples)
     if (sw2ax_classify_batch) {  // ARMSX2: EE block start PCs, other code by region (0xF000000r)
       vector<unsigned long long> pcs; vector<u32> cnt; for (auto& kv : profJit) { pcs.push_back(kv.first); cnt.push_back(kv.second); }
       vector<unsigned> out(pcs.size());
-      sw2ax_classify_batch(pcs.data(), out.data(), pcs.size());
+      sw2ax_classify_batch(pcs.data(), cnt.data(), out.data(), pcs.size());
       for (size_t i = 0; i < pcs.size(); i++) { auto& e = byBlock[out[i]]; e.first = out[i]; e.second += cnt[i]; }
     } else
     for (auto& kv : profJit) { u64 st = 0; u32 g = sw2_jit_guest_pc(kv.first, &st); auto& e = byBlock[st]; e.first = g; e.second += kv.second; }
@@ -2805,21 +2966,70 @@ static int autoRun = 0;
 static void startGame(const Rom& rom);
 static int autoShaderPrev = -1;  // the player's shader while a test run overrides it
 static int autoAudioBufferDefault = 1;
+static int autoDisplayDefault = 1;
+static int autoFrameDelayDefault = 0;
 static bool autoStartRun() {
   const Json* runs = autoJson.get("runs");
   Json one = Json::object();
   const Json* j = runs && runs->isArr() ? (autoRun < (int)runs->a.size() ? &runs->a[autoRun] : nullptr) : (autoRun == 0 ? &one : nullptr);
   if (!j) return false;
+  const Json* fixed = j->get("fixedSettings");
+  autoFixedSettings = fixed && fixed->isBool() && fixed->b;
+  autoCycleSkip = pick(j->get("cycleSkip"), CYCLE_SKIPS.size(), 0);
+  frameDelay = autoFixedSettings ? 0 : autoFrameDelayDefault;
+  const int testDisplay = autoFixedSettings ? pick(j->get("display"), DISPLAY_MODES.size(), 1) : autoDisplayDefault;
+  if (displayMode != testDisplay) { displayMode = testDisplay; gfx::setHighRefresh(displayMode == 1); }
+  const Json* vkMeasure = j->get("measureVulkan");
+  const Json* vuBlocks = j->get("traceVu0Blocks");
+  if (sw2ax_trace_vu0_blocks) sw2ax_trace_vu0_blocks(vuBlocks && vuBlocks->isBool() && vuBlocks->b);
+  const Json* sprTrace = j->get("traceSpr");
+  autoTraceSpr = sprTrace && sprTrace->isBool() && sprTrace->b;
+  if (sw2ax_trace_spr) sw2ax_trace_spr(autoTraceSpr);
+  const Json* frameWork = j->get("traceFrameWork");
+  autoTraceFrameWork = frameWork && frameWork->isBool() && frameWork->b;
+  if (sw2ax_trace_frame_work) sw2ax_trace_frame_work(autoTraceFrameWork);
+  const Json* vifCopies = j->get("traceVifCopies");
+  autoTraceVifCopies = vifCopies && vifCopies->isBool() && vifCopies->b;
+  if (sw2ax_trace_vif_copies) sw2ax_trace_vif_copies(autoTraceVifCopies);
+  const Json* vuNotifications = j->get("traceVuNotifications");
+  autoTraceVuNotifications = vuNotifications && vuNotifications->isBool() && vuNotifications->b;
+  if (sw2ax_trace_vu_notifications) sw2ax_trace_vu_notifications(autoTraceVuNotifications);
+  autoMeasureVulkan = vkMeasure && vkMeasure->isBool() && vkMeasure->b;
+  const Json* passEnds = j->get("vkTracePassEnds");
+  autoTracePassEnds = passEnds && passEnds->isBool() && passEnds->b;
+  if (sw2ax_vk_trace_pass_ends) sw2ax_vk_trace_pass_ends(autoTracePassEnds);
+  const Json* handoff = j->get("measureHandoff");
+  autoMeasureHandoff = handoff && handoff->isBool() && handoff->b;
+  const Json* cached = j->get("vkCachedRings");
+  const Json* tfxCache = j->get("vkTfxCache");
+  const Json* canonicalPipelines = j->get("vkCanonicalPipelines");
+  const Json* carryColourFeedback = j->get("vkCarryColourFeedback");
+  if (sw2ax_vk_test_options)
+    sw2ax_vk_test_options(autoMeasureVulkan, pick(j->get("vkReadbackKickPasses"), 65, 0),
+                          cached && cached->isBool() && cached->b, tfxCache && tfxCache->isBool() && tfxCache->b,
+                          canonicalPipelines && canonicalPipelines->isBool() && canonicalPipelines->b,
+                          carryColourFeedback && carryColourFeedback->isBool() && carryColourFeedback->b);
   audioBuffer = pick(j->get("audioBuffer"), AUDIO_BUFFERS.size(), autoAudioBufferDefault);
   const Json* g = j->get("game") ? j->get("game") : autoJson.get("game"); const Json* sl = j && j->get("slot") ? j->get("slot") : autoJson.get("slot"); const Json* sec = autoJson.get("seconds");
   int slot = sl && sl->isNum() ? (int)sl->n : 1; double seconds = sec && sec->isNum() ? sec->n : 20;
   ps2Renderer = pick(j->get("renderer"), RENDERERS.size(), 0); ps2Resolution = pick(j->get("resolution"), RESOLUTIONS.size(), 0);
   ps2EeSpeed = pick(j->get("eeSpeed"), EE_SPEEDS.size(), 1);  // (as players get it: 75%)
   ps2Fpu = pick(j->get("fpu"), FPU_MODES.size(), 0);
-  { const Json* rb = j->get("readback"); autoReadback = rb && rb->isNum() ? (int)rb->n : -1; }
+  { const Json* rb = j->get("readback"); autoReadback = rb && rb->isNum() ? (int)rb->n : autoFixedSettings ? 0 : -1; }
   cpuClock = pick(j->get("clock"), CPU_CLOCKS.size(), 2);  // 0 normal, 1 boost mode, 2 maximum
   gpuClock = pick(j->get("gpu"), GPU_CLOCKS.size(), 0);
   if (&sw2_prof_gs) { const Json* pg = j->get("profgs"); sw2_prof_gs = pg && pg->isBool() && pg->b; }
+  const Json* gsSpin = j->get("gsSpinWait");
+  if (&sw2_gs_spin_wait) sw2_gs_spin_wait = gsSpin && gsSpin->isBool() && gsSpin->b;
+  const Json* eeWait = j->get("eeWaitCycles");
+  if (&sw2_ee_wait_cycles) {
+    if (eeWait && eeWait->isNum())
+      sw2_ee_wait_cycles = (uint32_t)eeWait->n;
+    else
+      sw2_ee_wait_cycles = 3072;
+  }
+  const Json* apr = j->get("audioPanicRefill");
+  sw2_audio_panic_refill = !apr || !apr->isBool() || apr->b;
   if (&sw2_trace_ee_events) {
     const Json* trace = j->get("traceEvents");
     sw2_trace_ee_events = trace && trace->isBool() && trace->b;
@@ -2839,6 +3049,11 @@ static bool autoStartRun() {
   if (&sw2_audio_stretch) { const Json* st = j->get("stretch"); sw2_audio_stretch = st && st->isBool() ? st->b : adaptiveAudio; }
   { const Json* ms = j->get("measured"); skipMeasured = ms && ms->isBool() && !ms->b; }
   { const Json* at = j->get("autotune"); autoTuneTest = at && at->isBool() ? (at->b ? 1 : 0) : -1; }
+  const Json* preciseMfifo = j->get("mfifoPreciseNotify");
+  if (&sw2_mfifo_precise_notify) sw2_mfifo_precise_notify = !preciseMfifo || !preciseMfifo->isBool() || preciseMfifo->b;
+  const Json* kickLight = j->get("vuKickLight");
+  { const Json* nf = j->get("iopNoFence"); if (&sw2_iop_ee_nofence) sw2_iop_ee_nofence = !(nf && nf->isBool() && !nf->b); }
+  if (&sw2_vu_kick_light) sw2_vu_kick_light = kickLight && kickLight->isNum() ? (int)kickLight->n : kickLight && kickLight->isBool() && !kickLight->b ? 0 : 2;  // 2 default, 1 fenced, 0 always kick
   if (&sw2_softprot) { const Json* sp = j->get("softprot"); sw2_softprot = !(sp && sp->isBool() && !sp->b); }  // default on
   if (const Json* b = j->get("boost")) if (b->isBool()) cpuClock = b->b ? 1 : 0;  // older test files
   autoOptions.clear();
@@ -2857,6 +3072,13 @@ static bool autoStartRun() {
   const Rom* found = nullptr;
   if (g && g->isStr()) for (auto& r : allRoms) if (r.name == g->s) found = &r;
   record("autotest: run %d: game '%s' %s, slot %d, %.0f s, %s", autoRun, g && g->isStr() ? g->s.c_str() : "", found ? "found" : "NOT FOUND", slot, seconds, j->dump().c_str());
+  if (autoFixedSettings)
+    record("autotest: fixed settings, readbacks %s, display %s, frame delay %d ms, audio buffer %s%s%s",
+           autoReadback == 1 ? "fast" : "accurate",
+           DISPLAY_MODES[displayMode].c_str(), FRAME_DELAY_MS[frameDelay], AUDIO_BUFFERS[audioBuffer].c_str(),
+           sw2_gs_spin_wait ? ", GS spin-wait on" : "",
+           sw2_ee_wait_cycles != 3072 ? (", eeWaitCycles=" + std::to_string(sw2_ee_wait_cycles)).c_str() : "",
+           sw2_audio_panic_refill ? "" : ", audioSmooth on");
   if (!found) return false;
   Rom rom = *found;
   startGame(rom);
@@ -2878,10 +3100,22 @@ static bool autoStartRun() {
   autoMeasureSeconds = seconds;
   autoAwaitingState = measureAfterLoad && pendingLoadSlot;
   autoMeasuredFrames = 0;
+  autoFrameGaps.clear();
+  autoGameIntervals.clear();
+  autoPrevSwap = 0;
+  autoLowWindowStarted = false;
+  autoSkipFirstGameInterval = false;
   autoRunStart = nowMs();
-  autoTestEnd = autoRunStart + (autoAwaitingState ? 65 : seconds) * 1000;
+  autoTestEnd = autoRunStart + (autoAwaitingState ? 65 : seconds + AUTO_LOW_WARMUP_MS / 1000) * 1000;
+#ifdef SW2_VK
+  vkp::measureHandoff(autoMeasureHandoff);
+#endif
+  if (autoMeasureVulkan && sw2ax_vk_test_counters) sw2ax_vk_test_counters(autoVulkanStart);
   sessionLog = 0;
   autoShots.clear();
+  autoGameShotFrames = 0;
+  autoGameShotPriming = true;
+  { const Json* gs = j->get("shotGameFrame"); autoGameShotTarget = gs && gs->isNum() ? std::max(0, (int)gs->n) : 0; }
   { const Json* ps = j->get("playerStats"); autoPlayerStats = ps && ps->isBool() && ps->b; }
   autoMenuLoadAt = -1; autoMenuLoadStage = 0; autoLiveRes.clear(); autoEarlyLoadAt = -1; autoMenuOpenAt = -1; autoSaveAt = -1;
   if (const Json* sv = j->get("saveState")) if (sv->isArr() && sv->a.size() == 2 && sv->a[0].isNum() && sv->a[1].isNum()) { autoSaveAt = sv->a[0].n; autoSaveSlot = (int)sv->a[1].n; }
@@ -2898,7 +3132,12 @@ static bool autoStartRun() {
   }
   if (const Json* sh = j->get("shots")) if (sh->isArr()) for (auto& x : sh->a) if (x.isNum()) autoShots.push_back(x.n);
   if (const Json* sh = autoJson.get("shots")) if (sh->isArr() && autoShots.empty()) for (auto& x : sh->a) if (x.isNum()) autoShots.push_back(x.n);
-  profStart();
+  const Json* callers = j->get("profileCallers");
+  autoProfileCallers = callers && callers->isBool() && callers->b;
+  const Json* profile = j->get("profile");
+  const bool profileEnabled = !profile || !profile->isBool() || profile->b;
+  autoProfileAfterLoad = profileEnabled && autoAwaitingState;
+  if (profileEnabled && !autoProfileAfterLoad) profStart();
   return true;
 }
 /* ---------------- Vibration ----------------
@@ -3224,6 +3463,8 @@ int main(int argc, char** argv) {
   }
   loadSettings();
   autoAudioBufferDefault = audioBuffer;
+  autoDisplayDefault = displayMode;
+  autoFrameDelayDefault = frameDelay;
   loadDateFormat();
   loadPlaytime();
   rebuildSettings();
@@ -3259,7 +3500,8 @@ int main(int argc, char** argv) {
         if (const Json* pr = autoJson.get("probe")) if (pr->isBool() && pr->b) probeAliasing();
         if (const Json* pr = autoJson.get("glprobe")) if (pr->isBool() && pr->b) record("gl probe: %s", gfx::probeDesktopGL().c_str());
         if (const Json* pr = autoJson.get("clockProbe")) if (pr->isBool() && pr->b) probeClocks();
-        record("autotest: running as '%s'%s", self.c_str(), autoAgent ? " (agent)" : "");
+        record("autotest: running as '%s'%s; iteration %s; built %s %s; next-load %s", self.c_str(), autoAgent ? " (agent)" : "", SW2_ITERATION_ID, __DATE__, __TIME__, envHasNextLoad() ? "available" : "unavailable");
+        if (autoAgent) writeText(string(DATA_DIR) + "/autotest.started", self + "\n" + SW2_ITERATION_ID + "\n" + __DATE__ + " " + __TIME__ + "\n");
         if (!autoStartRun()) { if (autoAgent) autoWaiting = true; else quitApp = true; }
       }
     }
@@ -3282,6 +3524,18 @@ int main(int argc, char** argv) {
   gfx::setHighRefresh(displayMode == 1);
 
   while (appletMainLoop() && !quitApp) {
+    if (autoTest) {
+      const double activityNow = nowMs();
+      if (activityNow >= autoActivityNext) {
+        const Result rc = appletReportUserIsActive();
+        if (!autoActivityLogged) {
+          if (R_SUCCEEDED(rc)) record("autotest: periodic activity reporting enabled");
+          else record("autotest: unable to report activity (rc %08x)", rc);
+          autoActivityLogged = true;
+        }
+        autoActivityNext = activityNow + 45000;
+      }
+    }
     if (autoTest && !autoWaiting && running && autoMenuLoadAt >= 0) {  // as a player would: menu, then Load state
       const double t = (nowMs() - autoRunStart) / 1000.0;
       if (autoMenuLoadStage == 0 && t >= autoMenuLoadAt) { record("autotest: opening the menu at %.1f s", t); openMenu(); autoMenuLoadStage = 1; }
@@ -3304,6 +3558,8 @@ int main(int argc, char** argv) {
       else if (a.what == "skip") { gameSkip[running->name] = a.v; applySkipLive(); }
       else if (a.what == "readback") { autoReadback = -1; gameReadback[running->name] = a.v; applyReadbackLive(); }
       else if (a.what == "clock") { cpuClock = a.v; applySwitchClock(); }
+      else if (a.what == "eeWait") { sw2_ee_wait_cycles = (uint32_t)a.v; }
+      else if (a.what == "blending" && a.v >= 0 && a.v <= (int)BLENDING_LEVELS.size()) { applyBlendingChoice(a.v); }
       if (autoLiveSet.empty()) { gameRate.erase(running->name); gameSkip.erase(running->name); gameReadback.erase(running->name); }
     }
     if (autoTest && !autoWaiting && running && !autoLiveRes.empty() && nowMs() - autoRunStart >= autoLiveRes.front().first * 1000) {
@@ -3319,13 +3575,116 @@ int main(int argc, char** argv) {
     if (autoTest && !autoWaiting && (!running || nowMs() > autoTestEnd)) {
       const double elapsed = (nowMs() - autoRunStart) / 1000;
       profStop();
+      if (autoTraceSpr && sw2ax_trace_spr && sw2ax_spr_counts) {
+        sw2ax_trace_spr(false);
+        uint64_t c[32]{}; sw2ax_spr_counts(c);
+        for (int d = 0; d < 2; d++)
+          record("autotest: SPR %s size <=16 %llu <=32 %llu <=64 %llu <=128 %llu <=256 %llu <=512 %llu <=1024 %llu <=2048 %llu <=4096 %llu >4096 %llu; bytes %llu wrap %llu host unaligned %llu SPR unaligned %llu", d ? "from" : "to",
+                 (unsigned long long)c[d*10], (unsigned long long)c[d*10+1], (unsigned long long)c[d*10+2], (unsigned long long)c[d*10+3], (unsigned long long)c[d*10+4], (unsigned long long)c[d*10+5], (unsigned long long)c[d*10+6], (unsigned long long)c[d*10+7], (unsigned long long)c[d*10+8], (unsigned long long)c[d*10+9],
+                 (unsigned long long)c[20+d], (unsigned long long)c[22+d], (unsigned long long)c[24+d], (unsigned long long)c[26+d]);
+        record("autotest: SPR to sampled %llu transfers (%llu bytes), unchanged %llu transfers (%llu bytes)",
+               (unsigned long long)c[28], (unsigned long long)c[29], (unsigned long long)c[30], (unsigned long long)c[31]);
+      }
+      if (autoTraceFrameWork && sw2ax_trace_frame_work && sw2ax_frame_work_counts) {
+        sw2ax_trace_frame_work(false);
+        uint64_t c[12]{}; const uint64_t hz = sw2ax_frame_work_counts(c);
+        for (int b = 0; b < 2; b++) {
+          const double scale = c[b] && hz ? 1000.0 / (double(hz) * c[b]) : 0.0;
+          record("autotest: frame timing %s: %llu frames, work %.3f ms, GS wait %.3f ms, VU1 wait %.3f ms, target %.3f ms",
+                 b ? "late" : "on-time", (unsigned long long)c[b], c[2+b]*scale, c[4+b]*scale, c[6+b]*scale, c[8+b]*scale);
+        }
+        record("autotest: frame timing overran %llu, unmeasured %llu", (unsigned long long)c[10], (unsigned long long)c[11]);
+      }
+      if (autoTraceVifCopies && sw2ax_vif_copy_counts && sw2ax_trace_vif_copies) {
+        sw2ax_trace_vif_copies(false);
+        uint64_t counts[14]{};
+        sw2ax_vif_copy_counts(counts);
+        record("autotest: VIF1 copies direct %llu, reassembled %llu, partial %llu, staged bytes %llu",
+               (unsigned long long)counts[0], (unsigned long long)counts[1],
+               (unsigned long long)counts[2], (unsigned long long)counts[3]);
+        record("autotest: VIF1 queue size <=16 %llu <=32 %llu <=64 %llu <=128 %llu <=256 %llu <=512 %llu <=1024 %llu >1024 %llu, payload bytes %llu, metadata bytes %llu",
+               (unsigned long long)counts[4], (unsigned long long)counts[5], (unsigned long long)counts[6],
+               (unsigned long long)counts[7], (unsigned long long)counts[8], (unsigned long long)counts[9],
+               (unsigned long long)counts[10], (unsigned long long)counts[11],
+               (unsigned long long)counts[12], (unsigned long long)counts[13]);
+      }
+      if (autoTraceVuNotifications && sw2ax_vu_notification_counts && sw2ax_trace_vu_notifications) {
+        sw2ax_trace_vu_notifications(false);
+        uint64_t counts[4]{};
+        sw2ax_vu_notification_counts(counts);
+        record("autotest: VU notifications sleeping %llu, spinning %llu, running %llu, dead %llu",
+               (unsigned long long)counts[0], (unsigned long long)counts[1],
+               (unsigned long long)counts[2], (unsigned long long)counts[3]);
+      }
       if (autoAwaitingState || !running)
         record("autotest: run %d measurement incomplete", autoRun);
       else {
         record("autotest: run %d measured %.3f s, %u frame calls (%.3f calls/s)",
                autoRun, elapsed, autoMeasuredFrames, autoMeasuredFrames / elapsed);
+        double emu1PercentLow = 0, emuWorstMs = 0;
+        if (autoFrameGaps.size() >= 10) {
+          size_t k = std::max<size_t>(1, autoFrameGaps.size() / 100);
+          std::partial_sort(autoFrameGaps.begin(), autoFrameGaps.begin() + k, autoFrameGaps.end(), std::greater<float>());
+          double worstSum = 0;
+          for (size_t i = 0; i < k; i++) worstSum += autoFrameGaps[i];
+          emu1PercentLow = 1000.0 / (worstSum / k);
+          emuWorstMs = autoFrameGaps[0];
+        }
+        double game1PercentLow = 0, gameWorstMs = 0;
+        if (autoGameIntervals.size() >= 10) {
+          size_t k = std::max<size_t>(1, autoGameIntervals.size() / 100);
+          std::partial_sort(autoGameIntervals.begin(), autoGameIntervals.begin() + k, autoGameIntervals.end(), std::greater<float>());
+          double worstSum = 0;
+          for (size_t i = 0; i < k; i++) worstSum += autoGameIntervals[i];
+          game1PercentLow = 1000.0 / (worstSum / k);
+          gameWorstMs = autoGameIntervals[0];
+        }
+        record("autotest: frame lows: display 1%% low %.1f fps (worst %.1f ms, %zu samples), game 1%% low %.1f fps (worst %.1f ms, %zu samples), after %.1f s warmup",
+               emu1PercentLow, emuWorstMs, autoFrameGaps.size(), game1PercentLow, gameWorstMs, autoGameIntervals.size(), AUTO_LOW_WARMUP_MS / 1000);
         record("autotest: audio refills %u, minimum queue %.1f ms, final tempo %.3f",
                audioRefills, minAudioQueue / 48.0, outputTempo);
+        if (autoMeasureVulkan && sw2ax_vk_test_counters) {
+          uint64_t counts[9];
+          sw2ax_vk_test_counters(counts);
+          for (int i = 0; i < 9; i++) counts[i] -= autoVulkanStart[i];
+          record("autotest: Vulkan submits %llu, early submits %llu, synchronous readbacks %llu, readback time %.2f ms",
+                 (unsigned long long)counts[0], (unsigned long long)counts[1],
+                 (unsigned long long)counts[2], counts[3] / 1e6);
+          record("autotest: GS pipeline lookups %llu, hot-cache hits %llu, pipeline binds %llu, texture updates %llu, render passes %llu",
+                 (unsigned long long)counts[4], (unsigned long long)counts[5], (unsigned long long)counts[6],
+                 (unsigned long long)counts[7], (unsigned long long)counts[8]);
+        }
+        if (autoTracePassEnds && sw2ax_vk_pass_end_summary) {
+          sw2ax_vk_trace_pass_ends(false);
+          unsigned lines[12]{}, counts[12]{};
+          const auto total = sw2ax_vk_pass_end_summary(lines, counts, 12);
+          record("autotest: Vulkan pass ends attributed %llu", (unsigned long long)total);
+          for (unsigned i = 0; i < 12 && counts[i]; i++)
+            record("autotest: Vulkan pass end GSDeviceVK.cpp:%u count %u", lines[i], counts[i]);
+          if (sw2ax_vk_target_break_summary) {
+            unsigned reasons[16]{}, transitions[64]{};
+            sw2ax_vk_target_break_summary(reasons, transitions);
+            for (unsigned bits = 1; bits < 16; bits++) {
+              if (reasons[bits])
+                record("autotest: Vulkan target break colour=%u depth=%u feedback=%u missing_framebuffer=%u count %u",
+                       bits & 1, (bits >> 1) & 1, (bits >> 2) & 1, (bits >> 3) & 1, reasons[bits]);
+            }
+            for (unsigned i = 0; i < 64; i++) {
+              if (transitions[i])
+                record("autotest: Vulkan feedback-only transition %u -> %u count %u", i / 8, i % 8, transitions[i]);
+            }
+          }
+        }
+#ifdef SW2_VK
+        if (autoMeasureHandoff) {
+          const auto handoff = vkp::handoffStats();
+          record("autotest: handoff copies %llu, MiB %.1f, uploads %llu, submit CPU %.2f ms, fence waits %u (%.2f ms), map %.2f ms, GL upload CPU %.2f ms (max %.3f ms)",
+                 (unsigned long long)handoff.copies, handoff.bytes / 1048576.0,
+                 (unsigned long long)handoff.uploads, handoff.submitsNs / 1e6,
+                 vkp::slotWaits(), handoff.waitsNs / 1e6, handoff.mapNs / 1e6,
+                 handoff.uploadNs / 1e6, handoff.maxUploadNs / 1e6);
+        }
+#endif
       }
       record("autotest: run %d done", autoRun);
       if (sw2ax_event_sources && (!&sw2_trace_ee_events || sw2_trace_ee_events)) { char es[900]; sw2ax_event_sources(es, sizeof es); record("%s", es); }
@@ -3365,9 +3724,11 @@ int main(int argc, char** argv) {
       double tw = nowMs();
       if (!autoWaitSince) autoWaitSince = tw;
       padUpdate(&pad1);
-      if ((padGetButtons(&pad1) & HidNpadButton_Plus) || tw - autoWaitSince > 45 * 60000.0) { quitApp = true; break; }
+      if (padGetButtons(&pad1) & HidNpadButton_Plus) { quitApp = true; break; }
       if (tw >= autoPollAt) {
         autoPollAt = tw + 700;
+        // The host checks that this changes, rather than trusting an old completion marker.
+        writeText(string(DATA_DIR) + "/autotest.heartbeat", std::to_string(++autoHeartbeat) + " " + appSelfPath + "\n");
         string nt; Json nj;
         if (readText(string(DATA_DIR) + "/autotest.json", nt) && Json::parse(nt, nj) && nj.type == Json::OBJ) {
           const Json* nro = nj.get("nro");
@@ -3398,8 +3759,20 @@ int main(int argc, char** argv) {
           }
           // A request naming a different build requires a Homebrew Loader handoff.
           string self = argc > 0 && argv[0] ? argv[0] : "", want = nro && nro->isStr() && !nro->s.empty() ? string(DATA_DIR) + "/" + nro->s : self;
+          if (!exists(want)) {
+            writeText(string(DATA_DIR) + "/autotest.finished", "cannot restart: requested NRO does not exist\n");
+            remove((string(DATA_DIR) + "/autotest.json").c_str());
+            continue;
+          }
           Result rc = envHasNextLoad() ? envSetNextLoad(want.c_str(), ("\"" + want + "\"").c_str()) : -1;
-          if (R_FAILED(rc)) writeText(string(DATA_DIR) + "/autotest.finished", "cannot restart: the homebrew loader has no next-load support\n");
+          char rcText[32]; snprintf(rcText, sizeof rcText, "%08x", rc);
+          writeText(string(DATA_DIR) + "/autotest.handoff", "from " + self + "\nto " + want + "\nnext-load rc " + rcText + "\n");
+          if (R_FAILED(rc)) {
+            writeText(string(DATA_DIR) + "/autotest.finished", "cannot restart: next-load request failed (rc " + string(rcText) + ")\n");
+            remove((string(DATA_DIR) + "/autotest.json").c_str());
+            continue;
+          }
+          remove((string(DATA_DIR) + "/autotest.heartbeat").c_str());
           quitApp = true; break;
         }
       }
@@ -3486,17 +3859,53 @@ int main(int argc, char** argv) {
     phase[0] += tb - ta; phase[1] += tc - tb; phase[2] += t - tc; phase[3] += td - t; phase[4] += te - td; phaseN++;
 
     double after = nowMs();
+    const bool lowWindow = autoTest && !autoAwaitingState && after >= autoRunStart + AUTO_LOW_WARMUP_MS;
+    bool lowJustStarted = false;
+    if (lowWindow && !autoLowWindowStarted) {
+      autoLowWindowStarted = true;
+      autoSkipFirstGameInterval = true;
+      autoPrevSwap = 0;
+      lowJustStarted = true;
+    }
     double lastGapForFree = lastSwap ? after - lastSwap : 0;
     if (lastSwap) {
       double gap = after - lastSwap;
       if (gap > 5 && gap < 21) tickMs += (gap - tickMs) * 0.01;
-      if (frameDrawn) noteShown(after);
-    } else if (frameDrawn) noteShown(after);
-    if (statsLevel == 3 && running && sw2_game_frame_intervals) {  // the time between the game's own frames (core: game_frame)
+      if (frameDrawn) {
+        noteShown(after);
+        if (lowWindow && !lowJustStarted) {
+          if (autoPrevSwap > 0) {
+            float g = (float)(after - autoPrevSwap);
+            if (g > 0) autoFrameGaps.push_back(g);
+          }
+          autoPrevSwap = after;
+        }
+      }
+    } else if (frameDrawn) {
+      noteShown(after);
+      if (lowWindow) autoPrevSwap = after;
+    }
+    if (running && sw2_game_frame_intervals && (statsLevel == 3 || (autoTest && autoGameShotTarget > 0))) {  // game-frame events
       static unsigned gfSeq = 0; float iv[64];
       int n = sw2_game_frame_intervals(&gfSeq, iv, 64);
       if (graphSkipBacklog) { graphSkipBacklog = false; n = 0; }
-      for (int i = 0; i < n; i++) if (iv[i] > 0 && iv[i] < 1000) drawGraph(iv[i]);
+      if (autoTest && !autoAwaitingState && autoGameShotTarget > 0) {
+        if (autoGameShotPriming) autoGameShotPriming = false;
+        else autoGameShotFrames += n;
+        if (autoGameShotFrames >= autoGameShotTarget) {
+          char nm[64]; snprintf(nm, sizeof nm, "test-run%d-gameframe%d", autoRunBase + autoRun, autoGameShotTarget);
+          captureName = nm; captureRequested = true;
+          record("autotest: game-frame screenshot target %d reached at %.3f s (%d frames)", autoGameShotTarget, (after - autoRunStart) / 1000, autoGameShotFrames);
+          autoGameShotTarget = 0;
+        }
+      }
+      for (int i = 0; i < n; i++) if (iv[i] > 0) {
+        if (statsLevel == 3 && iv[i] < 1000) drawGraph(iv[i]);
+        if (statsLevel == 3 && lowWindow && !lowJustStarted) {
+          if (autoSkipFirstGameInterval) autoSkipFirstGameInterval = false;
+          else autoGameIntervals.push_back(iv[i]);
+        }
+      }
     } else if (frameDrawn) {  // (no game-frame times: new frames from the core)
       static double lastShownAt = 0;
       if (statsLevel == 3 && lastShownAt > 0 && after - lastShownAt < 1000) drawGraph(after - lastShownAt);
@@ -3513,6 +3922,7 @@ int main(int argc, char** argv) {
   }
 
   if (running) quitGame();
+  if (autoAgent) remove((string(DATA_DIR) + "/autotest.heartbeat").c_str());
   if (sw2ax_list_threads) sw2ax_list_threads("after the last game was unloaded");
   if (sw2ax_exit_trace) sw2ax_exit_trace("main: game unloaded, shutting down");
   saveSettings();

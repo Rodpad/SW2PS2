@@ -41,6 +41,12 @@ Opened with L + R + L3 + R3 (SL + SR + stick press on a single Joy-Con), in tabs
 The menu can pause the game and dim it behind (both optional). Less common options appear with
 Settings -> App -> Advanced options.
 
+The in-game Emulation tab also offers per-game **Blending accuracy** with Advanced options
+shown. The default follows PCSX2's game database: each game gets the level it recommends
+(and any limit it sets), and Basic where it names none. Choosing a level overrides that for
+the game. Lower levels may change visual effects; higher ones can cost speed, mainly at higher
+resolutions.
+
 ### Cheats
 
 Open **Game → Cheats…** while playing. SW2PS2 lists the codes for the disc's serial and ELF CRC

@@ -10,7 +10,21 @@
 # REUSE_RUNNING=1: run a new configuration in the currently running build.
 set -e
 cd "$(dirname "$0")/.."
-IP=${SWITCH_IP:?set SWITCH_IP to the console IP address}
+# Options make the network operation easy to approve once for repeated test runs.
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --switch) SWITCH_IP=$2; shift 2 ;;
+    --port) FTP_PORT=$2; shift 2 ;;
+    --debug) set -x; shift ;;
+    --bootstrap) NXLINK=1; shift ;;
+    --reuse) REUSE_RUNNING=1; shift ;;
+    --runs-file) RUNS_FILE=$2; shift 2 ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+done
+if [ -n "${RUNS_FILE:-}" ]; then set -- "$(cat "$RUNS_FILE")" "$@"; fi
+IP=${SWITCH_IP:?set SWITCH_IP or pass --switch}
 FTP_ROOT="ftp://$IP:${FTP_PORT:-5000}"
 FTP="$FTP_ROOT/switch/sw2ps2"
 RUNS=${1:-'[{"boost": true}]'}; SECONDS_EACH=${2:-14}; SLOT=${3:-1}; GAME=${4:-Katamari_Damacy.iso}
@@ -24,6 +38,23 @@ if [ -z "${NXLINK:-}" ]; then
     done|done\ *) ;;
     *) echo "No idle test agent found. Open NetLoader once, then run with NXLINK=1." >&2; exit 1 ;;
   esac
+  # Completion files survive a crash or exit; require proof the agent is alive.
+  # SW2Transfer caches read handles for 1.5 s after each read. Poll more
+  # slowly than that so replacing the heartbeat does not pin an old handle.
+  beat1=; live=0; attempts=0
+  while [ "$attempts" -lt 5 ]; do
+    beat=$(curl -fsS --max-time 8 "$FTP/autotest.heartbeat" 2>/dev/null || true)
+    if [ -n "$beat" ]; then
+      if [ -n "$beat1" ] && [ "$beat" != "$beat1" ]; then live=1; break; fi
+      beat1=$beat
+    fi
+    attempts=$((attempts + 1))
+    sleep 3
+  done
+  if [ "$live" -ne 1 ]; then
+    echo "The completion marker is stale or the agent is not responding; open NetLoader to start it." >&2
+    exit 1
+  fi
   if [ -n "${REUSE_RUNNING:-}" ]; then
     case "$idle_marker" in
       done\ *reuse-log) ;;
@@ -46,6 +77,9 @@ if [ -n "${REUSE_RUNNING:-}" ]; then
   target='"reuse": true, '
 elif [ -z "${NXLINK:-}" ]; then
   curl -fsS --max-time 120 -T build/sw2ps2-test.nro "$FTP/$NRO"
+  # The transfer plugin's newly created directory entry can become visible to
+  # the app slightly after the upload completes.
+  sleep 3
   target='"nro": "'"$NRO"'", '
 else
   target=
@@ -66,6 +100,7 @@ elif [ -z "${REUSE_RUNNING:-}" ]; then
   echo "$name" > build/.remote-nro
 fi
 limit=$(( n * (SECONDS_EACH + 25) + ${WAIT_EXTRA:-60} )); waited=0
+handoff_retries=0
 while [ $waited -lt $limit ]; do
   sleep 5; waited=$((waited + 5))
   marker=$(curl -fsS --max-time 8 "$FTP/autotest.finished" 2>/dev/null || true)
@@ -87,6 +122,17 @@ while [ $waited -lt $limit ]; do
     exit 0
   fi
   case "$marker" in
+    "cannot restart: requested NRO does not exist"*)
+      if [ -n "${NXLINK:-}" ] || [ -n "${REUSE_RUNNING:-}" ] || [ "$handoff_retries" -ge 3 ]; then
+        printf '%s\n' "$marker" >&2; exit 1
+      fi
+      handoff_retries=$((handoff_retries + 1))
+      echo "Uploaded NRO is not visible yet; retrying handoff ($handoff_retries/3)." >&2
+      sleep 3
+      curl -fsS --max-time 8 -Q "DELE /switch/sw2ps2/autotest.finished" "$FTP_ROOT/" >/dev/null 2>&1 || true
+      curl -fsS --max-time 10 -T build/autotest.json "$FTP/autotest.upload"
+      curl -fsS --max-time 10 -Q "RNFR /switch/sw2ps2/autotest.upload" -Q "RNTO /switch/sw2ps2/autotest.json" "$FTP_ROOT/" >/dev/null
+      ;;
     "cannot restart:"*|"cannot write test log $test_id") printf '%s\n' "$marker" >&2; exit 1 ;;
   esac
   if [ "$waited" -eq 30 ] && curl -fsS --max-time 8 "$FTP/autotest.json" -o /dev/null 2>/dev/null; then

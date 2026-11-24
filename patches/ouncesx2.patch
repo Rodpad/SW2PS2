@@ -101,6 +101,108 @@ index 78610d1f15..9fd64aead8 100644
  	const u64 start = GetCPUTicks();
  	MonitoredWait(word, expected);
  	// Charge unmeasurably short waits as one tick, not zero: the caller
+diff --git a/common/Threading.h b/common/Threading.h
+index b390dffb10..ac9f593c90 100644
+--- a/common/Threading.h
++++ b/common/Threading.h
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-3.0+
+ 
+ #pragma once
++#include "common/HostSys.h" // SW2PS2: ShortSpinOn / SPIN_TIME_NS for WaitForWorkPolled
+ 
+ #include "common/Pcsx2Defs.h"
+ 
+@@ -225,6 +226,89 @@ namespace Threading
+ 				m_sema.Post();
+ 		}
+ 
++#ifdef __SWITCH__
++		/// SW2PS2: NotifyOfWork without the atomic add when the worker already has a wake-up pending
++		/// (RUNNING_N stays RUNNING_N anyway). LSE atomics are slow on the Switch 2's A78C even
++		/// uncontended, and MTVU kicks millions of times a second while VU1 is busy. The full fence
++		/// orders the caller's queue publish before the state read; the worker must issue a matching
++		/// seq_cst fence after clearing RUNNING_N and before rereading its queue (MTVU does).
++		void NotifyOfWorkLight()
++		{
++			std::atomic_thread_fence(std::memory_order_seq_cst);
++			const s32 cur = m_state.load(std::memory_order_relaxed);
++			if (cur > 0 && (cur & (STATE_FLAG_WAITING_EMPTY - 1)) != 0)
++				return;
++			NotifyOfWork();
++		}
++
++		/// SW2PS2: as NotifyOfWorkLight without the fence, so the caller never waits for its queue
++		/// writes to drain. The state read can be stale, so a kick can be skipped while the worker is
++		/// going idle: only for workers that wait with WaitForWorkPolled (which watches the queue
++		/// itself), and whose "wait until empty" callers notify fully first (MTVU's WaitVU does).
++		void NotifyOfWorkNoFence()
++		{
++			const s32 cur = m_state.load(std::memory_order_relaxed);
++			if (cur > 0 && (cur & (STATE_FLAG_WAITING_EMPTY - 1)) != 0)
++				return;
++			NotifyOfWork();
++		}
++
++		s32 NotifyOfWorkTracked()
++		{
++			s32 old = m_state.fetch_add(2, std::memory_order_release);
++			if (old == STATE_SLEEPING)
++				m_sema.Post();
++			return old;
++		}
++#endif
++
++		/// SW2PS2: WaitForWorkWithSpin that also watches the queue (has_work), for workers fed by
++		/// NotifyOfWorkNoFence. While spinning it leaves as soon as has_work() is true; asleep it
++		/// wakes every millisecond to check, so a skipped kick delays work, never loses it.
++		template <typename F>
++		void WaitForWorkPolled(F&& has_work, u32 poll_us = 1000)
++		{
++			s32 value = m_state.load(std::memory_order_relaxed);
++			while (IsReadyForSleep(value))
++			{
++				if (m_state.compare_exchange_weak(value, STATE_SPINNING, std::memory_order_release, std::memory_order_relaxed))
++				{
++					if (value & STATE_FLAG_WAITING_EMPTY)
++						m_empty_sema.Post();
++					value = STATE_SPINNING;
++					break;
++				}
++			}
++			u32 waited = 0;
++			while (value < 0)
++			{
++				if (IsDead(value) || has_work())
++					break;
++				if (waited > SPIN_TIME_NS)
++				{
++					if (!m_state.compare_exchange_weak(value, STATE_SLEEPING, std::memory_order_relaxed))
++						continue;
++					for (;;)
++					{
++						if (m_sema.TimedWait(poll_us))
++							break; // a notifier moved SLEEPING -> RUNNING and posted
++						if (has_work())
++						{
++							s32 expected = STATE_SLEEPING;
++							if (!m_state.compare_exchange_strong(expected, STATE_RUNNING_0, std::memory_order_acq_rel))
++								m_sema.Wait(); // a notifier got there first: take its post
++							break;
++						}
++					}
++					break;
++				}
++				waited += ShortSpinOn(m_state, value);
++				value = m_state.load(std::memory_order_relaxed);
++			}
++			// Clear back to STATE_RUNNING_0 (but preserve waiting empty flag)
++			m_state.fetch_and(STATE_FLAG_WAITING_EMPTY, std::memory_order_acquire);
++		}
++
+ 		/// Checks if there's any work in the queue
+ 		bool CheckForWork();
+ 		/// Wait for work to be added to the queue
 diff --git a/pcsx2-libretro/Main.cpp b/pcsx2-libretro/Main.cpp
 index 24210fb067..a8194e0c90 100644
 --- a/pcsx2-libretro/Main.cpp
@@ -394,6 +496,146 @@ index 1da71e6ec9..8944dd416f 100644
  
  			cpuClearInt( channel );
  			QueuedDMA._u16 &= ~(1 << channel); //Clear any queued DMA requests for this channel
+diff --git a/pcsx2/EECycleRateSampler.cpp b/pcsx2/EECycleRateSampler.cpp
+index db9a45f89f..712d4e243b 100644
+--- a/pcsx2/EECycleRateSampler.cpp
++++ b/pcsx2/EECycleRateSampler.cpp
+@@ -23,6 +23,24 @@
+ 
+ #include "fmt/format.h"
+ 
++#ifdef __SWITCH__
++// Opt-in aggregate timing for the automated test harness. No per-frame I/O.
++static std::atomic<bool> s_sw2_frame_trace{false};
++static std::atomic<u64> s_sw2_frame_counts[12]{};
++extern "C" void sw2ax_trace_frame_work(bool enabled)
++{
++    s_sw2_frame_trace.store(false, std::memory_order_relaxed);
++    if (enabled)
++        for (auto& count : s_sw2_frame_counts) count.store(0, std::memory_order_relaxed);
++    s_sw2_frame_trace.store(enabled, std::memory_order_relaxed);
++}
++extern "C" u64 sw2ax_frame_work_counts(u64* out)
++{
++    for (int i = 0; i < 12; i++) out[i] = s_sw2_frame_counts[i].load(std::memory_order_relaxed);
++    return GetTickFrequency();
++}
++#endif
++
+ namespace
+ {
+ 	// Whether the blocking sites should time themselves at all: the governor is sampling, or a
+@@ -533,8 +551,12 @@ EECycleRateWindowSample EECycleRateSampler::BuildWindowSample(const WindowInputs
+ 
+ u64 EECycleRateSampler::BeginWait()
+ {
+-	if (!s_measuring_waits.load(std::memory_order_relaxed))
+-		return 0;
++	if (!s_measuring_waits.load(std::memory_order_relaxed)
++#ifdef __SWITCH__
++        && !s_sw2_frame_trace.load(std::memory_order_relaxed)
++#endif
++    )
++        return 0;
+ 
+ 	if (!VMManager::Internal::IsOnCPUThread())
+ 		return 0;
+@@ -691,7 +713,17 @@ bool EECycleRateSampler::GetLastWindow(LastWindow* out)
+ 
+ void EECycleRateSampler::OnSegmentThrottled(u64 segment_ticks, u64 target_ticks, bool frame_end, EECycleRateLateness lateness)
+ {
+-	if (!s_active && !s_tally_requested)
++#ifdef __SWITCH__
++    const bool trace = s_sw2_frame_trace.load(std::memory_order_relaxed);
++    static bool was_tracing = false; // CPU thread only
++    if (trace != was_tracing) {
++        if (!s_active && !s_tally_requested) ClearFrameInProgress();
++        was_tracing = trace;
++    }
++#else
++    constexpr bool trace = false;
++#endif
++	if (!s_active && !s_tally_requested && !trace)
+ 		return;
+ 
+ 	const EECycleRateFrameAccumulator::Outcome outcome = s_frame.AddSegment(segment_ticks, frame_end, lateness);
+@@ -701,7 +733,22 @@ void EECycleRateSampler::OnSegmentThrottled(u64 segment_ticks, u64 target_ticks,
+ 	// Every paced frame goes into the tally, measurable or not: a frame with a missing segment
+ 	// has no known length, but it still ended at the limiter and is one of the frames the speed
+ 	// is made of.
+-	s_tally.NoteFrame(s_frame);
++	if (s_active || s_tally_requested) s_tally.NoteFrame(s_frame);
++#ifdef __SWITCH__
++    if (trace) {
++        if (outcome == EECycleRateFrameAccumulator::Outcome::Unmeasured || target_ticks == 0)
++            s_sw2_frame_counts[11].fetch_add(1, std::memory_order_relaxed);
++        else {
++            const int b = s_frame.late ? 1 : 0;
++            s_sw2_frame_counts[b].fetch_add(1, std::memory_order_relaxed);
++            s_sw2_frame_counts[2 + b].fetch_add(s_frame.active_ticks, std::memory_order_relaxed);
++            s_sw2_frame_counts[4 + b].fetch_add(s_frame_gs_wait_ticks, std::memory_order_relaxed);
++            s_sw2_frame_counts[6 + b].fetch_add(s_frame_vu1_wait_ticks, std::memory_order_relaxed);
++            s_sw2_frame_counts[8 + b].fetch_add(target_ticks, std::memory_order_relaxed);
++            if (s_frame.overran) s_sw2_frame_counts[10].fetch_add(1, std::memory_order_relaxed);
++        }
++    }
++#endif
+ 
+ 	if (!s_active)
+ 	{
+@@ -738,7 +785,11 @@ void EECycleRateSampler::OnSegmentThrottled(u64 segment_ticks, u64 target_ticks,
+ 
+ void EECycleRateSampler::OnFrameNotThrottled()
+ {
+-	if (!s_active && !s_tally_requested)
++	if (!s_active && !s_tally_requested
++#ifdef __SWITCH__
++        && !s_sw2_frame_trace.load(std::memory_order_relaxed)
++#endif
++    )
+ 		return;
+ 
+ 	if (s_active)
+diff --git a/pcsx2/GS/GS.cpp b/pcsx2/GS/GS.cpp
+index ad3994e1d9..c7a8724b7e 100644
+--- a/pcsx2/GS/GS.cpp
++++ b/pcsx2/GS/GS.cpp
+@@ -288,8 +288,15 @@ static void GSClampUpscaleMultiplier(Pcsx2Config::GSOptions& config)
+ // this runs again each time and nothing accumulates.
+ //
+ // Reasoning, measurements and the picture-quality judgement: GSCopyRoadBlendingPolicy.h.
++#ifdef __SWITCH__
++extern int sw2_blending_explicit;
++#endif
+ static void GSApplyCopyRoadBlendingCap(Pcsx2Config::GSOptions& config)
+ {
++#ifdef __SWITCH__
++	if (sw2_blending_explicit)
++		return;
++#endif
+ 	// Blending accuracy is a hardware-renderer concept; the software renderer blends exactly and
+ 	// reads none of this, so leaving its level alone keeps the log and the OSD honest.
+ 	if (!GSIsHardwareRenderer() || config.CopyRoadMaximumBlendingLevel < 0)
+@@ -396,6 +403,9 @@ static bool OpenGSRenderer(GSRendererType renderer, u8* basemem)
+ 			Pcsx2Config::GSOptions::GetRendererName(renderer));
+ 		GSClampUpscaleMultiplier(GSConfig);
+ 		GSApplyCopyRoadBlendingCap(GSConfig);
++#ifdef __SWITCH__
++		Console.WriteLn("SW2PS2: active blending level %d (explicit %d)", static_cast<int>(GSConfig.AccurateBlendingUnit), sw2_blending_explicit);
++#endif
+ 		g_gs_renderer = std::make_unique<GSRendererHW>();
+ 	}
+ 	else
+@@ -1299,6 +1309,9 @@ void GSUpdateConfig(const Pcsx2Config::GSOptions& new_config)
+ 	// GSConfig was just replaced wholesale, so the cap has to be re-derived; old_config carries
+ 	// the previous run's capped value and new_config carries none.
+ 	GSApplyCopyRoadBlendingCap(GSConfig);
++#ifdef __SWITCH__
++	Console.WriteLn("SW2PS2: active blending level %d (explicit %d)", static_cast<int>(GSConfig.AccurateBlendingUnit), sw2_blending_explicit);
++#endif
+ 
+ 	// The download mode is an input to the back-thread decision, which only runs when a renderer
+ 	// opens. Reopen the renderer when a change would decide differently: Unsynchronized reads
 diff --git a/pcsx2/GS/Renderers/Common/GSRenderer.cpp b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
 index 7340c3205b..bf28a8bee2 100644
 --- a/pcsx2/GS/Renderers/Common/GSRenderer.cpp
@@ -587,10 +829,82 @@ index 6e853f423b..7b53f1b1bf 100644
  	m_shader_cache.GetProgram(&prog, vs, ps);
  	it = m_programs.emplace(psel, std::move(prog)).first;
 diff --git a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
-index ed78b9c38e..cfdf58bb80 100644
+index ed78b9c38e..8b7588197e 100644
 --- a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
 +++ b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
-@@ -3795,12 +3795,17 @@ bool GSDeviceVK::CreateDeviceAndSwapChain()
+@@ -195,6 +195,42 @@ static constexpr std::array<const char*, 0> s_required_device_extensions = {};
+ // The instance extensions the last CreateVulkanInstance enabled, for the driver report.
+ static std::vector<std::string> s_enabled_instance_extensions;
+ 
++#ifdef __SWITCH__
++#include <atomic>
++std::atomic<bool> sw2_vk_measure{false};
++// Successful submissions, early submissions, synchronous readbacks and readback nanoseconds.
++std::atomic<u64> sw2_vk_counters[9]{};
++// Per-site counters are enabled only during the dedicated pass-break test.
++std::atomic<bool> sw2_vk_trace_pass_ends{false};
++std::array<std::atomic<u32>, 16384> sw2_vk_pass_end_sites{};
++std::array<std::atomic<u32>, 16> sw2_vk_target_break_reasons{};
++std::array<std::atomic<u32>, 64> sw2_vk_feedback_transitions{};
++
++#define SW2_END_RENDER_PASS() do { \
++	static_assert(__LINE__ < sw2_vk_pass_end_sites.size()); \
++	if (sw2_vk_trace_pass_ends.load(std::memory_order_relaxed) && InRenderPass()) \
++		sw2_vk_pass_end_sites[__LINE__].fetch_add(1, std::memory_order_relaxed); \
++	EndRenderPass(); \
++} while (false)
++
++bool sw2_vk_tfx_cache = false;
++bool sw2_vk_canonical_pipelines = false;
++bool sw2_vk_carry_colour_feedback = false;
++
++namespace
++{
++	struct TFXCacheEntry
++	{
++		GSDeviceVK::PipelineSelector key;
++		VkPipeline pipeline = VK_NULL_HANDLE;
++	};
++	std::array<TFXCacheEntry, 64> s_sw2_tfx_cache{};
++	const GSDeviceVK* s_sw2_tfx_cache_owner = nullptr;
++} // namespace
++#else
++#define SW2_END_RENDER_PASS() EndRenderPass()
++#endif
++
+ GSDeviceVK::GSDeviceVK()
+ {
+ #ifdef ENABLE_OGL_DEBUG
+@@ -2103,6 +2139,10 @@ void GSDeviceVK::SubmitCommandBuffer(VKSwapChain* present_swap_chain)
+ 	FlushStreamRingWrites();
+ 
+ 	res = vkQueueSubmit(m_graphics_queue, 1, &submit_info, resources.fence);
++#ifdef __SWITCH__
++	if (res == VK_SUCCESS && sw2_vk_measure.load(std::memory_order_relaxed))
++		sw2_vk_counters[0].fetch_add(1, std::memory_order_relaxed);
++#endif
+ 	if (res != VK_SUCCESS)
+ 	{
+ 		LOG_VULKAN_ERROR(res, "vkQueueSubmit failed: ");
+@@ -3197,7 +3237,7 @@ void GSDeviceVK::Destroy()
+ 	// with a second VkDevice it owns; its Shutdown idles both before releasing anything.
+ 	GSLsfg::Shutdown();
+ 
+-	EndRenderPass();
++	SW2_END_RENDER_PASS();
+ 	if (GetCurrentCommandBuffer() != VK_NULL_HANDLE)
+ 		ExecuteCommandBuffer(false);
+ 	if (m_device != VK_NULL_HANDLE)
+@@ -3396,7 +3436,7 @@ void GSDeviceVK::SetVSyncMode(GSVSyncMode mode, bool allow_present_throttle)
+ 
+ GSDevice::PresentResult GSDeviceVK::DoBeginPresent(bool frame_skip)
+ {
+-	EndRenderPass();
++	SW2_END_RENDER_PASS();
+ 
+ 	// Check if the device was lost.
+ 	if (m_last_submit_failed)
+@@ -3795,12 +3835,17 @@ bool GSDeviceVK::CreateDeviceAndSwapChain()
  		return false;
  
  #ifdef __SWITCH__
@@ -608,6 +922,602 @@ index ed78b9c38e..cfdf58bb80 100644
  #endif
  
  	// Libretro context sharing: the VkInstance comes from the frontend's
+@@ -4819,7 +4864,7 @@ void GSDeviceVK::DoCopyRect(GSTexture* sTex, GSTexture* dTex, const GSVector4i&
+ 		{static_cast<s32>(destX), static_cast<s32>(destY), 0u},
+ 		{static_cast<u32>(r.width()), static_cast<u32>(r.height()), 1u}};
+ 
+-	EndRenderPass();
++	SW2_END_RENDER_PASS();
+ 
+ 	sTexVK->SetUseFenceCounter(GetCurrentFenceCounter());
+ 	dTexVK->SetUseFenceCounter(GetCurrentFenceCounter());
+@@ -4882,7 +4927,7 @@ void GSDeviceVK::DoDrawMultiStretchRects(
+ 		stex->CommitClear();
+ 		if (stex->GetLayout() != GSTextureVK::Layout::ShaderReadOnly)
+ 		{
+-			EndRenderPass();
++			SW2_END_RENDER_PASS();
+ 			stex->TransitionToLayout(GSTextureVK::Layout::ShaderReadOnly);
+ 		}
+ 	}
+@@ -5029,7 +5074,7 @@ void GSDeviceVK::DoStretchRect(GSTextureVK* sTex, const GSVector4& sRect, GSText
+ 	if (sTex->GetLayout() != GSTextureVK::Layout::ShaderReadOnly)
+ 	{
+ 		// can't transition in a render pass
+-		EndRenderPass();
++		SW2_END_RENDER_PASS();
+ 		sTex->TransitionToLayout(GSTextureVK::Layout::ShaderReadOnly);
+ 	}
+ 
+@@ -5047,7 +5092,7 @@ void GSDeviceVK::DoStretchRect(GSTextureVK* sTex, const GSVector4& sRect, GSText
+ 	{
+ 		OMSetRenderTargets(depth ? nullptr : dTex, depth ? dTex : nullptr, dst_rc);
+ 		if (InRenderPass() && dTex->GetState() == GSTexture::State::Cleared)
+-			EndRenderPass();
++			SW2_END_RENDER_PASS();
+ 	}
+ 	else
+ 	{
+@@ -5156,7 +5201,7 @@ void GSDeviceVK::BlitRect(GSTexture* sTex, const GSVector4i& sRect, u32 sLevel,
+ 	GSTextureVK* sTexVK = static_cast<GSTextureVK*>(sTex);
+ 	GSTextureVK* dTexVK = static_cast<GSTextureVK*>(dTex);
+ 
+-	EndRenderPass();
++	SW2_END_RENDER_PASS();
+ 
+ 	sTexVK->TransitionToLayout(GSTextureVK::Layout::TransferSrc);
+ 	dTexVK->TransitionToLayout(GSTextureVK::Layout::TransferDst);
+@@ -5255,7 +5300,7 @@ void GSDeviceVK::DoMerge(GSTexture* sTex[3], GSVector4* sRect, GSTexture* dTex,
+ 	// Merge the 2 source textures (sTex[0],sTex[1]). Final results go to dTex. Feedback write will go to sTex[2].
+ 	// If either 2nd output is disabled or SLBG is 1, a background color will be used.
+ 	// Note: background color is also used when outside of the unit rectangle area
+-	EndRenderPass();
++	SW2_END_RENDER_PASS();
+ 
+ 	// transition everything before starting the new render pass
+ 	const bool has_input_0 = (sTex[0] &&
+@@ -5301,7 +5346,7 @@ void GSDeviceVK::DoMerge(GSTexture* sTex[3], GSVector4* sRect, GSTexture* dTex,
+ 	const GSVector4i fbarea(0, 0, fbsize.x, fbsize.y);
+ 	if (feedback_write_2)
+ 	{
+-		EndRenderPass();
++		SW2_END_RENDER_PASS();
+ 		OMSetRenderTargets(sTex[2], nullptr, fbarea);
+ 		if (dcleared)
+ 			SetUtilityTexture(dTex, sampler);
+@@ -5313,7 +5358,7 @@ void GSDeviceVK::DoMerge(GSTexture* sTex[3], GSVector4* sRect, GSTexture* dTex,
+ 			SetUtilityPushConstants(yuv_constants, sizeof(yuv_constants));
+ 			DrawStretchRect(full_r, dRect[2], fbsize);
+ 		}
+-		EndRenderPass();
++		SW2_END_RENDER_PASS();
+ 
+ 		if (sTex[0] == sTex[2])
+ 		{
+@@ -5325,7 +5370,7 @@ void GSDeviceVK::DoMerge(GSTexture* sTex[3], GSVector4* sRect, GSTexture* dTex,
+ 	// Restore background color to process the normal merge
+ 	if (feedback_write_2_but_blend_bg || !dcleared)
+ 	{
+-		EndRenderPass();
++		SW2_END_RENDER_PASS();
+ 		OMSetRenderTargets(dTex, nullptr, darea);
+ 		BeginClearRenderPass(m_utility_color_render_pass_clear, darea, c);
+ 		dTex->SetState(GSTexture::State::Dirty);
+@@ -5349,7 +5394,7 @@ void GSDeviceVK::DoMerge(GSTexture* sTex[3], GSVector4* sRect, GSTexture* dTex,
+ 
+ 	if (feedback_write_1)
+ 	{
+-		EndRenderPass();
++		SW2_END_RENDER_PASS();
+ 		SetPipeline(GetConvertPipeline(ShaderConvert::YUV));
+ 		SetUtilityTexture(dTex, sampler);
+ 		SetUtilityPushConstants(yuv_constants, sizeof(yuv_constants));
+@@ -5358,7 +5403,7 @@ void GSDeviceVK::DoMerge(GSTexture* sTex[3], GSVector4* sRect, GSTexture* dTex,
+ 		DrawStretchRect(full_r, dRect[2], dsize);
+ 	}
+ 
+-	EndRenderPass();
++	SW2_END_RENDER_PASS();
+ 
+ 	// this texture is going to get used as an input, so make sure we don't read undefined data
+ 	static_cast<GSTextureVK*>(dTex)->CommitClear();
+@@ -5373,14 +5418,14 @@ void GSDeviceVK::DoInterlace(GSTexture* sTex, const GSVector4& sRect, GSTexture*
+ 	const GSVector4i rc = GSVector4i(dRect);
+ 	const GSVector4i dtex_rc = dTex->GetRect();
+ 	const GSVector4i clamped_rc = rc.rintersect(dtex_rc);
+-	EndRenderPass();
++	SW2_END_RENDER_PASS();
+ 	OMSetRenderTargets(dTex, nullptr, clamped_rc);
+ 	SetUtilityTexture(sTex, filter == Biln ? m_linear_sampler : m_point_sampler);
+ 	BeginRenderPassForStretchRect(static_cast<GSTextureVK*>(dTex), dTex->GetRect(), clamped_rc, false);
+ 	SetPipeline(m_interlace[static_cast<int>(shader)]);
+ 	SetUtilityPushConstants(&cb, sizeof(cb));
+ 	DrawStretchRect(sRect, dRect, dTex->GetSize());
+-	EndRenderPass();
++	SW2_END_RENDER_PASS();
+ 
+ 	static_cast<GSTextureVK*>(dTex)->TransitionToLayout(GSTextureVK::Layout::ShaderReadOnly);
+ }
+@@ -5389,7 +5434,7 @@ void GSDeviceVK::DoShadeBoost(GSTexture* sTex, GSTexture* dTex, const float para
+ {
+ 	const GSVector4 sRect = GSVector4(0.0f, 0.0f, 1.0f, 1.0f);
+ 	const GSVector4i dRect = dTex->GetRect();
+-	EndRenderPass();
++	SW2_END_RENDER_PASS();
+ 	OMSetRenderTargets(dTex, nullptr, dRect);
+ 	SetUtilityTexture(sTex, m_point_sampler);
+ 	BeginRenderPass(m_utility_color_render_pass_discard, dRect);
+@@ -5397,7 +5442,7 @@ void GSDeviceVK::DoShadeBoost(GSTexture* sTex, GSTexture* dTex, const float para
+ 	SetPipeline(m_shadeboost_pipeline);
+ 	SetUtilityPushConstants(params, sizeof(float) * 4);
+ 	DrawStretchRect(sRect, GSVector4(dRect), dTex->GetSize());
+-	EndRenderPass();
++	SW2_END_RENDER_PASS();
+ 
+ 	static_cast<GSTextureVK*>(dTex)->TransitionToLayout(GSTextureVK::Layout::ShaderReadOnly);
+ }
+@@ -5406,14 +5451,14 @@ void GSDeviceVK::DoFXAA(GSTexture* sTex, GSTexture* dTex)
+ {
+ 	const GSVector4 sRect = GSVector4(0.0f, 0.0f, 1.0f, 1.0f);
+ 	const GSVector4i dRect = dTex->GetRect();
+-	EndRenderPass();
++	SW2_END_RENDER_PASS();
+ 	OMSetRenderTargets(dTex, nullptr, dRect);
+ 	SetUtilityTexture(sTex, m_linear_sampler);
+ 	BeginRenderPass(m_utility_color_render_pass_discard, dRect);
+ 	dTex->SetState(GSTexture::State::Dirty);
+ 	SetPipeline(m_fxaa_pipeline);
+ 	DrawStretchRect(sRect, GSVector4(dRect), dTex->GetSize());
+-	EndRenderPass();
++	SW2_END_RENDER_PASS();
+ 
+ 	static_cast<GSTextureVK*>(dTex)->TransitionToLayout(GSTextureVK::Layout::ShaderReadOnly);
+ }
+@@ -5539,7 +5584,7 @@ bool GSDeviceVK::DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex)
+ 	GSTextureVK* const dst = static_cast<GSTextureVK*>(dTex);
+ 
+ 	// The chain records its own render passes, so it must not run inside one of ours.
+-	EndRenderPass();
++	SW2_END_RENDER_PASS();
+ 
+ 	// librashader's contract: source in SHADER_READ_ONLY_OPTIMAL, target in
+ 	// COLOR_ATTACHMENT_OPTIMAL.
+@@ -5665,8 +5710,25 @@ void GSDeviceVK::OMSetRenderTargets(
+ 		m_current_framebuffer_feedback_loop != feedback_loop ||
+ 		m_current_framebuffer == VK_NULL_HANDLE)
+ 	{
++#ifdef __SWITCH__
++		if (sw2_vk_trace_pass_ends.load(std::memory_order_relaxed) && InRenderPass())
++		{
++			const unsigned changes = (m_current_render_target != vkRt ? 1 : 0) |
++				(m_current_depth_target != vkDs ? 2 : 0) |
++				(m_current_framebuffer_feedback_loop != feedback_loop ? 4 : 0) |
++				(m_current_framebuffer == VK_NULL_HANDLE ? 8 : 0);
++			sw2_vk_target_break_reasons[changes].fetch_add(1, std::memory_order_relaxed);
++			if (changes == 4)
++			{
++				const unsigned previous = m_current_framebuffer_feedback_loop;
++				const unsigned next = feedback_loop;
++				if (previous < 8 && next < 8)
++					sw2_vk_feedback_transitions[previous * 8 + next].fetch_add(1, std::memory_order_relaxed);
++			}
++		}
++#endif
+ 		// framebuffer change or feedback loop enabled/disabled
+-		EndRenderPass();
++		SW2_END_RENDER_PASS();
+ 
+ 		if (vkRt)
+ 		{
+@@ -5703,7 +5765,7 @@ void GSDeviceVK::OMSetRenderTargets(
+ 		if (clear_pending &&
+ 			!m_current_render_pass_area.rcontains(GSVector4i::loadh(vkRt ? vkRt->GetSize() : vkDs->GetSize())))
+ 		{
+-			EndRenderPass();
++			SW2_END_RENDER_PASS();
+ 		}
+ 		else if (IsDeviceNVIDIA())
+ 		{
+@@ -5715,7 +5777,7 @@ void GSDeviceVK::OMSetRenderTargets(
+ 			{
+ 				if (vkRt->GetState() == GSTexture::State::Cleared)
+ 				{
+-					EndRenderPass();
++					SW2_END_RENDER_PASS();
+ 					vkRt->TransitionSubresourcesToLayout(GetCurrentCommandBuffer(), 0, 1,
+ 						vkRt->GetLayout(), vkRt->GetLayout());
+ 				}
+@@ -5729,7 +5791,7 @@ void GSDeviceVK::OMSetRenderTargets(
+ 			{
+ 				if (vkDs->GetState() == GSTexture::State::Cleared)
+ 				{
+-					EndRenderPass();
++					SW2_END_RENDER_PASS();
+ 					vkDs->TransitionSubresourcesToLayout(GetCurrentCommandBuffer(), 0, 1,
+ 						vkDs->GetLayout(), vkDs->GetLayout());
+ 				}
+@@ -7112,7 +7174,7 @@ bool GSDeviceVK::DoCAS(
+ {
+ 	g_perfmon.Put(GSPerfMon::TextureCopies, 1);
+ 
+-	EndRenderPass();
++	SW2_END_RENDER_PASS();
+ 
+ 	GSTextureVK* const sTexVK = static_cast<GSTextureVK*>(sTex);
+ 	GSTextureVK* const dTexVK = static_cast<GSTextureVK*>(dTex);
+@@ -7176,7 +7238,7 @@ bool GSDeviceVK::DoFSR1Pass(
+ {
+ 	g_perfmon.Put(GSPerfMon::TextureCopies, 1);
+ 
+-	EndRenderPass();
++	SW2_END_RENDER_PASS();
+ 
+ 	GSTextureVK* const sTexVK = static_cast<GSTextureVK*>(sTex);
+ 	GSTextureVK* const dTexVK = static_cast<GSTextureVK*>(dTex);
+@@ -7270,7 +7332,7 @@ bool GSDeviceVK::DoSGSR(GSTexture* sTex, GSTexture* dTex, const std::array<u32,
+ {
+ 	g_perfmon.Put(GSPerfMon::TextureCopies, 1);
+ 
+-	EndRenderPass();
++	SW2_END_RENDER_PASS();
+ 
+ 	GSTextureVK* const sTexVK = static_cast<GSTextureVK*>(sTex);
+ 	GSTextureVK* const dTexVK = static_cast<GSTextureVK*>(dTex);
+@@ -7338,6 +7400,10 @@ bool GSDeviceVK::DoSGSR(GSTexture* sTex, GSTexture* dTex, const std::array<u32,
+ 
+ void GSDeviceVK::DestroyResources()
+ {
++#ifdef __SWITCH__
++	if (s_sw2_tfx_cache_owner == this)
++		s_sw2_tfx_cache_owner = nullptr;
++#endif
+ 	// Before anything a worker reads is destroyed.
+ 	StopPipelinePrecompile();
+ 
+@@ -7845,11 +7911,65 @@ VkPipeline GSDeviceVK::CreateTFXPipeline(const PipelineSelector& p)
+ 	return pipeline;
+ }
+ 
+-VkPipeline GSDeviceVK::GetTFXPipeline(const PipelineSelector& p)
++VkPipeline GSDeviceVK::GetTFXPipeline(const PipelineSelector& requested)
+ {
++#ifdef __SWITCH__
++	// Match the state CreateTFXPipeline actually emits. Width is dynamic, the
++	// raster-order key is conditional, DATE-one only configures enabled stencil
++	// DATE, and ineffective blends already compile without the second output.
++	PipelineSelector canonical;
++	const PipelineSelector* selector = &requested;
++	if (sw2_vk_canonical_pipelines)
++	{
++		canonical = requested;
++		canonical.line_width = 0;
++		if (m_features.framebuffer_fetch || !m_features.declared_loop_overlap_needs_raster_order ||
++			!canonical.IsRTFeedbackLoop())
++			canonical.raster_order = 0;
++		if (!canonical.dss.date)
++			canonical.dss.date_one = 0;
++		if (!canonical.bs.IsEffective(canonical.cms))
++		{
++			canonical.bs = {};
++			canonical.ps.no_color1 = true;
++		}
++		selector = &canonical;
++	}
++	const PipelineSelector& p = *selector;
++	const bool measure = sw2_vk_measure.load(std::memory_order_relaxed);
++	if (measure)
++		sw2_vk_counters[4].fetch_add(1, std::memory_order_relaxed);
++	TFXCacheEntry* hot = nullptr;
++	if (sw2_vk_tfx_cache)
++	{
++		if (s_sw2_tfx_cache_owner != this)
++		{
++			s_sw2_tfx_cache.fill({});
++			s_sw2_tfx_cache_owner = this;
++		}
++		// The slot is only a hint. A hit requires the full selector and a live pipeline.
++		const u64 folded = p.ps.key_lo ^ (p.ps.key_lo >> 32) ^ p.ps.key_hi ^ p.key ^
++			(static_cast<u64>(p.vs.key) << 3) ^ (static_cast<u64>(p.bs.key) * 0x9e3779b1u);
++		hot = &s_sw2_tfx_cache[(folded ^ (folded >> 6) ^ (folded >> 12)) & (s_sw2_tfx_cache.size() - 1)];
++		if (hot->pipeline != VK_NULL_HANDLE && hot->key == p)
++		{
++			if (measure)
++				sw2_vk_counters[5].fetch_add(1, std::memory_order_relaxed);
++			return hot->pipeline;
++		}
++	}
++#else
++	const PipelineSelector& p = requested;
++#endif
+ 	const auto it = m_tfx_pipelines.find(p);
+ 	if (it != m_tfx_pipelines.end())
++	{
++#ifdef __SWITCH__
++		if (hot && it->second != VK_NULL_HANDLE)
++			*hot = {p, it->second};
++#endif
+ 		return it->second;
++	}
+ 
+ 	// A cache miss compiles SYNCHRONOUSLY on the GS thread, freezing the picture for as long as the
+ 	// driver takes. Normally invisible (a few ms, spread out), but fast-forward runs through content
+@@ -8418,7 +8538,7 @@ GSDeviceVK::WaitType GSDeviceVK::GetWaitType(bool wait, bool spin)
+ 
+ void GSDeviceVK::ExecuteCommandBuffer(bool wait_for_completion)
+ {
+-	EndRenderPass();
++	SW2_END_RENDER_PASS();
+ 	ExecuteCommandBuffer(GetWaitType(wait_for_completion, GSConfig.HWSpinCPUForReadbacks));
+ }
+ 
+@@ -8450,7 +8570,7 @@ void GSDeviceVK::ExecuteCommandBufferAndRestartRenderPass(bool wait_for_completi
+ 	const std::array<GSTextureVK*, NUM_TFX_TEXTURES> tfx_textures = m_tfx_textures;
+ 	const GSTextureVK* const utility_texture = m_utility_texture;
+ 
+-	EndRenderPass();
++	SW2_END_RENDER_PASS();
+ 	ExecuteCommandBuffer(GetWaitType(wait_for_completion, GSConfig.HWSpinCPUForReadbacks));
+ 
+ 	m_tfx_textures = tfx_textures;
+@@ -8524,7 +8644,19 @@ void GSDeviceVK::ExecuteCommandBufferAndRestartPresent(bool wait_for_completion,
+ void GSDeviceVK::ExecuteCommandBufferForReadback()
+ {
+ 	m_readback_frame = m_frame;
++#ifdef __SWITCH__
++	const bool measure = sw2_vk_measure.load(std::memory_order_relaxed);
++	const auto begin = measure ? Common::Timer::GetCurrentValue() : 0;
++#endif
+ 	ExecuteCommandBuffer(true);
++#ifdef __SWITCH__
++	if (measure)
++	{
++		sw2_vk_counters[2].fetch_add(1, std::memory_order_relaxed);
++		const double elapsed = Common::Timer::ConvertValueToMilliseconds(Common::Timer::GetCurrentValue() - begin);
++		sw2_vk_counters[3].fetch_add(static_cast<u64>(elapsed * 1e6), std::memory_order_relaxed);
++	}
++#endif
+ 	if (m_spinning_supported && GSConfig.HWSpinGPUForReadbacks)
+ 	{
+ 		m_spin_timer = 30;
+@@ -8654,7 +8786,7 @@ void GSDeviceVK::PSSetROVs(GSTexture* rt, GSTexture* ds, bool write_rt, bool wri
+ 		if (vkRt != oldVkRt || vkDs != oldVkDs)
+ 		{
+ 			GL_INS("VK: Ending render pass due to UAV switch");
+-			EndRenderPass();
++			SW2_END_RENDER_PASS();
+ 		}
+ 	}
+ 
+@@ -8665,7 +8797,7 @@ void GSDeviceVK::PSSetROVs(GSTexture* rt, GSTexture* ds, bool write_rt, bool wri
+ 		if ((vkRt || vkDs) && InRenderPass())
+ 		{
+ 			GL_INS("Ending render pass due to UAV barrier");
+-			EndRenderPass();
++			SW2_END_RENDER_PASS();
+ 		}
+ 		for (GSTextureVK* tex : std::array{ vkRt, vkDs })
+ 		{
+@@ -8674,7 +8806,7 @@ void GSDeviceVK::PSSetROVs(GSTexture* rt, GSTexture* ds, bool write_rt, bool wri
+ 				if (InRenderPass())
+ 				{
+ 					GL_INS("Ending render pass due to UAV barrier");
+-					EndRenderPass();
++					SW2_END_RENDER_PASS();
+ 				}
+ 				// The subresources version does the barrier even when the before/after layout
+ 				// are the same since we want a memory barrier here, not just a layout change.
+@@ -8702,7 +8834,7 @@ void GSDeviceVK::PSSetShaderResource(int i, GSTexture* sr, bool check_state, Res
+ 				if (InRenderPass())
+ 				{
+ 					GL_INS("Ending render pass due to resource transition");
+-					EndRenderPass();
++					SW2_END_RENDER_PASS();
+ 				}
+ 				vkTex->TransitionToLayout(layout);
+ 			}
+@@ -8780,7 +8912,7 @@ void GSDeviceVK::UnbindTexture(GSTextureVK* tex)
+ 	}
+ 	if (m_current_render_target == tex || m_current_depth_target == tex)
+ 	{
+-		EndRenderPass();
++		SW2_END_RENDER_PASS();
+ 		m_current_framebuffer = VK_NULL_HANDLE;
+ 		m_current_render_target = nullptr;
+ 		m_current_depth_target = nullptr;
+@@ -8795,7 +8927,7 @@ bool GSDeviceVK::InRenderPass()
+ void GSDeviceVK::BeginRenderPass(VkRenderPass rp, const GSVector4i& rect)
+ {
+ 	if (m_current_render_pass != VK_NULL_HANDLE)
+-		EndRenderPass();
++		SW2_END_RENDER_PASS();
+ 
+ 	m_current_render_pass = rp;
+ 	m_loop_declared_in_pass = false;
+@@ -8823,7 +8955,7 @@ void GSDeviceVK::CountRenderPassArea(const GSVector4i& rect)
+ void GSDeviceVK::BeginClearRenderPass(VkRenderPass rp, const GSVector4i& rect, const VkClearValue* cv, u32 cv_count)
+ {
+ 	if (m_current_render_pass != VK_NULL_HANDLE)
+-		EndRenderPass();
++		SW2_END_RENDER_PASS();
+ 
+ 	m_current_render_pass = rp;
+ 	m_loop_declared_in_pass = false;
+@@ -8860,6 +8992,10 @@ void GSDeviceVK::EndRenderPass()
+ 	m_current_render_pass = VK_NULL_HANDLE;
+ 	g_perfmon.Put(GSPerfMon::RenderPasses, 1);
+ 	m_render_passes_since_submit++;
++#ifdef __SWITCH__
++	if (sw2_vk_measure.load(std::memory_order_relaxed))
++		sw2_vk_counters[8].fetch_add(1, std::memory_order_relaxed);
++#endif
+ 	m_render_pass_serial++;
+ 
+ 	vkCmdEndRenderPass(GetCurrentCommandBuffer());
+@@ -8913,6 +9049,10 @@ __ri void GSDeviceVK::ApplyBaseState(u32 flags, VkCommandBuffer cmdbuf)
+ 		// dedupes same-pipeline requests, and the cost being tracked is the command
+ 		// actually reaching the driver.
+ 		g_perfmon.Put(GSPerfMon::PipelineSwitches, 1);
++#ifdef __SWITCH__
++		if (sw2_vk_measure.load(std::memory_order_relaxed))
++			sw2_vk_counters[6].fetch_add(1, std::memory_order_relaxed);
++#endif
+ 		vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_current_pipeline);
+ 	}
+ 
+@@ -9017,6 +9157,10 @@ bool GSDeviceVK::ApplyTFXState(bool already_execed)
+ 
+ 	if (flags & DIRTY_FLAG_TFX_TEXTURES)
+ 	{
++#ifdef __SWITCH__
++		if (sw2_vk_measure.load(std::memory_order_relaxed))
++			sw2_vk_counters[7].fetch_add(1, std::memory_order_relaxed);
++#endif
+ 		VkDescriptorSet ds = VK_NULL_HANDLE;
+ 		// Non-push path allocates a fresh (empty) descriptor set, so every binding the
+ 		// shader may read must be written — not just the dirty ones (push descriptors
+@@ -9201,7 +9345,7 @@ void GSDeviceVK::SetupDATE(GSTexture* rt, GSTexture* ds, SetDATM datm, const GSV
+ 	};
+ 
+ 	// sfex3 (after the capcom logo), vf4 (first menu fading in), ffxii shadows, rumble roses shadows, persona4 shadows
+-	EndRenderPass();
++	SW2_END_RENDER_PASS();
+ 	SetUtilityTexture(rt, m_point_sampler);
+ 	OMSetRenderTargets(nullptr, ds, bbox);
+ 	IASetVertexBuffer(vertices, sizeof(vertices[0]), 4);
+@@ -9210,7 +9354,7 @@ void GSDeviceVK::SetupDATE(GSTexture* rt, GSTexture* ds, SetDATM datm, const GSV
+ 	if (ApplyUtilityState())
+ 		DrawPrimitive();
+ 
+-	EndRenderPass();
++	SW2_END_RENDER_PASS();
+ }
+ 
+ GSTextureVK* GSDeviceVK::SetupPrimitiveTrackingDATE(GSHWDrawConfig& config)
+@@ -9231,7 +9375,7 @@ GSTextureVK* GSDeviceVK::SetupPrimitiveTrackingDATE(GSHWDrawConfig& config)
+ 	if (!image)
+ 		return nullptr;
+ 
+-	EndRenderPass();
++	SW2_END_RENDER_PASS();
+ 
+ 	// setup the fill quad to prefill with existing alpha values
+ 	SetUtilityTexture(config.rt, m_point_sampler);
+@@ -9289,7 +9433,7 @@ GSTextureVK* GSDeviceVK::SetupPrimitiveTrackingDATE(GSHWDrawConfig& config)
+ 		Draw(config);
+ 
+ 	// image is initialized/prepass is done, so finish up and get ready to do the "real" draw
+-	EndRenderPass();
++	SW2_END_RENDER_PASS();
+ 
+ 	// .. by setting it to DATE=3
+ 	config.ps.date = 3;
+@@ -9357,8 +9501,12 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
+ 		if (m_frame_resources[next_buffer].fence_counter <= m_completed_fence_counter)
+ 		{
+ 			// Submitting does not close an open pass, and this one ends at this draw anyway.
+-			EndRenderPass();
++			SW2_END_RENDER_PASS();
+ 			ExecuteCommandBuffer(WaitType::None);
++#ifdef __SWITCH__
++			if (sw2_vk_measure.load(std::memory_order_relaxed))
++				sw2_vk_counters[1].fetch_add(1, std::memory_order_relaxed);
++#endif
+ 		}
+ 	}
+ 
+@@ -9452,7 +9600,7 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
+ 		{
+ 			GL_PUSH("Blit ColorClip back to RT");
+ 
+-			EndRenderPass();
++			SW2_END_RENDER_PASS();
+ 			colclip_rt->TransitionToLayout(GSTextureVK::Layout::ShaderReadOnly);
+ 
+ 			draw_rt = static_cast<GSTextureVK*>(config.rt);
+@@ -9549,7 +9697,7 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
+ 		if (!colclip_rt)
+ 		{
+ 			config.colclip_update_area = config.drawarea;
+-			EndRenderPass();
++			SW2_END_RENDER_PASS();
+ 			colclip_rt = static_cast<GSTextureVK*>(CreateFeedbackTarget(draw_size.x, draw_size.y, GSTexture::Format::ColorClip, false));
+ 			if (!colclip_rt)
+ 			{
+@@ -9597,7 +9745,7 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
+ 	{
+ 		// DoStretchRect, not StretchRect: the latter flushes deferred draws, and this is one of them.
+ 		// The depth-output flag is what makes the copy write depth at all.
+-		EndRenderPass();
++		SW2_END_RENDER_PASS();
+ 		native_ds = static_cast<GSTextureVK*>(CreateDepthStencil(draw_size, false, true));
+ 		if (!native_ds)
+ 		{
+@@ -9616,7 +9764,7 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
+ 	if (colclip_rt && (config.colclip_mode == GSHWDrawConfig::ColClipMode::ConvertAndResolve || config.colclip_mode == GSHWDrawConfig::ColClipMode::ConvertOnly))
+ 	{
+ 		// colclip hw requires blitting.
+-		EndRenderPass();
++		SW2_END_RENDER_PASS();
+ 	}
+ 	else if (InRenderPass() &&
+ 		((draw_rt && m_current_render_target == draw_rt) ||
+@@ -9640,7 +9788,19 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
+ 		// Keep the open pass's feedback bits across a run of draws on the same target, as the
+ 		// renderer decided (GSDrawRoad.h). Per target: a draw that keeps the RT but swaps the depth
+ 		// buffer must not inherit the old depth feedback layout.
+-		if (config.road.carry_rt && draw_rt && m_current_render_target == draw_rt)
++		bool carry_rt = config.road.carry_rt;
++#ifdef __SWITCH__
++		// Keep the existing colour feedback pass for a non-reader on the same attachments.
++		// A later reader still uses the barriers selected by the GS draw road.
++		carry_rt |= sw2_vk_carry_colour_feedback && UseFeedbackLoopLayout() &&
++			m_features.texture_barrier && m_current_depth_target == draw_ds &&
++			m_current_framebuffer_feedback_loop == FeedbackLoopFlag_ReadAndWriteRT &&
++			pipe.feedback_loop_flags == FeedbackLoopFlag_None &&
++			!config.road.clone_rt && !config.require_one_barrier && !config.require_full_barrier &&
++			!config.IsFeedbackLoopRT(pipe.ps) &&
++			!config.blend_multi_pass.enable && !config.alpha_second_pass.enable;
++#endif
++		if (carry_rt && draw_rt && m_current_render_target == draw_rt)
+ 			pipe.feedback_loop_flags |= m_current_framebuffer_feedback_loop & FeedbackLoopFlag_ReadAndWriteRT;
+ 		if (config.road.carry_depth && draw_ds && m_current_depth_target == draw_ds)
+ 		{
+@@ -9658,7 +9818,7 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
+ 			GL_PUSH("VK: Copy RT to temp texture {%d,%d %dx%d}",
+ 				config.drawarea.left, config.drawarea.top,
+ 				config.drawarea.width(), config.drawarea.height());
+-			EndRenderPass();
++			SW2_END_RENDER_PASS();
+ 			if (config.tex_hazard)
+ 			{
+ 				const GSVector4i union_rect = config.drawarea.runion(config.samplearea);
+@@ -9910,7 +10070,7 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
+ 
+ 	if (native_ds)
+ 	{
+-		EndRenderPass();
++		SW2_END_RENDER_PASS();
+ 		draw_ds = full_ds;
+ 		Recycle(native_ds);
+ 	}
+@@ -9925,7 +10085,7 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
+ 		{
+ 			GL_PUSH("Blit ColorClip back to RT");
+ 
+-			EndRenderPass();
++			SW2_END_RENDER_PASS();
+ 
+ 			colclip_rt->TransitionToLayout(GSTextureVK::Layout::ShaderReadOnly);
+ 
+@@ -10402,7 +10562,7 @@ void GSDeviceVK::RemotePlayVSync(GSTexture* src, const GSVector4& src_uv, const
+ 	{
+ 		m_rp_frame->CommitClear();
+ 	}
+-	EndRenderPass();
++	SW2_END_RENDER_PASS();
+ 
+ 	const VkCommandBuffer cmd = GetCurrentCommandBuffer();
+ 	m_rp_frame->TransitionToLayout(GSTextureVK::Layout::TransferSrc);
 diff --git a/pcsx2/GS/Renderers/Vulkan/VKLibretro.cpp b/pcsx2/GS/Renderers/Vulkan/VKLibretro.cpp
 index 5bba9b2520..7d8f661dfb 100644
 --- a/pcsx2/GS/Renderers/Vulkan/VKLibretro.cpp
@@ -667,38 +1577,64 @@ index 5bba9b2520..7d8f661dfb 100644
  		s_pacing = enabled;
  		if (!enabled)
 diff --git a/pcsx2/GameDatabase.cpp b/pcsx2/GameDatabase.cpp
-index 1bac5a4b58..869c72d0dd 100644
+index 1bac5a4b58..4b79a66670 100644
 --- a/pcsx2/GameDatabase.cpp
 +++ b/pcsx2/GameDatabase.cpp
-@@ -889,6 +889,9 @@ bool GameDatabaseSchema::GameEntry::configMatchesHWFix(const Pcsx2Config::GSOpti
+@@ -889,6 +889,10 @@ bool GameDatabaseSchema::GameEntry::configMatchesHWFix(const Pcsx2Config::GSOpti
  	}
  }
  
 +#ifdef __SWITCH__
 +extern int sw2_db_effects;  // SW2PS2 front end: apply the database's accuracy recommendations
++extern int sw2_blending_explicit;
 +#endif
  void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
  	Pcsx2Config::GSOptions& config, const PerGameOverrides& overrides, ApplyMode mode) const
  {
-@@ -1169,6 +1172,17 @@ void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
+@@ -1144,6 +1148,10 @@ void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
+ 
+ 			case GSHWFixId::MinimumBlendingLevel:
+ 			{
++#ifdef __SWITCH__
++				if (sw2_blending_explicit)
++					break;
++#endif
+ 				if (value >= 0 && value <= static_cast<int>(AccBlendLevel::Maximum))
+ 					config.AccurateBlendingUnit = std::max(config.AccurateBlendingUnit, static_cast<AccBlendLevel>(value));
+ 			}
+@@ -1151,6 +1159,10 @@ void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
+ 
+ 			case GSHWFixId::MaximumBlendingLevel:
+ 			{
++#ifdef __SWITCH__
++				if (sw2_blending_explicit)
++					break;
++#endif
+ 				if (value >= 0 && value <= static_cast<int>(AccBlendLevel::Maximum))
+ 					config.AccurateBlendingUnit = std::min(config.AccurateBlendingUnit, static_cast<AccBlendLevel>(value));
+ 			}
+@@ -1169,6 +1181,20 @@ void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
  
  			case GSHWFixId::RecommendedBlendingLevel:
  			{
 +#ifdef __SWITCH__
-+				// SW2PS2: effects must look right, so the database's recommendation is applied
-+				// rather than shown as a warning (GPU headroom is ample at native resolution).
-+				if (sw2_db_effects && !quiet && !is_sw_renderer && value >= 0 && value <= static_cast<int>(AccBlendLevel::Maximum) &&
-+					static_cast<int>(config.AccurateBlendingUnit) < value)
++				// SW2PS2 uses the selected blending level when the front end sets one;
++				// otherwise honour the database recommendation.
++				// A recommendation of Maximum is taken as Full: Maximum is too slow on the Switch 2
++				// (TimeSplitters: Future Perfect 59.5 -> 56 fps at 1x, 43 at 2x); a player can still choose it.
++				const int level = std::min(value, static_cast<int>(AccBlendLevel::Full));
++				if (sw2_db_effects && !sw2_blending_explicit && !quiet && !is_sw_renderer && level >= 0 &&
++					static_cast<int>(config.AccurateBlendingUnit) < level)
 +				{
-+					config.AccurateBlendingUnit = static_cast<AccBlendLevel>(value);
-+					Console.WriteLn("SW2PS2: blending accuracy raised to the database's level %d", value);
++					config.AccurateBlendingUnit = static_cast<AccBlendLevel>(level);
++					Console.WriteLn("SW2PS2: blending accuracy raised to the database's level %d (recommended %d)", level, value);
 +				}
 +				break;
 +#endif
  				// Quiet also while auto-tune applies a trial: a toast per apply stacks up (see AutoTune::IsApplyingSettings).
  				if (quiet || AutoTune::IsApplyingSettings())
  					break;
-@@ -1204,6 +1218,14 @@ void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
+@@ -1204,6 +1230,14 @@ void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
  
  			case GSHWFixId::RecommendedAccurateAlphaTest:
  			{
@@ -713,7 +1649,7 @@ index 1bac5a4b58..869c72d0dd 100644
  				// Quiet also while auto-tune applies a trial: a toast per apply stacks up (see AutoTune::IsApplyingSettings).
  				if (quiet || AutoTune::IsApplyingSettings())
  					break;
-@@ -1229,6 +1251,14 @@ void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
+@@ -1229,6 +1263,14 @@ void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
  
  			case GSHWFixId::RecommendedHWAA1:
  			{
@@ -758,15 +1694,101 @@ index edf0c786f9..592cdfe969 100644
  
  		/// Sets the secrets settings layer. Should follow call to SetBaseSettingsLayer.
  		void SetSecretsSettingsLayer(SettingsInterface* sif);
+diff --git a/pcsx2/Host/AudioStream.cpp b/pcsx2/Host/AudioStream.cpp
+index 4e8169f047..3347834515 100644
+--- a/pcsx2/Host/AudioStream.cpp
++++ b/pcsx2/Host/AudioStream.cpp
+@@ -4,6 +4,7 @@
+ #include "Host/AudioStream.h"
+ #include "FreeSurroundDecoder.h"
+ #include "Host.h"
++#include "Config.h"
+ #include "GS/GSVector.h"
+ 
+ #include "common/Assertions.h"
+@@ -26,6 +27,9 @@
+ //#define LOG_UNDERRUN(...) DEV_LOG(__VA_ARGS__)
+ #define LOG_UNDERRUN(...) (void)0
+ static constexpr bool LOG_TIMESTRETCH_STATS = false;
++#if defined(__SWITCH__) && defined(ENABLE_LIBRETRO)
++std::atomic<float> sw2_output_tempo{1.0f};
++#endif
+ 
+ static constexpr const std::array<std::pair<u8, u8>, static_cast<size_t>(AudioExpansionMode::Count)>
+ 	s_expansion_channel_count = {{
+@@ -130,6 +134,17 @@ std::unique_ptr<AudioStream> AudioStream::CreateStream(AudioBackend backend, u32
+ #endif
+ 
+ 		case AudioBackend::Null:
++#if defined(__SWITCH__) && defined(ENABLE_LIBRETRO)
++			if (stretch_enabled)
++			{
++				// The frontend pulls this stream into its own device queue.
++				AudioStreamParameters params = parameters;
++				params.expansion_mode = AudioExpansionMode::Disabled;
++				std::unique_ptr<AudioStream> stream(new AudioStream(sample_rate, params));
++				stream->BaseInitialize(&StereoSampleReaderImpl, true);
++				return stream;
++			}
++#endif
+ 			return CreateNullStream(sample_rate, parameters.buffer_ms);
+ 
+ 		default:
+@@ -651,6 +666,11 @@ void AudioStream::StretchWriteBlock(const float* block)
+ {
+ 	if (IsStretchEnabled())
+ 	{
++#if defined(__SWITCH__) && defined(ENABLE_LIBRETRO)
++		const bool frontend_clock = EmuConfig.SPU2.Backend == AudioBackend::Null;
++		if (frontend_clock)
++			m_soundtouch->setTempo(sw2_output_tempo.load(std::memory_order_relaxed));
++#endif
+ 		m_soundtouch->putSamples(block, CHUNK_SIZE);
+ 
+ 		u32 tempProgress;
+@@ -659,7 +679,9 @@ void AudioStream::StretchWriteBlock(const float* block)
+ 			InternalWriteFrames(m_staging_buffer.get(), tempProgress);
+ 		}
+ 
+-		if (IsStretchEnabled())
++#if defined(__SWITCH__) && defined(ENABLE_LIBRETRO)
++		if (!frontend_clock)
++#endif
+ 			UpdateStretchTempo();
+ 	}
+ 	else
 diff --git a/pcsx2/Hw.cpp b/pcsx2/Hw.cpp
-index 76d55ed399..93d65ad62d 100644
+index 76d55ed399..907740eeeb 100644
 --- a/pcsx2/Hw.cpp
 +++ b/pcsx2/Hw.cpp
-@@ -149,6 +149,7 @@ __ri bool hwMFIFOWrite(u32 addr, const u128* data, uint qwc)
+@@ -15,6 +15,11 @@
+ 
+ #include <deque>
+ 
++#ifdef __SWITCH__
++#include "MfifoWriteRange.h"
++extern "C" { int sw2_mfifo_precise_notify = 1; }
++#endif
++
+ using namespace R5900;
+ 
+ const int rdram_devices = 2;	// put 8 for TOOL and 2 for PS2 and PSX
+@@ -148,7 +153,18 @@ __ri bool hwMFIFOWrite(u32 addr, const u128* data, uint qwc)
+ 		const u32 ringsize = (dmacRegs.rbsr.RMSK / 16) + 1;
  		pxAssertMsg( PSM(dmacRegs.rbor.ADDR+ringsize-1) != NULL, "Scratchpad/MFIFO ringbuffer spans into invalid (unmapped) physical memory!" );
  		uint startpos = (addr & dmacRegs.rbsr.RMSK)/16;
++#ifdef __SWITCH__
++        const uint write_start = startpos;
++#endif
  		MemCopy_WrappedDest( data, dst, startpos, ringsize, qwc );
-+		vtlb_NotifyHostWrite(dst, ringsize * 16); // SW2PS2 soft code protection (the whole ring: it wraps)
++#ifdef __SWITCH__
++        if (sw2_mfifo_precise_notify) {
++            const MfifoWriteRanges ranges = GetMfifoWriteRanges(write_start, ringsize, qwc);
++            if (ranges.first_count) vtlb_NotifyHostWrite(dst + ranges.first_start, ranges.first_count * 16);
++            if (ranges.second_count) vtlb_NotifyHostWrite(dst, ranges.second_count * 16);
++        } else
++#endif
++        vtlb_NotifyHostWrite(dst, ringsize * 16); // conservatively cover the ring
  	}
  	else
  	{
@@ -1592,7 +2614,7 @@ index 6e12dfeff5..418bb711a6 100644
  	/// least this far below it. The SD865 (1024 against 871) and the T820 (1024 against 869) qualify; a Dimensity
  	/// 8300 (an X-class core a few percent over three more of its kind) and a part whose top cores are equal do not.
 diff --git a/pcsx2/IopThread/IopThread.cpp b/pcsx2/IopThread/IopThread.cpp
-index 78834b23b5..d1bd05bf5a 100644
+index 78834b23b5..edc12ef080 100644
 --- a/pcsx2/IopThread/IopThread.cpp
 +++ b/pcsx2/IopThread/IopThread.cpp
 @@ -1,7 +1,7 @@
@@ -1604,7 +2626,16 @@ index 78834b23b5..d1bd05bf5a 100644
  
  #include "IopThread/IopThread.h"
  
-@@ -66,7 +66,11 @@ namespace IopThread
+@@ -19,6 +19,8 @@
+ #include <unistd.h>
+ #endif
+ 
++extern "C" { int sw2_iop_ee_nofence = 1; }  // SW2PS2: see Start() (front end test key "iopNoFence")
++
+ namespace IopThread
+ {
+ 	namespace
+@@ -66,7 +68,11 @@ namespace IopThread
  		// clears the monitor, which is the event WFE waits for. Elsewhere it is the spin hint.
  		__fi void WaitForLineChange(const std::atomic<u64>& word, u64 expected)
  		{
@@ -1617,7 +2648,7 @@ index 78834b23b5..d1bd05bf5a 100644
  			u64 seen;
  			__asm__ __volatile__(
  				"sevl\n"
-@@ -95,8 +99,6 @@ namespace IopThread
+@@ -95,8 +101,6 @@ namespace IopThread
  		Stop();
  	}
  
@@ -1626,7 +2657,7 @@ index 78834b23b5..d1bd05bf5a 100644
  	bool Thread::Start(Params params)
  	{
  		if (m_running)
-@@ -109,6 +111,7 @@ namespace IopThread
+@@ -109,6 +113,7 @@ namespace IopThread
  		m_mode = m_params.mode;
  		m_lag = m_params.lag;
  		m_min_slice = std::max<s32>(m_params.min_slice, 0);
@@ -1634,7 +2665,18 @@ index 78834b23b5..d1bd05bf5a 100644
  		m_idle_spin_ns = m_params.idle_spin_ns;
  #if defined(__linux__)
  		m_use_membarrier = (m_params.sleep_barrier == SleepBarrier::Auto) && RegisterMembarrier();
-@@ -119,7 +122,19 @@ namespace IopThread
+@@ -116,10 +121,30 @@ namespace IopThread
+ 		m_use_membarrier = false;
+ #endif
+ 		m_ee_fence = !m_use_membarrier;
++#ifdef __SWITCH__
++		// SW2PS2: no membarrier on Horizon, so the EE paid a full fence on every event test. Instead the
++		// EE skips it and the IOP's idle sleep polls (IdleWait): a wake-up lost to a stale `sleeping`
++		// read delays the IOP by at most kSleepPollUs, and the EE's own waits on the IOP re-wake it.
++		m_sleep_polled = sw2_iop_ee_nofence != 0;
++		if (m_sleep_polled)
++			m_ee_fence = false;
++#endif
  
  		// Nothing else touches any of this: the IOP thread does not exist yet. The thread's creation
  		// orders these writes before its first read.
@@ -1654,7 +2696,7 @@ index 78834b23b5..d1bd05bf5a 100644
  		m_i2e.Reset();
  		m_e2i_kicks.TakeAll();
  		m_call.fn = nullptr;
-@@ -152,7 +167,8 @@ namespace IopThread
+@@ -152,7 +177,8 @@ namespace IopThread
  				 &m_e2i_full_spins, &m_e2i_full_iterations, &m_e2i_full_failfast, &m_i2e_drained, &m_calls_served, &m_wakes_sent,
  				 &m_wakes_dropped, &m_stop_checks, &m_handoffs, &m_slices, &m_items_applied, &m_parks, &m_holds_entered,
  				 &m_calls_posted, &m_calls_cancelled, &m_i2e_full_waits, &m_kicks_applied, &m_lag_spins_idle, &m_lag_idle_stall_ns,
@@ -1664,7 +2706,7 @@ index 78834b23b5..d1bd05bf5a 100644
  			c->Reset();
  
  		// A hold that is live when the thread starts keeps it stopped: the IOP comes up held at the
-@@ -207,13 +223,13 @@ namespace IopThread
+@@ -207,13 +233,13 @@ namespace IopThread
  		m_running = false;
  		m_iop_tid = std::thread::id();
  		m_mode = IopThreadMode::Off;
@@ -1681,7 +2723,7 @@ index 78834b23b5..d1bd05bf5a 100644
  		Threading::SetNameOfCurrentThread(m_params.name);
  		PerformanceMetrics::AdpfRegisterCallingThread();
  		PageFaultHandler::InstallSecondaryThread();
-@@ -232,12 +248,11 @@ namespace IopThread
+@@ -232,12 +258,11 @@ namespace IopThread
  		m_host.RunPending();
  	}
  
@@ -1699,7 +2741,7 @@ index 78834b23b5..d1bd05bf5a 100644
  	template <class Ready>
  	void Thread::ParkUntil(Ready&& ready)
  	{
-@@ -264,10 +279,10 @@ namespace IopThread
+@@ -264,10 +289,10 @@ namespace IopThread
  		return true;
  	}
  
@@ -1714,7 +2756,7 @@ index 78834b23b5..d1bd05bf5a 100644
  	void Thread::IdleWait()
  	{
  		m_idle_waits.Add();
-@@ -282,7 +297,6 @@ namespace IopThread
+@@ -282,18 +307,21 @@ namespace IopThread
  			if (NowNs() >= deadline)
  			{
  				m_sleep.sleeping.store(true, std::memory_order_seq_cst);
@@ -1722,7 +2764,15 @@ index 78834b23b5..d1bd05bf5a 100644
  				if (IopStoreLoadBarrier())
  				{
  					if (!WorkAvailable())
-@@ -293,7 +307,6 @@ namespace IopThread
+ 					{
+ 						m_parks.Add();
++#ifdef __SWITCH__
++						if (m_sleep_polled)
++							m_sema.WaitForWorkPolled([this] { return WorkAvailable(); }, kSleepPollUs);
++						else
++#endif
+ 						m_sema.WaitForWork();
+ 					}
  					m_sleep.sleeping.store(false, std::memory_order_relaxed);
  					break;
  				}
@@ -1730,7 +2780,7 @@ index 78834b23b5..d1bd05bf5a 100644
  				m_sleep.sleeping.store(false, std::memory_order_relaxed);
  			}
  			WaitForLineChange(m_ee.wm, wm);
-@@ -311,7 +324,7 @@ namespace IopThread
+@@ -311,7 +339,7 @@ namespace IopThread
  		bool run = false;
  		if (budget > 0)
  		{
@@ -1739,7 +2789,7 @@ index 78834b23b5..d1bd05bf5a 100644
  			run = budget >= m_min_slice || next <= wm || m_ee.spinning.load(std::memory_order_relaxed);
  		}
  		if (!run && m_params.has_event && m_params.has_event())
-@@ -336,7 +349,7 @@ namespace IopThread
+@@ -336,7 +364,7 @@ namespace IopThread
  	void Thread::ApplyDueItems()
  	{
  		E2IItem item;
@@ -1748,7 +2798,7 @@ index 78834b23b5..d1bd05bf5a 100644
  		{
  			if (m_params.apply_item)
  				m_params.apply_item(item);
-@@ -356,9 +369,8 @@ namespace IopThread
+@@ -356,9 +384,8 @@ namespace IopThread
  			m_params.apply_kicks(bits);
  	}
  
@@ -1760,7 +2810,7 @@ index 78834b23b5..d1bd05bf5a 100644
  	void Thread::RunOneSlice(u64 target)
  	{
  		u64 reached = m_params.run_slice(m_iop_pos, target);
-@@ -367,11 +379,22 @@ namespace IopThread
+@@ -367,11 +394,22 @@ namespace IopThread
  			reached = m_iop_pos;
  		m_iop_pos = reached;
  		ApplyDueItems();
@@ -1783,7 +2833,7 @@ index 78834b23b5..d1bd05bf5a 100644
  	void Thread::ThreadedLoop()
  	{
  		while (!m_ee.shutdown.load(std::memory_order_acquire))
-@@ -452,26 +475,26 @@ namespace IopThread
+@@ -452,26 +490,26 @@ namespace IopThread
  			ParkUntil([&] { return !still_held(); });
  	}
  
@@ -1819,7 +2869,7 @@ index 78834b23b5..d1bd05bf5a 100644
  				return true;
  			if (n < kI2ESpaceSpins)
  				SpinHint();
-@@ -492,6 +515,7 @@ namespace IopThread
+@@ -492,6 +530,7 @@ namespace IopThread
  
  		m_call.fn = fn;
  		m_call.arg = arg;
@@ -1827,7 +2877,7 @@ index 78834b23b5..d1bd05bf5a 100644
  		// Pairs with the acquire CAS in ServeCall().
  		m_call.state.store(kCallPosted, std::memory_order_release);
  		m_calls_posted.Add();
-@@ -529,8 +553,6 @@ namespace IopThread
+@@ -529,8 +568,6 @@ namespace IopThread
  		}
  	}
  
@@ -1836,7 +2886,7 @@ index 78834b23b5..d1bd05bf5a 100644
  	bool Thread::ShouldStop()
  	{
  		m_stop_checks.Add();
-@@ -584,9 +606,19 @@ namespace IopThread
+@@ -584,9 +621,19 @@ namespace IopThread
  			m_i2e.Pop();
  			taken++;
  			if (item.kind == I2EKind::CallOnEE)
@@ -1858,7 +2908,7 @@ index 78834b23b5..d1bd05bf5a 100644
  		}
  		m_i2e_drained.Add(taken);
  		return taken;
-@@ -603,6 +635,7 @@ namespace IopThread
+@@ -603,6 +650,7 @@ namespace IopThread
  
  		void (*fn)(void*) = m_call.fn;
  		void* arg = m_call.arg;
@@ -1866,7 +2916,7 @@ index 78834b23b5..d1bd05bf5a 100644
  		const bool was_in_call = m_in_call;
  		m_in_call = true;
  		fn(arg);
-@@ -615,14 +648,15 @@ namespace IopThread
+@@ -615,14 +663,15 @@ namespace IopThread
  		m_sema.NotifyOfWork(); // not filtered: the IOP may be asleep waiting for exactly this
  	}
  
@@ -1885,7 +2935,7 @@ index 78834b23b5..d1bd05bf5a 100644
  		// What the IOP was doing when the wait began, read before the wake-up below: asleep (or on its
  		// way), so the EE also waits for it to wake, or idle and awake, watching a watermark that gives it
  		// less than S_min to run.
-@@ -641,7 +675,7 @@ namespace IopThread
+@@ -641,7 +690,7 @@ namespace IopThread
  			if (m_i2e.MayHaveItems())
  				DrainI2E();
  			const u64 pos = m_iop.pos_pub.load(std::memory_order_acquire);
@@ -1894,7 +2944,7 @@ index 78834b23b5..d1bd05bf5a 100644
  			{
  				m_last_seen_iop_pos = pos;
  				reached = true;
-@@ -655,8 +689,15 @@ namespace IopThread
+@@ -655,8 +704,15 @@ namespace IopThread
  			}
  		}
  		m_ee.spinning.store(false, std::memory_order_relaxed);
@@ -1911,7 +2961,7 @@ index 78834b23b5..d1bd05bf5a 100644
  		m_lag_stall_ns.Add(stall_ns);
  		if (found_parked)
  		{
-@@ -671,8 +712,39 @@ namespace IopThread
+@@ -671,8 +727,39 @@ namespace IopThread
  		return reached;
  	}
  
@@ -1951,7 +3001,7 @@ index 78834b23b5..d1bd05bf5a 100644
  		if (!m_e2i.TryPush(stamp, kind, arg))
  		{
  			if (!WaitForE2ISpace(stamp, kind, arg))
-@@ -692,7 +764,6 @@ namespace IopThread
+@@ -692,7 +779,6 @@ namespace IopThread
  		return true;
  	}
  
@@ -1959,7 +3009,7 @@ index 78834b23b5..d1bd05bf5a 100644
  	bool Thread::WaitForE2ISpace(u64 stamp, u16 kind, u32 arg)
  	{
  		// Making room takes the IOP consuming, which it cannot do while it is held, while it is
-@@ -732,8 +803,6 @@ namespace IopThread
+@@ -732,8 +818,6 @@ namespace IopThread
  		return queued;
  	}
  
@@ -1968,7 +3018,7 @@ index 78834b23b5..d1bd05bf5a 100644
  	void Thread::AcquireHold(HoldKind kind)
  	{
  		// The IOP is already stopped for a hold taken inside another, inside a CallOnEE function, in
-@@ -765,10 +834,8 @@ namespace IopThread
+@@ -765,10 +849,8 @@ namespace IopThread
  		m_ee.spinning.store(true, std::memory_order_relaxed);
  		WakeIfParked(WakeSite::SpinEntry);
  
@@ -1981,7 +3031,7 @@ index 78834b23b5..d1bd05bf5a 100644
  		const bool may_sleep = (kind == HoldKind::Lifecycle);
  		const auto begin = std::chrono::steady_clock::now();
  		bool sleeping = false;
-@@ -841,6 +908,7 @@ namespace IopThread
+@@ -841,6 +923,7 @@ namespace IopThread
  	{
  		pxAssertMsg(m_hold_depth > 0 || !m_running, "Resync() needs the IOP held or stopped");
  		m_e2i.Reset();
@@ -1989,7 +3039,7 @@ index 78834b23b5..d1bd05bf5a 100644
  		m_i2e.Reset();
  		m_e2i_kicks.TakeAll();
  		m_ee_wm_local = ee_cycle;
-@@ -852,8 +920,6 @@ namespace IopThread
+@@ -852,8 +935,6 @@ namespace IopThread
  		m_iop.pos_pub.store(iop_pos, std::memory_order_relaxed);
  	}
  
@@ -1998,7 +3048,7 @@ index 78834b23b5..d1bd05bf5a 100644
  	u64 Thread::LockstepCall(u32 kind, u64 arg)
  	{
  		pxAssertMsg(m_running && m_mode == IopThreadMode::Lockstep, "a Lockstep handoff needs a running Lockstep thread");
-@@ -891,6 +957,16 @@ namespace IopThread
+@@ -891,6 +972,16 @@ namespace IopThread
  		return static_cast<size_t>(LockstepCall(kLsApplyUpTo, stamp));
  	}
  
@@ -2015,7 +3065,7 @@ index 78834b23b5..d1bd05bf5a 100644
  	void Thread::LockstepLoop()
  	{
  		u64 done = 0;
-@@ -906,11 +982,25 @@ namespace IopThread
+@@ -906,11 +997,25 @@ namespace IopThread
  				if (m_host.HasPending())
  					m_host.RunPending();
  
@@ -2045,7 +3095,7 @@ index 78834b23b5..d1bd05bf5a 100644
  					m_iop.pos_pub.store(m_iop_pos, std::memory_order_relaxed);
  					m_ls.result = m_iop_pos;
  				}
-@@ -946,7 +1036,43 @@ namespace IopThread
+@@ -946,7 +1051,43 @@ namespace IopThread
  		}
  	}
  
@@ -2090,7 +3140,7 @@ index 78834b23b5..d1bd05bf5a 100644
  
  	Thread::Ticket Thread::PostHostCommand(HostCommandQueue::Command command)
  	{
-@@ -982,6 +1108,11 @@ namespace IopThread
+@@ -982,6 +1123,11 @@ namespace IopThread
  		s.emu_hold_requests = m_emu_hold_requests.Get();
  		s.emu_hold_stall_ns = m_emu_hold_stall_ns.Get();
  		s.sif_ee_pumps = m_sif_ee_pumps.Get();
@@ -2102,7 +3152,7 @@ index 78834b23b5..d1bd05bf5a 100644
  		s.hold_requests = m_hold_requests.Get();
  		s.hold_markers = m_hold_markers.Get();
  		s.hold_spin_iterations = m_hold_spin_iterations.Get();
-@@ -995,6 +1126,20 @@ namespace IopThread
+@@ -995,6 +1141,20 @@ namespace IopThread
  		s.wakes_dropped = m_wakes_dropped.Get();
  		s.stop_checks = m_stop_checks.Get();
  		s.handoffs = m_handoffs.Get();
@@ -2124,7 +3174,7 @@ index 78834b23b5..d1bd05bf5a 100644
  		s.items_applied = m_items_applied.Get();
  		s.parks = m_parks.Get();
 diff --git a/pcsx2/IopThread/IopThread.h b/pcsx2/IopThread/IopThread.h
-index 5dde561fa5..3e137148d3 100644
+index 5dde561fa5..be367e6a87 100644
 --- a/pcsx2/IopThread/IopThread.h
 +++ b/pcsx2/IopThread/IopThread.h
 @@ -1,10 +1,9 @@
@@ -2776,7 +3826,18 @@ index 5dde561fa5..3e137148d3 100644
  		I2EQueue<kI2EQueueCapacity> m_i2e;
  		KickBits m_e2i_kicks;
  		HostCommandQueue m_host;
-@@ -692,20 +859,21 @@ namespace IopThread
+@@ -678,6 +845,10 @@ namespace IopThread
+ 		// and stores of them stay in the EE's cache.
+ 		alignas(kChannelLineSize) u64 m_ee_wm_local = 0;
+ 		bool m_ee_fence = false; // the EE's half of the sleep handshake is a fence (no membarrier)
++#ifdef __SWITCH__
++		static constexpr u32 kSleepPollUs = 500; // SW2PS2: the idle IOP's sleep re-checks this often (m_sleep_polled)
++		bool m_sleep_polled = false; // SW2PS2: the EE skips its fence; the idle sleep polls instead
++#endif
+ 		u64 m_last_seen_iop_pos = 0;
+ 		u32 m_hold_depth = 0;
+ 		bool m_hold_requested = false; // hold_target is set for a hold this thread owns
+@@ -692,20 +863,21 @@ namespace IopThread
  			u64 result = 0;
  		} m_ls; // the Lockstep mailbox; ordered by req_seq and done_seq
  
@@ -2802,13 +3863,32 @@ index 5dde561fa5..3e137148d3 100644
  	/// The outermost hold publishes the EE's cycle, asks the IOP to run up to it, waits until it
  	/// has, and the IOP then stays still until the hold ends. Holds taken while one is live, or
 diff --git a/pcsx2/IopThread/IopThreadMode.cpp b/pcsx2/IopThread/IopThreadMode.cpp
-index d1bf5976ea..179e67973b 100644
+index d1bf5976ea..6295289eab 100644
 --- a/pcsx2/IopThread/IopThreadMode.cpp
 +++ b/pcsx2/IopThread/IopThreadMode.cpp
-@@ -31,6 +31,18 @@ s32 IopThread::ClampLag(s32 requested)
- 	return std::clamp(requested, kMinLag, kMaxLag);
- }
+@@ -7,6 +7,10 @@
  
+ #include <algorithm>
+ 
++#ifdef __SWITCH__
++extern "C" uint32_t sw2_ee_wait_cycles;
++#endif
++
+ IopThreadMode IopThread::s_mode = IopThreadMode::Off;
+ 
+ namespace
+@@ -28,7 +32,24 @@ bool IopThread::IsRecompilerTestHarness()
+ 
+ s32 IopThread::ClampLag(s32 requested)
+ {
++#ifdef __SWITCH__
++	const s32 minLag = (s32)sw2_ee_wait_cycles + 1024;
++	return std::clamp(requested, minLag, kMaxLag);
++#else
+ 	return std::clamp(requested, kMinLag, kMaxLag);
++#endif
++}
++
 +bool IopThread::DefaultOnForHost(const HostCpuInfo& host, bool mtvu)
 +{
 +	if (host.performance_cores < kMinPerformanceCores || host.performance_cores > kMaxDefaultOnPerformanceCores)
@@ -2819,12 +3899,10 @@ index d1bf5976ea..179e67973b 100644
 +	config.Speedhacks.iopThreadLockstep = false;
 +	config.Speedhacks.vuThread = mtvu;
 +	return ResolveMode(config, host, VmConditions{}) == IopThreadMode::Threaded;
-+}
-+
+ }
+ 
  IopThreadMode IopThread::ResolveMode(const Pcsx2Config& config, const HostCpuInfo& host, const VmConditions& vm)
- {
- 	if (!config.Speedhacks.iopThread)
-@@ -41,22 +53,27 @@ IopThreadMode IopThread::ResolveMode(const Pcsx2Config& config, const HostCpuInf
+@@ -41,22 +62,27 @@ IopThreadMode IopThread::ResolveMode(const Pcsx2Config& config, const HostCpuInf
  	if (vm.ps1_mode || vm.arcade || vm.gs_dump_replay || vm.iop_breakpoints || vm.recompiler_test_harness)
  		return IopThreadMode::Off;
  
@@ -4133,6 +5211,171 @@ index 1e72bbd418..d0122d617a 100644
  		Relaxed& operator&=(T value)
  		{
  			StoreRelaxed(m_value, static_cast<T>(LoadRelaxed(m_value) & value));
+diff --git a/pcsx2/MTGS.cpp b/pcsx2/MTGS.cpp
+index 33add15ce7..1079b2beaf 100644
+--- a/pcsx2/MTGS.cpp
++++ b/pcsx2/MTGS.cpp
+@@ -89,6 +89,10 @@ namespace MTGS
+ 	static Threading::UserspaceSemaphore s_sem_mtvu_pop;
+ 	static void NotifyMTVUPacketPopped();
+ 	static Threading::WorkSema s_sem_event;
++#ifdef __SWITCH__
++	extern "C" bool sw2_gs_spin_wait;
++	bool sw2_gs_spin_wait = false;
++#endif
+ 	static Threading::UserspaceSemaphore s_sem_OnRingReset;
+ 	static Threading::UserspaceSemaphore s_sem_Vsync;
+ 
+@@ -365,7 +369,14 @@ void MTGS::MainLoop()
+ 		else
+ 		{
+ 			mtvu_lock.unlock();
++#ifdef __SWITCH__
++			if (sw2_gs_spin_wait)
++				s_sem_event.WaitForWorkWithSpin();
++			else
++				s_sem_event.WaitForWork();
++#else
+ 			s_sem_event.WaitForWork();
++#endif
+ 			mtvu_lock.lock();
+ 		}
+ 
+diff --git a/pcsx2/MTVU.cpp b/pcsx2/MTVU.cpp
+index 717b821be9..0a7689afcc 100644
+--- a/pcsx2/MTVU.cpp
++++ b/pcsx2/MTVU.cpp
+@@ -137,6 +137,10 @@ void VU_Thread::Reset()
+ 	vu1Thread.mtvuInterrupts = 0;
+ }
+ 
++// SW2PS2: how the EE wakes VU1. 2 (default): skip redundant kicks without a fence, VU1 also watches
++// its queue (WorkSema::NotifyOfWorkNoFence / WaitForWorkPolled); 1: skip with a fence; 0: always kick.
++extern "C" { int sw2_vu_kick_light = 2; }
++
+ void VU_Thread::ExecuteRingBuffer()
+ {
+ 	Threading::SetNameOfCurrentThread("MTVU");
+@@ -144,7 +148,14 @@ void VU_Thread::ExecuteRingBuffer()
+ 
+ 	for (;;)
+ 	{
++#ifdef __SWITCH__
++		if (sw2_vu_kick_light == 2)  // kicks skip the fence: watch the queue as well
++			semaEvent.WaitForWorkPolled([this] { return GetWritePos() != m_read_pos; });
++		else
++#endif
+ 		semaEvent.WaitForWorkWithSpin();
++		// SW2PS2: pairs with NotifyOfWorkLight's fence (a skipped kick's work is visible below)
++		std::atomic_thread_fence(std::memory_order_seq_cst);
+ 		if (m_shutdown_flag.load(std::memory_order_acquire))
+ 			break;
+ 
+@@ -286,7 +297,7 @@ __fi s32 VU_Thread::GetReadPos()
+ // Use this when reading write_pos from vu thread
+ __fi s32 VU_Thread::GetWritePos()
+ {
+-	return m_ato_write_pos.load(std::memory_order_acquire);
++		return m_ato_write_pos.load(std::memory_order_acquire);
+ }
+ 
+ // Gets the effective write pointer after
+@@ -298,7 +309,7 @@ __fi u32* VU_Thread::GetWritePtr()
+ 
+ __fi void VU_Thread::CommitWritePos()
+ {
+-	m_ato_write_pos.store(m_write_pos, std::memory_order_release);
++		m_ato_write_pos.store(m_write_pos, std::memory_order_release);
+ 
+ 	if (MTVU_ALWAYS_KICK)
+ 		KickStart();
+@@ -440,8 +451,47 @@ void VU_Thread::Apply_MTVUChanges(u32 interrupts)
+ 	}
+ }
+ 
++#ifdef __SWITCH__
++static std::atomic<bool> sw2_trace_vu_notifications{false};
++static std::atomic<u64> sw2_vu_notification_counts[4]{};
++
++extern "C" void sw2ax_trace_vu_notifications(bool enabled)
++{
++	if (enabled)
++		for (auto& count : sw2_vu_notification_counts)
++			count.store(0, std::memory_order_relaxed);
++	sw2_trace_vu_notifications.store(enabled, std::memory_order_relaxed);
++}
++
++extern "C" void sw2ax_vu_notification_counts(u64* counts)
++{
++	for (unsigned i = 0; i < 4; i++)
++		counts[i] = sw2_vu_notification_counts[i].load(std::memory_order_relaxed);
++}
++#endif
++
++
+ void VU_Thread::KickStart()
+ {
++#ifdef __SWITCH__
++	if (sw2_trace_vu_notifications.load(std::memory_order_relaxed))
++	{
++		const s32 state = semaEvent.NotifyOfWorkTracked();
++		const unsigned bucket = state == -1 ? 0 : state == -2 ? 1 : state >= 0 ? 2 : 3;
++		sw2_vu_notification_counts[bucket].fetch_add(1, std::memory_order_relaxed);
++		return;
++	}
++	if (sw2_vu_kick_light == 2)  // default: no fence (the worker watches the queue too)
++	{
++		semaEvent.NotifyOfWorkNoFence();
++		return;
++	}
++	if (sw2_vu_kick_light)
++	{
++		semaEvent.NotifyOfWorkLight();
++		return;
++	}
++#endif
+ 	semaEvent.NotifyOfWork();
+ }
+ 
+@@ -454,6 +504,10 @@ void VU_Thread::WaitVU()
+ {
+ 	MTVU_LOG("MTVU - WaitVU!");
+ 	const u64 wait_begin = EECycleRateSampler::BeginWait();
++#ifdef __SWITCH__
++	if (sw2_vu_kick_light == 2)
++		semaEvent.NotifyOfWork();  // a skipped kick must not make the queue look empty
++#endif
+ 	semaEvent.WaitForEmpty();
+ 	EECycleRateSampler::EndVU1Wait(wait_begin);
+ }
+@@ -484,9 +538,27 @@ void VU_Thread::ExecuteVU(u32 vu_addr, u32 vif_top, u32 vif_itop, u32 fbrst)
+ 	}
+ }
+ 
++#ifdef __SWITCH__
++extern std::atomic<bool> sw2_trace_vif_copies;
++extern std::atomic<u64> sw2_vif_copy_counts[14];
++#endif
++
+ void VU_Thread::VifUnpack(vifStruct& _vif, VIFregisters& _vifRegs, const u8* data, u32 size)
+ {
+ 	MTVU_LOG("MTVU - VifUnpack!");
++#ifdef __SWITCH__
++	if (sw2_trace_vif_copies.load(std::memory_order_relaxed))
++	{
++		unsigned bucket = 0;
++		for (u32 limit = 16; bucket < 7 && size > limit; limit *= 2)
++			bucket++;
++		sw2_vif_copy_counts[4 + bucket].fetch_add(1, std::memory_order_relaxed);
++		sw2_vif_copy_counts[12].fetch_add(size, std::memory_order_relaxed);
++		sw2_vif_copy_counts[13].fetch_add(
++			static_cast<u64>((uptr)&_vif.StructEnd - (uptr)&_vif.tag) + sizeof(VIFregistersMTVU),
++			std::memory_order_relaxed);
++	}
++#endif
+ 	u32 vif_copy_size = (u32)((uptr)&_vif.StructEnd - (uptr)&_vif.tag);
+ 	ReserveSpace(1 + size_u32(vif_copy_size) + size_u32(sizeof(VIFregistersMTVU)) + 1 + size_u32(size));
+ 	Write(MTVU_VIF_UNPACK);
 diff --git a/pcsx2/Memory.cpp b/pcsx2/Memory.cpp
 index 082f367cbc..64d4623b71 100644
 --- a/pcsx2/Memory.cpp
@@ -4193,6 +5436,94 @@ index 16a24ebbdc..f8ccb4bb85 100644
  	__fi static u8* GetVTLBVirtualMapEnd() { return GetDataPtr(HostMemoryMap::VTLBVirtualMapOffset + HostMemoryMap::VTLBVirtualMapSize); }
  	__fi static u8* GetVTLBAddressMap() { return GetDataPtr(HostMemoryMap::VTLBAddressMapOffset); }
  	__fi static u8* GetVTLBAddressMapEnd() { return GetDataPtr(HostMemoryMap::VTLBAddressMapOffset + HostMemoryMap::VTLBAddressMapSize); }
+diff --git a/pcsx2/Patch.cpp b/pcsx2/Patch.cpp
+index 842ba4717c..e5aad14797 100644
+--- a/pcsx2/Patch.cpp
++++ b/pcsx2/Patch.cpp
+@@ -144,6 +144,9 @@ namespace Patch
+ 	static std::vector<std::string> s_just_enabled_cheats;
+ 	static std::vector<std::string> s_just_enabled_patches;
+ 	static u32 s_patches_crc;
++#if defined(__SWITCH__) && defined(ENABLE_LIBRETRO)
++	static std::string s_cheat_serial;
++#endif
+ 	static std::optional<float> s_override_aspect_ratio;
+ 	static std::optional<GSInterlaceMode> s_override_interlace_mode;
+ 
+@@ -393,6 +396,23 @@ bool Patch::ContainsPatchName(const std::vector<PatchInfo>& patches, const std::
+ template <typename F>
+ void Patch::EnumeratePnachFiles(const std::string_view serial, u32 crc, bool cheats, bool for_ui, const F& f)
+ {
++#if defined(__SWITCH__) && defined(ENABLE_LIBRETRO)
++	// SW2PS2 presents individually selected cheats for the exact disc revision.
++	if (cheats)
++	{
++		if (serial.empty() || crc == 0 || (!for_ui && Achievements::IsHardcoreModeActive()))
++			return;
++
++		const std::string filename = GetPnachTemplate(serial, crc, true, false, false);
++		for (const std::string& dir : {EmuFolders::Cheats, std::string("romfs:/cheats")})
++		{
++			const std::string path = Path::Combine(dir, filename);
++			if (const auto contents = FileSystem::ReadFileToString(path.c_str()))
++				f(path, *contents);
++		}
++		return;
++	}
++#endif
+ 	// Prefer files on disk over the zip.
+ 	//
+ 	// Hardcore blocks CHEATS, not fixes. The old condition dropped every on-disk pnach,
+@@ -644,10 +664,24 @@ std::string Patch::GetPnachFilename(const std::string_view serial, u32 crc, bool
+ void Patch::ReloadEnabledLists()
+ {
+ 	const std::vector<std::string> prev_enabled_cheats = std::move(s_enabled_cheats);
++	s_enabled_cheats.clear();
+ 	if (EmuConfig.EnableCheats && !Achievements::IsHardcoreModeActive())
++	{
++#if defined(__SWITCH__) && defined(ENABLE_LIBRETRO)
++		if (!s_cheat_serial.empty() && s_patches_crc != 0)
++		{
++			const std::string selection = GetPnachFilename(s_cheat_serial, s_patches_crc, true) + ".enabled";
++			if (const auto contents = FileSystem::ReadFileToString(selection.c_str()))
++			{
++				std::istringstream input(*contents);
++				for (std::string name; std::getline(input, name);)
++					s_enabled_cheats.push_back(std::move(name));
++			}
++		}
++#else
+ 		s_enabled_cheats = Host::GetStringListSetting(CHEATS_CONFIG_SECTION, PATCH_ENABLE_CONFIG_KEY);
+-	else
+-		s_enabled_cheats = {};
++#endif
++	}
+ 
+ 	const std::vector<std::string> prev_enabled_patches = std::exchange(s_enabled_patches, Host::GetStringListSetting(PATCHES_CONFIG_SECTION, PATCH_ENABLE_CONFIG_KEY));
+ 	const std::vector<std::string> disabled_patches = Host::GetStringListSetting(PATCHES_CONFIG_SECTION, PATCH_DISABLE_CONFIG_KEY);
+@@ -877,6 +911,11 @@ void Patch::ReloadPatches(const std::string& serial, u32 crc, bool reload_files,
+ 	bool verbose_if_changed)
+ {
+ 	reload_files |= (s_patches_crc != crc);
++#if defined(__SWITCH__) && defined(ENABLE_LIBRETRO)
++	reload_files |= (s_cheat_serial != serial);
++	reload_enabled_list |= (s_cheat_serial != serial || s_patches_crc != crc);
++	s_cheat_serial = serial;
++#endif
+ 	s_patches_crc = crc;
+ 
+ 	if (reload_files)
+@@ -912,6 +951,10 @@ void Patch::ReloadPatches(const std::string& serial, u32 crc, bool reload_files,
+ 				if (patch_count > 0)
+ 					Console.WriteLn(Color_Green, fmt::format("Found {} cheats in {}.", patch_count, filename));
+ 			});
++#if defined(__SWITCH__) && defined(ENABLE_LIBRETRO)
++		// Legacy unlabelled codes auto-enable in PCSX2. Here every cheat is opt-in.
++		std::erase_if(s_cheat_patches, [](const PatchGroup& group) { return group.name.empty(); });
++#endif
+ 	}
+ 
+ 	UpdateActivePatches(reload_enabled_list, verbose, verbose_if_changed, false);
 diff --git a/pcsx2/Pcsx2Config.cpp b/pcsx2/Pcsx2Config.cpp
 index a58d80c321..9e2ca219d4 100644
 --- a/pcsx2/Pcsx2Config.cpp
@@ -4264,7 +5595,7 @@ index 600834c53c..e3d6b98292 100644
 +	return n;
 +}
 diff --git a/pcsx2/R5900.cpp b/pcsx2/R5900.cpp
-index 48c686a506..eb21ef5bac 100644
+index 48c686a506..a8b4377189 100644
 --- a/pcsx2/R5900.cpp
 +++ b/pcsx2/R5900.cpp
 @@ -35,6 +35,8 @@
@@ -4276,7 +5607,22 @@ index 48c686a506..eb21ef5bac 100644
  using namespace R5900;	// for R5900 disasm tools
  
  s32 EEsCycle;		// used to sync the IOP to the EE
-@@ -208,6 +210,23 @@ void cpuTlbMissW(u32 addr, u32 bd) {
+@@ -46,7 +48,14 @@ cachedTlbs_t cachedTlbs;
+ 
+ R5900cpu *Cpu = NULL;
+ 
++#ifdef __SWITCH__
++extern "C" uint32_t sw2_ee_wait_cycles;
++uint32_t sw2_ee_wait_cycles = 3072;
++#define CURRENT_EE_WAIT_CYCLES sw2_ee_wait_cycles
++#else
+ static constexpr uint eeWaitCycles = IopThread::kEeWaitCycles;
++#define CURRENT_EE_WAIT_CYCLES eeWaitCycles
++#endif
+ 
+ bool eeEventTestIsActive = false;
+ EE_intProcessStatus eeRunInterruptScan = INT_NOT_RUNNING;
+@@ -208,6 +217,23 @@ void cpuTlbMissW(u32 addr, u32 bd) {
  }
  
  // sets a branch test to occur some time from an arbitrary starting point.
@@ -4300,7 +5646,7 @@ index 48c686a506..eb21ef5bac 100644
  __fi void cpuSetNextEvent( u64 startCycle, s32 delta )
  {
  	// typecast the conditional to signed so that things don't blow up
-@@ -218,6 +237,7 @@ __fi void cpuSetNextEvent( u64 startCycle, s32 delta )
+@@ -218,6 +244,7 @@ __fi void cpuSetNextEvent( u64 startCycle, s32 delta )
  		cpuRegs.nextEventCycle = startCycle + delta;
  	}
  }
@@ -4308,15 +5654,18 @@ index 48c686a506..eb21ef5bac 100644
  
  // sets a branch to occur some time from the current cycle
  __fi void cpuSetNextEventDelta( s32 delta )
-@@ -499,6 +519,7 @@ __fi void _cpuEventTest_Shared()
+@@ -499,8 +526,9 @@ __fi void _cpuEventTest_Shared()
  #ifdef PCSX2_RECOMPILER_TESTS
  	g_twinEeEventTests++;
  #endif
 +	vtlb_ProcessPendingRamWrites(); // SW2PS2: code-page writes queued by the IOP thread
  	eeEventTestIsActive = true;
- 	cpuRegs.nextEventCycle = cpuRegs.cycle + eeWaitCycles;
+-	cpuRegs.nextEventCycle = cpuRegs.cycle + eeWaitCycles;
++	cpuRegs.nextEventCycle = cpuRegs.cycle + CURRENT_EE_WAIT_CYCLES;
  	cpuRegs.lastEventCycle = cpuRegs.cycle;
-@@ -526,6 +547,14 @@ __fi void _cpuEventTest_Shared()
+ 
+ 	// Android's in-game Exit/Reset can flip the VM to Stopping from another
+@@ -526,6 +554,14 @@ __fi void _cpuEventTest_Shared()
  
  	// Threaded: publish where the EE has got and take what the IOP queued for it (the SBUS interrupt, a
  	// pause request), so that the interrupt checks below see it at once.
@@ -4331,7 +5680,7 @@ index 48c686a506..eb21ef5bac 100644
  	if constexpr (M == IopThreadMode::Threaded)
  		IopThread::EeEventTestBegin(cpuRegs.cycle);
  
-@@ -550,6 +579,29 @@ __fi void _cpuEventTest_Shared()
+@@ -550,6 +586,29 @@ __fi void _cpuEventTest_Shared()
  	// ---- IOP -------------
  	iopRunSliceForEE<M>();
  
@@ -4374,18 +5723,74 @@ index 3708b20a77..b98cf7bf4a 100644
  // breakpoint code shared between interpreter and recompiler
  int isMemcheckNeeded(u32 pc);
 diff --git a/pcsx2/SPR.cpp b/pcsx2/SPR.cpp
-index f45f096106..b38be128ee 100644
+index f45f096106..fc56aad0d0 100644
 --- a/pcsx2/SPR.cpp
 +++ b/pcsx2/SPR.cpp
-@@ -86,6 +86,7 @@ static void memcpy_to_spr(u32 dst, u8* src, size_t size)
+@@ -6,6 +6,42 @@
+ #include "SPR.h"
+ #include "VUmicro.h"
+ #include "MTVU.h"
++#ifdef __SWITCH__
++#include <atomic>
++static std::atomic<bool> sw2_spr_trace{false};
++static std::atomic<u64> sw2_spr_counts[32]{};
++extern "C" void sw2ax_trace_spr(bool on) {
++    sw2_spr_trace.store(false, std::memory_order_relaxed);
++    if (on) for (auto& n : sw2_spr_counts) n.store(0, std::memory_order_relaxed);
++    sw2_spr_trace.store(on, std::memory_order_relaxed);
++}
++extern "C" void sw2ax_spr_counts(u64* out) {
++    for (int i = 0; i < 32; i++) out[i] = sw2_spr_counts[i].load(std::memory_order_relaxed);
++}
++static inline void sw2_spr_note(unsigned dir, u32 spr, const void* host, size_t size) {
++    if (!sw2_spr_trace.load(std::memory_order_relaxed)) return;
++    unsigned bucket = 0;
++    for (size_t n = 16; bucket < 9 && size > n; n *= 2) ++bucket;
++    sw2_spr_counts[dir * 10 + bucket].fetch_add(1, std::memory_order_relaxed);
++    sw2_spr_counts[20 + dir].fetch_add(size, std::memory_order_relaxed);
++    if ((spr & 0x3fff) + size >= 0x4000) sw2_spr_counts[22 + dir].fetch_add(1, std::memory_order_relaxed);
++    if ((reinterpret_cast<uintptr_t>(host) & 15) != 0) sw2_spr_counts[24 + dir].fetch_add(1, std::memory_order_relaxed);
++    if ((spr & 15) != 0) sw2_spr_counts[26 + dir].fetch_add(1, std::memory_order_relaxed);
++    // Randomised 1/256 sample, before the transfer. This is observational;
++    // the actual DMA and its timing always run as before.
++    static u32 sample = 0x387a19efu;
++    sample = sample * 1664525u + 1013904223u;
++    const u32 offset = spr & 0x3fffu;
++    if (dir == 0 && (sample >> 24) == 0 && size && size <= 0x4000u - offset) {
++        sw2_spr_counts[28].fetch_add(1, std::memory_order_relaxed);
++        sw2_spr_counts[29].fetch_add(size, std::memory_order_relaxed);
++        if (std::memcmp(&psSu128(offset), host, size) == 0) {
++            sw2_spr_counts[30].fetch_add(1, std::memory_order_relaxed);
++            sw2_spr_counts[31].fetch_add(size, std::memory_order_relaxed);
++        }
++    }
++}
++#endif
+ 
+ static bool spr0finished = false;
+ static bool spr1finished = false;
+@@ -71,6 +107,9 @@ static void TestClearVUs(u32 madr, u32 qwc, bool isWrite)
+ 
+ static void memcpy_to_spr(u32 dst, u8* src, size_t size)
+ {
++#ifdef __SWITCH__
++    sw2_spr_note(0, dst, src, size);
++#endif
+ 	dst &= _16kb - 1;
+ 
+ 	if (dst + size >= _16kb) {
+@@ -86,6 +125,10 @@ static void memcpy_to_spr(u32 dst, u8* src, size_t size)
  
  static void memcpy_from_spr(u8* dst, u32 src, size_t size)
  {
++#ifdef __SWITCH__
++    sw2_spr_note(1, src, dst, size);
++#endif
 +	u8* const dst0 = dst;
  	src &= _16kb - 1;
  
  	if (src + size >= _16kb) {
-@@ -97,6 +98,7 @@ static void memcpy_from_spr(u8* dst, u32 src, size_t size)
+@@ -97,6 +140,7 @@ static void memcpy_from_spr(u8* dst, u32 src, size_t size)
  	} else {
  		memcpy(dst, &psSu128(src), size);
  	}
@@ -4604,6 +6009,57 @@ index c85af24247..402e6b2f3e 100644
  	//	pMem += size;
  
  	//Some games such as Alex Ferguson's Player Manager 2001 reads less than GSLastDownloadSize by VIF then reads the remainder by FIFO
+diff --git a/pcsx2/Vif_Unpack.cpp b/pcsx2/Vif_Unpack.cpp
+index 33a05e02e4..371cd04ab3 100644
+--- a/pcsx2/Vif_Unpack.cpp
++++ b/pcsx2/Vif_Unpack.cpp
+@@ -327,6 +327,26 @@ static __fi u8* getVUptr(uint idx, int offset)
+ }
+ 
+ 
++#ifdef __SWITCH__
++#include <atomic>
++std::atomic<bool> sw2_trace_vif_copies{false};
++std::atomic<u64> sw2_vif_copy_counts[14]{};
++
++extern "C" void sw2ax_trace_vif_copies(bool enabled)
++{
++	if (enabled)
++		for (auto& count : sw2_vif_copy_counts)
++			count.store(0, std::memory_order_relaxed);
++	sw2_trace_vif_copies.store(enabled, std::memory_order_relaxed);
++}
++
++extern "C" void sw2ax_vif_copy_counts(u64* counts)
++{
++	for (unsigned i = 0; i < 14; i++)
++		counts[i] = sw2_vif_copy_counts[i].load(std::memory_order_relaxed);
++}
++#endif
++
+ _vifT int nVifUnpack(const u8* data)
+ {
+ 	nVifStruct&   v       = nVif[idx];
+@@ -338,6 +358,19 @@ _vifT int nVifUnpack(const u8* data)
+ 	const bool isFill = (vifRegs.cycle.cl < wl);
+ 	s32        size   = ret << 2;
+ 
++#ifdef __SWITCH__
++	if constexpr (idx == 1)
++	{
++		if (sw2_trace_vif_copies.load(std::memory_order_relaxed))
++		{
++			const unsigned bucket = ret == vif.tag.size ? (v.bSize ? 1 : 0) : 2;
++			sw2_vif_copy_counts[bucket].fetch_add(1, std::memory_order_relaxed);
++			if (bucket != 0)
++				sw2_vif_copy_counts[3].fetch_add(size, std::memory_order_relaxed);
++		}
++	}
++#endif
++
+ 	if (ret == vif.tag.size) // Full Transfer
+ 	{
+ 		if (v.bSize) // Last transfer was partial
 diff --git a/pcsx2/arm64/BaseblockEx-arm64.h b/pcsx2/arm64/BaseblockEx-arm64.h
 index 8666bdd61d..e5176613a4 100644
 --- a/pcsx2/arm64/BaseblockEx-arm64.h
@@ -4640,7 +6096,7 @@ index 885d69dbd2..03154a859e 100644
  		armAsm->Add(a64::x0, a64::x8, a64::Operand(a64::w9, a64::UXTW));
  
 diff --git a/pcsx2/arm64/iR5900-arm64.cpp b/pcsx2/arm64/iR5900-arm64.cpp
-index bcd5ff70f8..ebdee7af46 100644
+index bcd5ff70f8..8d1d9c3fdf 100644
 --- a/pcsx2/arm64/iR5900-arm64.cpp
 +++ b/pcsx2/arm64/iR5900-arm64.cpp
 @@ -4,6 +4,11 @@
@@ -4655,7 +6111,15 @@ index bcd5ff70f8..ebdee7af46 100644
  #include <algorithm>
  #include <atomic>
  #include <cfloat>
-@@ -1956,6 +1961,16 @@ static void SetBranchBackedge()
+@@ -80,6 +85,7 @@ bool g_maySignalException = false;
+ // g_eeUnalignedFuseCount is a diagnostic/test tally.
+ bool g_eeUnalignedFused = false;
+ u32 g_eeUnalignedFuseCount = 0;
++u32 g_eeShiftPairPc = ~0u;
+ 
+ // Constant propagation — defined here, declared extern in iR5900-arm64.h
+ 
+@@ -1956,6 +1962,16 @@ static void SetBranchBackedge()
  #endif
  }
  
@@ -4672,7 +6136,7 @@ index bcd5ff70f8..ebdee7af46 100644
  void SetBranchImm(u32 imm)
  {
  	if (s_loopResident && !s_loopBackedgeEmitted && imm == s_loopTopPc)
-@@ -1995,6 +2010,7 @@ void SetBranchImm(u32 imm)
+@@ -1995,6 +2011,7 @@ void SetBranchImm(u32 imm)
  		recEeNoteChargeSite(EeChargeSite::WaitLoopFastFwd);
  		armAsm->Cmp(RECCYCLE, 0);
  		armAsm->Csel(RECCYCLE, RECCYCLE, a64::xzr, a64::gt);
@@ -4680,7 +6144,27 @@ index bcd5ff70f8..ebdee7af46 100644
  		armEmitJmp(DispatcherEvent);
  		return;
  	}
-@@ -3601,7 +3617,17 @@ static bool memory_protect_recompiled_code(u32 startpc, u32 size)
+@@ -2977,6 +2994,8 @@ void recompileNextInstruction(bool delayslot, bool swapped_delay_slot)
+ 	EEINST* old_inst_info = g_pCurInstInfo;
+ 
+ 	cpuRegs.code = memRead32(pc);
++	const bool shift_pair_second = !delayslot && pc == g_eeShiftPairPc;
++	g_eeShiftPairPc = ~0u;
+ 
+ 	// EP-2b: default-flush seam — any op that is not a cache-aware
+ 	// hand-rolled COP2 macro op kills the VF residency cache (dirty
+@@ -3113,7 +3132,9 @@ void recompileNextInstruction(bool delayslot, bool swapped_delay_slot)
+ #else
+ 		constexpr bool forcedInterp = false;
+ #endif
+-		if (isBranchInDelaySlot || !opcode.recompile || forcedInterp)
++		if (shift_pair_second)
++			; // emitted with the first half
++		else if (isBranchInDelaySlot || !opcode.recompile || forcedInterp)
+ 		{
+ 			if ((opcode.flags & IS_BRANCH) && !isBranchInDelaySlot)
+ 				recBranchCall(opcode.interpret);
+@@ -3601,7 +3622,17 @@ static bool memory_protect_recompiled_code(u32 startpc, u32 size)
  	// The EENULL thread context register is stored @ 0x81000-....
  	const bool contains_thread_stack = ((startpc >> 12) == 0x81) || ((startpc >> 12) == 0x80001);
  
@@ -4699,7 +6183,7 @@ index bcd5ff70f8..ebdee7af46 100644
  
  	switch (PageType)
  	{
-@@ -3699,7 +3725,7 @@ static bool memory_protect_recompiled_code(u32 startpc, u32 size)
+@@ -3699,7 +3730,7 @@ static bool memory_protect_recompiled_code(u32 startpc, u32 size)
  
  			// Counted blocks: track how often this block runs. If the counter overflows,
  			// reset the page to write-protected mode (faster than manual checks).
@@ -4708,7 +6192,7 @@ index bcd5ff70f8..ebdee7af46 100644
  			{
  				armMoveAddressToReg(RSCRATCHADDR, &manual_page[inpage_ptr >> 12]);
  				armAsm->Ldrh(RWSCRATCH, a64::MemOperand(RSCRATCHADDR));
-@@ -4521,8 +4547,15 @@ static bool recSkipTimeoutLoop(s32 reg, bool is_timeout_loop)
+@@ -4521,8 +4552,15 @@ static bool recSkipTimeoutLoop(s32 reg, bool is_timeout_loop)
  	armAsm->Sxtw(a64::x9, a64::w9);
  	armStoreEERegPtr(a64::x9, &cpuRegs.GPR.r[reg].UD[0]);
  
@@ -4726,12 +6210,35 @@ index bcd5ff70f8..ebdee7af46 100644
  
  	// Loop finished — set PC to end of block and dispatch
  	armAsm->Mov(RWSCRATCH, s_nEndBlock);
-@@ -5437,3 +5470,27 @@ R5900cpu recCpu = {
+@@ -5175,6 +5213,7 @@ StartRecomp:
+ 		// Sweep any LDL/LDR fusion residue from an aborted prior compile (the
+ 		// per-pair gate otherwise guarantees same-block consume).
+ 		g_eeUnalignedFused = false;
++		g_eeShiftPairPc = ~0u;
+ 		// SL-03: sweep side-exit residue the same way (recEmitPendingSideExits
+ 		// drains the list on every completed compile).
+ 		s_numSideExits = 0;
+@@ -5437,3 +5476,42 @@ R5900cpu recCpu = {
  	recCancelInstruction,
  	recClear,
  };
 +
 +#ifdef __SWITCH__
++extern "C" u32 sw2ax_copy_ee_block(u32 guest_pc, u32* guest, u32 guest_capacity,
++	u32* host, u32 host_capacity, u32* guest_words)
++{
++	*guest_words = 0;
++	const BASEBLOCKEX* block = recBlocks.Get(guest_pc);
++	if (!block || block->startpc != guest_pc || guest_pc >= Ps2MemSize::ExposedRam)
++		return 0;
++	const u32 bytes = std::min<u32>(block->size * 4, Ps2MemSize::ExposedRam - guest_pc);
++	*guest_words = std::min<u32>(guest_capacity, bytes / 4);
++	std::memcpy(guest, recRAMCopy.data() + guest_pc, *guest_words * sizeof(u32));
++	const u32 host_words = std::min<u32>(host_capacity, block->x86size / 4);
++	std::memcpy(host, reinterpret_cast<const void*>(block->fnptr), host_words * sizeof(u32));
++	return host_words;
++}
++
 +// SW2PS2 profiler: which code region a sampled host PC is in (1 EE, 2 IOP, 3 VU0, 4 VU1, 5 VIF
 +// unpack, 0 other) and, for EE code, the PS2 start PC of the block holding it (0 if none).
 +extern "C" u32 sw2ax_classify_host_pc(u64 pc, u32* ee_block)
@@ -4754,6 +6261,423 @@ index bcd5ff70f8..ebdee7af46 100644
 +	return 0;
 +}
 +#endif
+diff --git a/pcsx2/arm64/iR5900-arm64.h b/pcsx2/arm64/iR5900-arm64.h
+index f7f5eac1f1..29f5a81d5d 100644
+--- a/pcsx2/arm64/iR5900-arm64.h
++++ b/pcsx2/arm64/iR5900-arm64.h
+@@ -707,6 +707,10 @@ extern bool g_recompilingDelaySlot;
+ extern bool g_eeUnalignedFused;
+ extern u32 g_eeUnalignedFuseCount;
+ 
++// Guest pc of the second half of a shift pair the first half emitted
++// (recShiftPairLead, iR5900Shift-arm64.cpp), or ~0u. Cleared at block start.
++extern u32 g_eeShiftPairPc;
++
+ // Exclusive end PC of the block currently being recompiled. Used by the LDL/LDR
+ // fusion to confirm the peeked partner instruction is in the same block.
+ u32 recCurrentBlockEndPC();
+@@ -1004,6 +1008,11 @@ namespace R5900
+ 	namespace Dynarec
+ 	{
+ 		extern void recDoBranchImm(u32 branchTo, u32* jmpSkip, bool isLikely = false, bool swappedDelaySlot = false);
++
++		namespace OpcodeImpl
++		{
++			bool recShiftPairLead();
++		}
+ 	}
+ }
+ 
+diff --git a/pcsx2/arm64/iR5900AritImm-arm64.cpp b/pcsx2/arm64/iR5900AritImm-arm64.cpp
+index d72a3797cd..cae5020b8d 100644
+--- a/pcsx2/arm64/iR5900AritImm-arm64.cpp
++++ b/pcsx2/arm64/iR5900AritImm-arm64.cpp
+@@ -96,6 +96,8 @@ static void recANDI_const()
+ 
+ static void recANDI_(int info)
+ {
++	if (recShiftPairLead())
++		return;
+ 	if (_ImmU_ == 0)
+ 	{
+ 		memStoreT(a64::xzr);
+diff --git a/pcsx2/arm64/iR5900Shift-arm64.cpp b/pcsx2/arm64/iR5900Shift-arm64.cpp
+index a30af66e8d..95e228447b 100644
+--- a/pcsx2/arm64/iR5900Shift-arm64.cpp
++++ b/pcsx2/arm64/iR5900Shift-arm64.cpp
+@@ -6,6 +6,11 @@
+ // No register allocation for scalar ops.
+ 
+ #include "arm64/iR5900-arm64.h"
++#include "Memory.h"
++#include "Patch.h"
++
++#include <algorithm>
++#include <bit>
+ 
+ namespace a64 = vixl::aarch64;
+ 
+@@ -55,6 +60,150 @@ static a64::Register memDestD()
+ 	return _eeGetGPRDestReg(_Rd_, RXSCRATCH);
+ }
+ 
++/*********************************************************
++ * Shift pairs — two instructions, one bitfield op        *
++ *********************************************************/
++
++// The second instruction reads and overwrites the first one's destination:
++//   SLL then SRA/SRL, DSLL/DSLL32 then DSRA/DSRL/DSRA32/DSRL32: sbfx/ubfx or
++//   sbfiz/ubfiz. SLL then SRL by 0 is signed.
++//   SRL/SRA/DSRL/DSRA/DSRL32/DSRA32 then ANDI 2^n-1: ubfx. An arithmetic
++//   shift fuses only when the field stays below the sign bit.
++//   ANDI 2^n-1 then SLL/DSLL/DSLL32: ubfiz, or sbfiz once SLL moves the field
++//   into bit 31.
++struct ShiftPairField
++{
++	bool is_signed;
++	bool insert; // bfiz when set, bfx otherwise
++	u32 lsb;
++	u32 width;
++};
++
++enum ShiftKind { kNotShift, kLeft, kRightLogical, kRightArith };
++
++// A constant-amount shift's kind, total amount and word size.
++static ShiftKind decodeShift(u32 code, u32* amount, u32* bits)
++{
++	if ((code >> 26) != 0)
++		return kNotShift;
++	const u32 sa = (code >> 6) & 0x1f;
++	*amount = sa;
++	*bits = 32;
++	switch (code & 0x3f)
++	{
++		case 0x00: return kLeft; // SLL
++		case 0x02: return kRightLogical; // SRL
++		case 0x03: return kRightArith; // SRA
++	}
++	*bits = 64;
++	switch (code & 0x3f)
++	{
++		case 0x38: return kLeft; // DSLL
++		case 0x3a: return kRightLogical; // DSRL
++		case 0x3b: return kRightArith; // DSRA
++	}
++	*amount = sa + 32;
++	switch (code & 0x3f)
++	{
++		case 0x3c: return kLeft; // DSLL32
++		case 0x3e: return kRightLogical; // DSRL32
++		case 0x3f: return kRightArith; // DSRA32
++	}
++	return kNotShift;
++}
++
++// n for an ANDI mask of 2^n-1, else 0.
++static u32 andiLowMaskBits(u32 code)
++{
++	const u32 m = code & 0xffff;
++	return (m & (m + 1)) == 0 ? static_cast<u32>(std::popcount(m)) : 0;
++}
++
++static bool shiftPairField(u32 first, u32 second, ShiftPairField* f)
++{
++	const bool first_andi = (first >> 26) == 0x0c;
++	const u32 dest = first_andi ? (first >> 16) & 0x1f : (first >> 11) & 0x1f;
++	const bool second_andi = (second >> 26) == 0x0c;
++	const u32 second_src = second_andi ? (second >> 21) & 0x1f : (second >> 16) & 0x1f;
++	const u32 second_dest = second_andi ? (second >> 16) & 0x1f : (second >> 11) & 0x1f;
++	if (dest == 0 || second_src != dest || second_dest != dest)
++		return false;
++
++	u32 a, a_bits, b, b_bits;
++	if (first_andi)
++	{
++		const u32 n = andiLowMaskBits(first);
++		if (n == 0 || decodeShift(second, &b, &b_bits) != kLeft)
++			return false;
++		if (b_bits == 32 && b + n >= 32)
++			*f = {true, true, b, 32 - b};
++		else
++			*f = {false, true, b, std::min(n, b_bits - b)};
++		return true;
++	}
++
++	const ShiftKind k = decodeShift(first, &a, &a_bits);
++	if (k == kNotShift)
++		return false;
++	if (k != kLeft)
++	{
++		const u32 n = second_andi ? andiLowMaskBits(second) : 0;
++		if (n == 0 || (k == kRightArith && a + n > a_bits))
++			return false;
++		*f = {false, false, a, std::min(n, a_bits - a)};
++		return true;
++	}
++
++	const ShiftKind k2 = decodeShift(second, &b, &b_bits);
++	if ((k2 != kRightLogical && k2 != kRightArith) || b_bits != a_bits || (a_bits == 64 && a == 0 && b == 0))
++		return false;
++	const bool is_signed = k2 == kRightArith || (a_bits == 32 && b == 0);
++	if (b >= a)
++		*f = {is_signed, false, b - a, a_bits - b};
++	else
++		*f = {is_signed, true, a - b, a_bits - a};
++	return true;
++}
++
++// Called by the first instruction's non-constant path. When the next
++// instruction completes a pair in the same block, emit the pair and leave its
++// pc in g_eeShiftPairPc so recompileNextInstruction emits nothing for it.
++// Returns false otherwise, having emitted nothing.
++bool recShiftPairLead()
++{
++	// In a delay slot pc is still the slot's own address.
++	if (g_recompilingDelaySlot || pc >= recCurrentBlockEndPC())
++		return false;
++	// recompileNextInstruction would apply these before reading the second
++	// instruction; applying them twice writes the same words.
++	if (EmuConfig.EnablePatches)
++		Patch::ApplyDynamicPatches(pc);
++	const u32 second = memRead32(pc);
++#ifdef PCSX2_RECOMPILER_TESTS
++	if (EERecFallback::Selected(second))
++		return false;
++#endif
++	ShiftPairField f;
++	if (!shiftPairField(cpuRegs.code, second, &f))
++		return false;
++
++	const bool andi = _Opcode_ == 0x0c;
++	const int dest = andi ? _Rt_ : _Rd_;
++	const a64::Register src = _eeGetGPRSourceReg(RXSCRATCH, andi ? _Rs_ : _Rt_);
++	const a64::Register dst = _eeGetGPRDestReg(dest, RXSCRATCH);
++	if (f.insert && f.is_signed)
++		armAsm->Sbfiz(dst, src, f.lsb, f.width);
++	else if (f.insert)
++		armAsm->Ubfiz(dst, src, f.lsb, f.width);
++	else if (f.is_signed)
++		armAsm->Sbfx(dst, src, f.lsb, f.width);
++	else
++		armAsm->Ubfx(dst, src, f.lsb, f.width);
++	_eeStoreGPRDestReg(dest, dst);
++	g_eeShiftPairPc = pc;
++	return true;
++}
++
+ /*********************************************************
+  * Shift with constant amount — rd = rt SHIFT sa         *
+  * Uses eeRecompileCodeRC2_MEM                            *
+@@ -68,6 +217,8 @@ static void recSLL_const()
+ 
+ static void recSLL_(int info)
+ {
++	if (recShiftPairLead())
++		return;
+ 	const a64::Register rt = memLoadT32();
+ 	const a64::Register dst = memDestD();
+ 	if (_Sa_ != 0)
+@@ -94,6 +245,8 @@ static void recSRL_const()
+ 
+ static void recSRL_(int info)
+ {
++	if (recShiftPairLead())
++		return;
+ 	const a64::Register rt = memLoadT32();
+ 	const a64::Register dst = memDestD();
+ 	if (_Sa_ != 0)
+@@ -119,6 +272,8 @@ static void recSRA_const()
+ 
+ static void recSRA_(int info)
+ {
++	if (recShiftPairLead())
++		return;
+ 	const a64::Register rt = memLoadT32();
+ 	const a64::Register dst = memDestD();
+ 	if (_Sa_ != 0)
+@@ -143,6 +298,8 @@ static void recDSLL_const()
+ 
+ static void recDSLL_(int info)
+ {
++	if (recShiftPairLead())
++		return;
+ 	const a64::Register rt = memLoadT64();
+ 	if (_Sa_ != 0)
+ 	{
+@@ -166,6 +323,8 @@ static void recDSRL_const()
+ 
+ static void recDSRL_(int info)
+ {
++	if (recShiftPairLead())
++		return;
+ 	const a64::Register rt = memLoadT64();
+ 	if (_Sa_ != 0)
+ 	{
+@@ -189,6 +348,8 @@ static void recDSRA_const()
+ 
+ static void recDSRA_(int info)
+ {
++	if (recShiftPairLead())
++		return;
+ 	const a64::Register rt = memLoadT64();
+ 	if (_Sa_ != 0)
+ 	{
+@@ -212,6 +373,8 @@ static void recDSLL32_const()
+ 
+ static void recDSLL32_(int info)
+ {
++	if (recShiftPairLead())
++		return;
+ 	const a64::Register rt = memLoadT64();
+ 	const a64::Register dst = memDestD();
+ 	armAsm->Lsl(dst, rt, _Sa_ + 32);
+@@ -228,6 +391,8 @@ static void recDSRL32_const()
+ 
+ static void recDSRL32_(int info)
+ {
++	if (recShiftPairLead())
++		return;
+ 	const a64::Register rt = memLoadT64();
+ 	const a64::Register dst = memDestD();
+ 	armAsm->Lsr(dst, rt, _Sa_ + 32);
+@@ -244,6 +409,8 @@ static void recDSRA32_const()
+ 
+ static void recDSRA32_(int info)
+ {
++	if (recShiftPairLead())
++		return;
+ 	const a64::Register rt = memLoadT64();
+ 	const a64::Register dst = memDestD();
+ 	armAsm->Asr(dst, rt, _Sa_ + 32);
+diff --git a/pcsx2/arm64/microVU-arm64.cpp b/pcsx2/arm64/microVU-arm64.cpp
+index 3b9272619b..2b217a75d6 100644
+--- a/pcsx2/arm64/microVU-arm64.cpp
++++ b/pcsx2/arm64/microVU-arm64.cpp
+@@ -1182,6 +1182,10 @@ void mVUGenerateModelStubs(mV)
+ // Resets Rec Data
+ void mVUreset(microVU& mVU, bool resetReserve, bool vu1Idle)
+ {
++#ifdef __SWITCH__
++	if (!mVU.index && sw2_vu0_trace_blocks)
++		sw2_vu0_block_ranges.clear();
++#endif
+ 	EECycleRate::NoteVuReset(mVU.index);
+ 
+ #ifdef mVUcacheTrace
+diff --git a/pcsx2/arm64/microVU_Compile-arm64.inl b/pcsx2/arm64/microVU_Compile-arm64.inl
+index fd08604592..88c958208d 100644
+--- a/pcsx2/arm64/microVU_Compile-arm64.inl
++++ b/pcsx2/arm64/microVU_Compile-arm64.inl
+@@ -8,6 +8,75 @@
+ #include "common/Path.h"
+ #include "vuaot/VuAotMvuTrace.h"
+ 
++#ifdef __SWITCH__
++#include <algorithm>
++#include <array>
++#include <vector>
++
++struct SW2Vu0BlockRange
++{
++	uptr begin;
++	uptr end;
++	u32 program_pc;
++	u32 block_pc;
++	u32 count;
++	std::array<u64, 32> guest_code;
++};
++static bool sw2_vu0_trace_blocks = false;
++static std::vector<SW2Vu0BlockRange> sw2_vu0_block_ranges;
++
++extern "C" void sw2ax_trace_vu0_blocks(bool enabled)
++{
++	sw2_vu0_trace_blocks = enabled;
++	sw2_vu0_block_ranges.clear();
++}
++
++extern "C" u32 sw2ax_map_vu0_block(u64 pc)
++{
++	const auto it = std::upper_bound(sw2_vu0_block_ranges.begin(), sw2_vu0_block_ranges.end(),
++		static_cast<uptr>(pc), [](uptr value, const SW2Vu0BlockRange& range) { return value < range.begin; });
++	if (it == sw2_vu0_block_ranges.begin())
++		return 0;
++	const SW2Vu0BlockRange& range = *std::prev(it);
++	if (pc >= range.end)
++		return 0;
++	return 0xE0000000u | ((range.program_pc / 8) << 9) | (range.block_pc / 8);
++}
++
++extern "C" u32 sw2ax_copy_vu0_host_block(u64 pc, u32* out, u32 capacity)
++{
++	const auto it = std::upper_bound(sw2_vu0_block_ranges.begin(), sw2_vu0_block_ranges.end(),
++		static_cast<uptr>(pc), [](uptr value, const SW2Vu0BlockRange& range) { return value < range.begin; });
++	if (it == sw2_vu0_block_ranges.begin() || pc >= std::prev(it)->end)
++		return 0;
++	const SW2Vu0BlockRange& range = *std::prev(it);
++	const u32 words = std::min(capacity, static_cast<u32>((range.end - range.begin) / sizeof(u32)));
++	std::memcpy(out, reinterpret_cast<const void*>(range.begin), words * sizeof(u32));
++	return words;
++}
++
++extern "C" void sw2ax_describe_vu0_block(u64 pc, char* out, size_t size)
++{
++	const auto it = std::upper_bound(sw2_vu0_block_ranges.begin(), sw2_vu0_block_ranges.end(),
++		static_cast<uptr>(pc), [](uptr value, const SW2Vu0BlockRange& range) { return value < range.begin; });
++	if (it == sw2_vu0_block_ranges.begin() || pc >= std::prev(it)->end)
++	{
++		std::snprintf(out, size, "unmapped");
++		return;
++	}
++	const SW2Vu0BlockRange& range = *std::prev(it);
++	int written = std::snprintf(out, size, "program %03x block %03x count %u guest", range.program_pc, range.block_pc, range.count);
++	size_t pos = written > 0 ? static_cast<size_t>(written) : 0;
++	for (u32 i = 0; i < range.count && i < range.guest_code.size() && pos < size; i++)
++	{
++		written = std::snprintf(out + pos, size - pos, " %016llx", static_cast<unsigned long long>(range.guest_code[i]));
++		if (written <= 0)
++			break;
++		pos += static_cast<size_t>(written);
++	}
++}
++#endif
++
+ 
+ //------------------------------------------------------------------
+ // Messages Called at Execution Time
+@@ -1665,6 +1734,33 @@ void* mVUcompile(microVU& mVU, u32 startPC, uptr pState)
+ 	mVUendProgram(mVU, &mFC, 1);
+ 
+ perf_and_return:
++#ifdef __SWITCH__
++	if (!mVU.index && sw2_vu0_trace_blocks)
++	{
++		const uptr begin = reinterpret_cast<uptr>(thisPtr);
++		const uptr end = reinterpret_cast<uptr>(armGetCurrentCodePointer());
++		if (end > begin)
++		{
++			SW2Vu0BlockRange range{};
++			range.begin = begin;
++			range.end = end;
++			range.program_pc = mVU.regs().start_pc & 0xff8;
++			range.block_pc = startPC & 0xff8;
++			range.count = mVUcount;
++			for (u32 i = 0; i < range.count && i < range.guest_code.size(); i++)
++			{
++				const u32 offset = (startPC + i * 8) & 0xff8;
++				std::memcpy(&range.guest_code[i], mVU.regs().Micro + offset, sizeof(u64));
++			}
++			const auto it = std::lower_bound(sw2_vu0_block_ranges.begin(), sw2_vu0_block_ranges.end(), begin,
++				[](const SW2Vu0BlockRange& item, uptr value) { return item.begin < value; });
++			if (it != sw2_vu0_block_ranges.end() && it->begin == begin)
++				*it = range;
++			else
++				sw2_vu0_block_ranges.insert(it, range);
++		}
++	}
++#endif
+ 	// Register the program-entry compile only, not every continuation block
+ 	// compiled at a mid-program PC (start_pc stays the program entry for
+ 	// branch-target sub-blocks; it's only re-pointed on the dispatch/indirect-
 diff --git a/pcsx2/arm64/recVTLB-arm64.cpp b/pcsx2/arm64/recVTLB-arm64.cpp
 index 9a1a2d1179..fad8b1acbf 100644
 --- a/pcsx2/arm64/recVTLB-arm64.cpp
@@ -5234,6 +7158,30 @@ index 439b788b5b..620e0c0dd5 100644
 +	// SW2PS2 crash watch: the kernel handles of the threads started through pthread_create.
 +	std::size_t GetLiveThreadHandles(unsigned* out, std::size_t max);
  } // namespace HorizonThreadWrap
+diff --git a/tests/ctest/core/recompilers/CMakeLists.txt b/tests/ctest/core/recompilers/CMakeLists.txt
+index b601f1b894..474c20d0eb 100644
+--- a/tests/ctest/core/recompilers/CMakeLists.txt
++++ b/tests/ctest/core/recompilers/CMakeLists.txt
+@@ -72,6 +72,7 @@ add_pcsx2_test(recompiler_tests
+ 	ee_rec_muldiv_tests.cpp
+ 	ee_rec_multiblock_tests.cpp
+ 	ee_rec_shift_tests.cpp
++	ee_rec_shift_pair_tests.cpp
+ 	ee_rec_skipmpeg_tests.cpp
+ 	ee_rec_smc_manual_tests.cpp
+ 	ee_rec_smc_tests.cpp
+diff --git a/tests/ctest/core/recompilers/harness/EeRecTestHarness.h b/tests/ctest/core/recompilers/harness/EeRecTestHarness.h
+index 60eab3205d..c266b52755 100644
+--- a/tests/ctest/core/recompilers/harness/EeRecTestHarness.h
++++ b/tests/ctest/core/recompilers/harness/EeRecTestHarness.h
+@@ -175,6 +175,7 @@ public:
+ 
+ 	u64 GetGpr64Interp(u32 reg_idx) const;
+ 	u64 GetGpr64Jit   (u32 reg_idx) const;
++	u64 GetCycleDeltaJit() const { return jit_snapshot_.regs.cycle - pre_snapshot_.regs.cycle; }
+ 	u32 GetGprInterp  (u32 reg_idx) const { return static_cast<u32>(GetGpr64Interp(reg_idx)); }
+ 	u32 GetGprJit     (u32 reg_idx) const { return static_cast<u32>(GetGpr64Jit(reg_idx)); }
+ 	u64 GetHi64Interp() const;
 diff --git a/pcsx2/IopThread/IopLagControl.cpp b/pcsx2/IopThread/IopLagControl.cpp
 new file mode 100644
 index 0000000000..523936139f
@@ -5716,16 +7664,20 @@ index 0000000000..adaa27c727
 +} // namespace IopThread
 diff --git a/pcsx2/IopThread/IopLagRules.cpp b/pcsx2/IopThread/IopLagRules.cpp
 new file mode 100644
-index 0000000000..d00e2bdbe0
+index 0000000000..163d57734a
 --- /dev/null
 +++ b/pcsx2/IopThread/IopLagRules.cpp
-@@ -0,0 +1,163 @@
+@@ -0,0 +1,172 @@
 +// SPDX-FileCopyrightText: 2026 ARMSX2 Contributors
 +// SPDX-License-Identifier: GPL-3.0+
 +
 +#include "IopThread/IopLagRules.h"
 +
 +#include <algorithm>
++
++#ifdef __SWITCH__
++extern "C" uint32_t sw2_ee_wait_cycles;
++#endif
 +
 +namespace IopThread
 +{
@@ -5756,7 +7708,12 @@ index 0000000000..d00e2bdbe0
 +	{
 +		m_cfg = config;
 +		m_cfg.mask &= LagRule::kAll;
++#ifdef __SWITCH__
++		const s32 minLag = (s32)sw2_ee_wait_cycles + 1024;
++		m_cfg.tight = std::max<s32>(m_cfg.tight, minLag);
++#else
 +		m_cfg.tight = std::max<s32>(m_cfg.tight, kMinLag);
++#endif
 +	}
 +
 +	void LagRules::Reset(u32 frame)
@@ -6145,153 +8102,639 @@ index 0000000000..e62f35076c
 +		s32 m_last_rule = -1;
 +	};
 +} // namespace IopThread
-diff --git a/pcsx2/Patch.cpp b/pcsx2/Patch.cpp
-index 842ba4717c..e5aad14797 100644
---- a/pcsx2/Patch.cpp
-+++ b/pcsx2/Patch.cpp
-@@ -144,6 +144,9 @@ namespace Patch
- 	static std::vector<std::string> s_just_enabled_cheats;
- 	static std::vector<std::string> s_just_enabled_patches;
- 	static u32 s_patches_crc;
-+#if defined(__SWITCH__) && defined(ENABLE_LIBRETRO)
-+	static std::string s_cheat_serial;
-+#endif
- 	static std::optional<float> s_override_aspect_ratio;
- 	static std::optional<GSInterlaceMode> s_override_interlace_mode;
- 
-@@ -393,6 +396,23 @@ bool Patch::ContainsPatchName(const std::vector<PatchInfo>& patches, const std::
- template <typename F>
- void Patch::EnumeratePnachFiles(const std::string_view serial, u32 crc, bool cheats, bool for_ui, const F& f)
- {
-+#if defined(__SWITCH__) && defined(ENABLE_LIBRETRO)
-+	// SW2PS2 presents individually selected cheats for the exact disc revision.
-+	if (cheats)
-+	{
-+		if (serial.empty() || crc == 0 || (!for_ui && Achievements::IsHardcoreModeActive()))
-+			return;
+diff --git a/pcsx2/MfifoWriteRange.h b/pcsx2/MfifoWriteRange.h
+new file mode 100644
+index 0000000000..7ae3986238
+--- /dev/null
++++ b/pcsx2/MfifoWriteRange.h
+@@ -0,0 +1,22 @@
++// SPDX-FileCopyrightText: 2026 SW2PS2 Contributors
++// SPDX-License-Identifier: GPL-3.0+
++#pragma once
 +
-+		const std::string filename = GetPnachTemplate(serial, crc, true, false, false);
-+		for (const std::string& dir : {EmuFolders::Cheats, std::string("romfs:/cheats")})
-+		{
-+			const std::string path = Path::Combine(dir, filename);
-+			if (const auto contents = FileSystem::ReadFileToString(path.c_str()))
-+				f(path, *contents);
-+		}
-+		return;
-+	}
-+#endif
- 	// Prefer files on disk over the zip.
- 	//
- 	// Hardcore blocks CHEATS, not fixes. The old condition dropped every on-disk pnach,
-@@ -644,10 +664,24 @@ std::string Patch::GetPnachFilename(const std::string_view serial, u32 crc, bool
- void Patch::ReloadEnabledLists()
- {
- 	const std::vector<std::string> prev_enabled_cheats = std::move(s_enabled_cheats);
-+	s_enabled_cheats.clear();
- 	if (EmuConfig.EnableCheats && !Achievements::IsHardcoreModeActive())
++// Qword spans in a circular MFIFO that must be invalidated after a write.
++// The caller guarantees ring > 0 and start < ring. For oversized writes,
++// conservatively keep the entire ring, matching the old behaviour.
++struct MfifoWriteRanges
++{
++    unsigned first_start;
++    unsigned first_count;
++    unsigned second_count;
++};
++
++constexpr MfifoWriteRanges GetMfifoWriteRanges(unsigned start, unsigned ring, unsigned count)
++{
++    if (count >= ring)
++        return {0, ring, 0};
++    const unsigned available = ring - start;
++    const unsigned first = count < available ? count : available;
++    return {start, first, count - first};
++}
+diff --git a/tests/ctest/core/recompilers/ee_rec_shift_pair_tests.cpp b/tests/ctest/core/recompilers/ee_rec_shift_pair_tests.cpp
+new file mode 100644
+index 0000000000..9b9ea26207
+--- /dev/null
++++ b/tests/ctest/core/recompilers/ee_rec_shift_pair_tests.cpp
+@@ -0,0 +1,602 @@
++// SPDX-FileCopyrightText: 2026 ARMSX2 Dev Team
++// SPDX-License-Identifier: GPL-3.0+
++
++// Shift pairs whose second instruction reads and overwrites the first one's
++// destination compile to one bitfield instruction. JIT vs interpreter over
++// every shift amount and ANDI mask, with the pairs that must not fuse.
++
++#include "harness/EeRecTestHarness.h"
++
++#include "arm64/iR5900-arm64.h"
++
++#include "R5900.h"
++#include "vtlb.h"
++
++#include "vixl/aarch64/disasm-aarch64.h"
++
++#include <gtest/gtest.h>
++
++#include <bit>
++#include <cstdio>
++#include <cstdlib>
++#include <iterator>
++#include <utility>
++#include <sstream>
++#include <string>
++#include <vector>
++
++using namespace recompiler_tests;
++using namespace mips;
++namespace e = mips::ee;
++
++extern bool recEeBlockHostInfo(u32 pc_query, uptr* fnptr, u32* host_size, uptr* lut_fnptr);
++
++namespace {
++
++constexpr u32 kPc = RecompilerTestEnvironment::kProgramPc;
++constexpr u32 kData = RecompilerTestEnvironment::kScratchAddr;
++
++struct Lcg
++{
++	u64 s;
++	u32 next() { s = s * 6364136223846793005ull + 1442695040888963407ull; return static_cast<u32>(s >> 33); }
++	u64 next64() { return (static_cast<u64>(next()) << 32) | next(); }
++};
++
++u64 Sext(u32 v) { return static_cast<u64>(static_cast<s64>(static_cast<s32>(v))); }
++
++enum Family : u32 { kLeftRight32, kLeftRight64, kRightMask, kMaskLeft, kFamilyCount };
++
++const char* const kFamilyName[] = {"SLL+SRx", "DSLLx+DSRx", "SRx+ANDI", "ANDI+SLLx"};
++
++// Instructions with their register fields left zero.
++constexpr u32 kSll = SLL(0, 0, 0), kSrl = SRL(0, 0, 0), kSra = SRA(0, 0, 0);
++constexpr u32 kDsll = e::DSLL(0, 0, 0), kDsrl = e::DSRL(0, 0, 0), kDsra = e::DSRA(0, 0, 0);
++constexpr u32 kDsll32 = e::DSLL32(0, 0, 0), kDsrl32 = e::DSRL32(0, 0, 0), kDsra32 = e::DSRA32(0, 0, 0);
++constexpr u32 kAndi = ANDI(0, 0, 0);
++
++const u16 kMasks[] = {0x0001, 0x0003, 0x0007, 0x000F, 0x001F, 0x003F, 0x007F, 0x00FF, 0x01FF, 0x03FF, 0x07FF,
++	0x0FFF, 0x1FFF, 0x3FFF, 0x7FFF, 0xFFFF, 0x0000, 0x0002, 0x00F0, 0x8000, 0x5555, 0xFFFE, 0x7FFE, 0x0101};
++
++bool IsAndi(u32 code) { return (code >> 26) == 0x0C; }
++
++u32 WithAmount(u32 shift, u32 sa) { return shift | (sa << 6); }
++u32 WithMask(u16 m) { return kAndi | m; }
++
++// Register fields: a shift reads rt and writes rd, ANDI reads rs and writes rt.
++u32 WithRegs(u32 code, u32 src, u32 dest)
++{
++	if (IsAndi(code))
++		return code | (src << 21) | (dest << 16);
++	return code | (src << 16) | (dest << 11);
++}
++
++// The interpreter's result, written out independently of it.
++u64 Apply(u32 code, u64 v)
++{
++	if (IsAndi(code))
++		return v & (code & 0xFFFF);
++	const u32 sa = (code >> 6) & 31;
++	switch (code & 0x3F)
 +	{
-+#if defined(__SWITCH__) && defined(ENABLE_LIBRETRO)
-+		if (!s_cheat_serial.empty() && s_patches_crc != 0)
-+		{
-+			const std::string selection = GetPnachFilename(s_cheat_serial, s_patches_crc, true) + ".enabled";
-+			if (const auto contents = FileSystem::ReadFileToString(selection.c_str()))
-+			{
-+				std::istringstream input(*contents);
-+				for (std::string name; std::getline(input, name);)
-+					s_enabled_cheats.push_back(std::move(name));
-+			}
-+		}
-+#else
- 		s_enabled_cheats = Host::GetStringListSetting(CHEATS_CONFIG_SECTION, PATCH_ENABLE_CONFIG_KEY);
--	else
--		s_enabled_cheats = {};
-+#endif
++		case 0x00: return Sext(static_cast<u32>(v) << sa);
++		case 0x02: return Sext(static_cast<u32>(v) >> sa);
++		case 0x03: return Sext(static_cast<u32>(static_cast<s32>(v) >> sa));
++		case 0x38: return v << sa;
++		case 0x3A: return v >> sa;
++		case 0x3B: return static_cast<u64>(static_cast<s64>(v) >> sa);
++		case 0x3C: return v << (sa + 32);
++		case 0x3E: return v >> (sa + 32);
++		default: return static_cast<u64>(static_cast<s64>(v) >> (sa + 32));
 +	}
- 
- 	const std::vector<std::string> prev_enabled_patches = std::exchange(s_enabled_patches, Host::GetStringListSetting(PATCHES_CONFIG_SECTION, PATCH_ENABLE_CONFIG_KEY));
- 	const std::vector<std::string> disabled_patches = Host::GetStringListSetting(PATCHES_CONFIG_SECTION, PATCH_DISABLE_CONFIG_KEY);
-@@ -877,6 +911,11 @@ void Patch::ReloadPatches(const std::string& serial, u32 crc, bool reload_files,
- 	bool verbose_if_changed)
- {
- 	reload_files |= (s_patches_crc != crc);
-+#if defined(__SWITCH__) && defined(ENABLE_LIBRETRO)
-+	reload_files |= (s_cheat_serial != serial);
-+	reload_enabled_list |= (s_cheat_serial != serial || s_patches_crc != crc);
-+	s_cheat_serial = serial;
-+#endif
- 	s_patches_crc = crc;
- 
- 	if (reload_files)
-@@ -912,6 +951,10 @@ void Patch::ReloadPatches(const std::string& serial, u32 crc, bool reload_files,
- 				if (patch_count > 0)
- 					Console.WriteLn(Color_Green, fmt::format("Found {} cheats in {}.", patch_count, filename));
- 			});
-+#if defined(__SWITCH__) && defined(ENABLE_LIBRETRO)
-+		// Legacy unlabelled codes auto-enable in PCSX2. Here every cheat is opt-in.
-+		std::erase_if(s_cheat_patches, [](const PatchGroup& group) { return group.name.empty(); });
-+#endif
- 	}
- 
- 	UpdateActivePatches(reload_enabled_list, verbose, verbose_if_changed, false);
-diff --git a/pcsx2/Host/AudioStream.cpp b/pcsx2/Host/AudioStream.cpp
---- a/pcsx2/Host/AudioStream.cpp
-+++ b/pcsx2/Host/AudioStream.cpp
-@@ -4,6 +4,7 @@
- #include "Host/AudioStream.h"
- #include "FreeSurroundDecoder.h"
- #include "Host.h"
-+#include "Config.h"
- #include "GS/GSVector.h"
- 
- #include "common/Assertions.h"
-@@ -26,6 +27,9 @@
- //#define LOG_UNDERRUN(...) DEV_LOG(__VA_ARGS__)
- #define LOG_UNDERRUN(...) (void)0
- static constexpr bool LOG_TIMESTRETCH_STATS = false;
-+#if defined(__SWITCH__) && defined(ENABLE_LIBRETRO)
-+std::atomic<float> sw2_output_tempo{1.0f};
-+#endif
- 
- static constexpr const std::array<std::pair<u8, u8>, static_cast<size_t>(AudioExpansionMode::Count)>
- 	s_expansion_channel_count = {{
-@@ -130,6 +134,17 @@
- #endif
- 
- 		case AudioBackend::Null:
-+#if defined(__SWITCH__) && defined(ENABLE_LIBRETRO)
-+			if (stretch_enabled)
-+			{
-+				// The frontend pulls this stream into its own device queue.
-+				AudioStreamParameters params = parameters;
-+				params.expansion_mode = AudioExpansionMode::Disabled;
-+				std::unique_ptr<AudioStream> stream(new AudioStream(sample_rate, params));
-+				stream->BaseInitialize(&StereoSampleReaderImpl, true);
-+				return stream;
-+			}
-+#endif
- 			return CreateNullStream(sample_rate, parameters.buffer_ms);
- 
- 		default:
-@@ -651,6 +666,11 @@
- {
- 	if (IsStretchEnabled())
- 	{
-+#if defined(__SWITCH__) && defined(ENABLE_LIBRETRO)
-+		const bool frontend_clock = EmuConfig.SPU2.Backend == AudioBackend::Null;
-+		if (frontend_clock)
-+			m_soundtouch->setTempo(sw2_output_tempo.load(std::memory_order_relaxed));
-+#endif
- 		m_soundtouch->putSamples(block, CHUNK_SIZE);
- 
- 		u32 tempProgress;
-@@ -659,7 +679,9 @@
- 			InternalWriteFrames(m_staging_buffer.get(), tempProgress);
- 		}
- 
--		if (IsStretchEnabled())
-+#if defined(__SWITCH__) && defined(ENABLE_LIBRETRO)
-+		if (!frontend_clock)
-+#endif
- 			UpdateStretchTempo();
- 	}
- 	else
++}
++
++u32 Amount(u32 code)
++{
++	const u32 f = code & 0x3F;
++	return ((code >> 6) & 31) + (f >= 0x3C ? 32 : 0);
++}
++
++struct Pair
++{
++	Family family;
++	u32 first, second; // register fields zero
++	bool fuses;        // when the second reads and writes the first's destination
++};
++
++std::vector<Pair> AllPairs()
++{
++	std::vector<Pair> v;
++	for (u32 a = 0; a < 32; a++)
++	for (u32 b = 0; b < 32; b++)
++	for (const u32 r : {kSra, kSrl})
++		v.push_back({kLeftRight32, WithAmount(kSll, a), WithAmount(r, b), true});
++	for (const u32 l : {kDsll, kDsll32})
++	for (const u32 r : {kDsra, kDsrl, kDsra32, kDsrl32})
++	for (u32 a = 0; a < 32; a++)
++	for (u32 b = 0; b < 32; b++)
++	{
++		const u32 first = WithAmount(l, a), second = WithAmount(r, b);
++		v.push_back({kLeftRight64, first, second, Amount(first) != 0 || Amount(second) != 0});
++	}
++	for (const u32 r : {kSrl, kSra, kDsrl, kDsra, kDsrl32, kDsra32})
++	for (u32 a = 0; a < 32; a++)
++	for (const u16 m : kMasks)
++	{
++		const u32 first = WithAmount(r, a);
++		const u32 n = std::has_single_bit(static_cast<u32>(m) + 1) ? std::popcount(m) : 0;
++		const bool arith = r == kSra || r == kDsra || r == kDsra32;
++		const u32 bits = (r == kSrl || r == kSra) ? 32 : 64;
++		v.push_back({kRightMask, first, WithMask(m), n != 0 && !(arith && Amount(first) + n > bits)});
++	}
++	for (const u16 m : kMasks)
++	for (const u32 l : {kSll, kDsll, kDsll32})
++	for (u32 b = 0; b < 32; b++)
++		v.push_back({kMaskLeft, WithMask(m), WithAmount(l, b), std::has_single_bit(static_cast<u32>(m) + 1) && m != 0});
++	return v;
++}
++
++// SBFM, UBFM (every immediate shift, sxtw, ubfx/ubfiz/sbfx/sbfiz) and AND,
++// immediate or register, 32- or 64-bit.
++bool IsShiftClass(u32 w)
++{
++	const u32 op = w & 0x7F800000u;
++	return op == 0x13000000u || op == 0x53000000u || op == 0x12000000u || (w & 0x7F200000u) == 0x0A000000u;
++}
++
++// mov between registers (ORR with the zero register, no shift).
++bool IsMov(u32 w) { return (w & 0x7FE0FFE0u) == 0x2A0003E0u; }
++
++bool IsCall(u32 w) { return (w & 0xFC000000u) == 0x94000000u || (w & 0xFFFFFC1Fu) == 0xD63F0000u; }
++
++struct Shape
++{
++	bool found = false;
++	u32 ops = 0; // shift-class and mov
++	u32 calls = 0;
++	u32 first_shift_class = 0;
++};
++
++Shape ShapeAt(u32 guest_pc)
++{
++	Shape s;
++	uptr fn = 0, lut = 0;
++	u32 size = 0;
++	if (!recEeBlockHostInfo(guest_pc, &fn, &size, &lut))
++		return s;
++	s.found = true;
++	const u32* code = reinterpret_cast<const u32*>(fn);
++	for (u32 i = 0; i < size / 4; i++)
++	{
++		if (IsShiftClass(code[i]) && s.first_shift_class == 0)
++			s.first_shift_class = code[i];
++		s.ops += IsShiftClass(code[i]) || IsMov(code[i]);
++		s.calls += IsCall(code[i]);
++	}
++	return s;
++}
++
++bool Is64BitShiftByZero(u32 code) { return !IsAndi(code) && (code & 0x3F) >= 0x38 && Amount(code) == 0; }
++
++void DumpBlock(u32 guest_pc)
++{
++	uptr fn = 0, lut = 0;
++	u32 size = 0;
++	if (!recEeBlockHostInfo(guest_pc, &fn, &size, &lut))
++		return;
++	std::fprintf(stderr, "block 0x%x, %u host bytes:\n", guest_pc, size);
++	vixl::aarch64::PrintDisassembler dis(stderr);
++	dis.DisassembleBuffer(reinterpret_cast<const vixl::aarch64::Instruction*>(fn), size);
++}
++
++void ResetRecAndPageProtection()
++{
++	recCpu.Reset();
++	mmap_ResetBlockTracking();
++}
++
++// Source and destination of the first instruction; aliased or not, pinned or not.
++struct Regs
++{
++	u32 src, dest;
++};
++const Regs kRegs[] = {{reg::t0, reg::t1}, {reg::t1, reg::t1}, {reg::a0, reg::s0}, {reg::s0, reg::s0},
++	{reg::a1, reg::t3}, {reg::t2, reg::v1}};
++
++// Where the source's value comes from. kComputed and kQuad write it earlier
++// in the block (an allocator register, a 128-bit home); kConst builds it with
++// LUI/ORI so the pair folds; kZero reads r0.
++enum Home : u32 { kSeeded, kComputed, kQuad, kConst, kZero, kHomeCount };
++
++// Where the pair sits. kDelayTaken puts the first instruction in the delay
++// slot of a taken BEQ r0,r0 whose target is the second; kDelaySwap the same
++// under BNE k0,r0, which can hoist the slot; kDelayCont under a BEQ k0,r0 that
++// falls through to the second in the same superblock; kDelaySkip under a taken
++// BNE that jumps past the second. kSplit makes the second a branch target, so
++// a block starts there (it runs twice). kBeforeBranch puts the pair right
++// before a taken branch whose delay slot reads the destination.
++enum Placement : u32
++{
++	kInline,
++	kDelayTaken,
++	kDelaySwap,
++	kDelayCont,
++	kDelaySkip,
++	kSplit,
++	kBeforeBranch,
++	kPlacementCount
++};
++
++const char* const kPlacementName[] = {"inline", "delay-taken", "delay-swap", "delay-cont", "delay-skip", "split",
++	"before-branch"};
++
++// Whether the second instruction completes the pair. kDestOther writes another
++// register, so the intermediate stays live and is read later; kSrcOther reads
++// another register.
++enum Variant : u32 { kFuse, kDestOther, kSrcOther, kVariantCount };
++
++// Where the destination is read back: not at all, in the pair's block, or in
++// the block after it.
++enum Readback : u32 { kNoRead, kSameBlock, kNextBlock, kReadbackCount };
++
++const u64 kEdgeValues[] = {0, 0x7FFFFFFFull, 0xFFFFFFFF80000000ull, 0xFFFFFFFFFFFFFFFFull, 0x00000000FFFFFFFFull,
++	0x0000000080000000ull, 0x123456787FFFFFFFull, 0x8000000000000000ull, 0xFFFFFFFF00000000ull, 0x0000000100000000ull};
++
++struct Tally
++{
++	u32 runs = 0;
++	u32 families[kFamilyCount] = {};
++	u32 homes[kHomeCount] = {};
++	u32 placements[kPlacementCount] = {};
++	u32 variants[kVariantCount] = {};
++	u32 readbacks[kReadbackCount] = {};
++	u32 regs[std::size(kRegs)] = {};
++	u32 wide = 0;
++	u32 split_blocks = 0;
++};
++
++struct Case
++{
++	Pair pair;
++	u32 regs, home, placement, variant, readback;
++	u64 value;
++};
++
++void RunOne(const Case& c, Lcg& r, Tally& t)
++{
++	const u32 src = c.home == kZero ? reg::zero : kRegs[c.regs].src;
++	const u32 dest = kRegs[c.regs].dest;
++	const u32 other = (c.regs & 1) ? reg::a2 : reg::t5;
++	const u32 other2 = reg::t4;
++	const u64 v = c.home == kZero ? 0 : c.home == kConst ? Sext(static_cast<u32>(c.value)) : c.value;
++
++	const u32 first = WithRegs(c.pair.first, src, dest);
++	u32 second;
++	switch (c.variant)
++	{
++		case kDestOther: second = WithRegs(c.pair.second, dest, other); break;
++		case kSrcOther: second = WithRegs(c.pair.second, other2, dest); break;
++		default: second = WithRegs(c.pair.second, dest, dest); break;
++	}
++
++	std::vector<u32> p;
++	switch (c.home)
++	{
++		case kComputed: p.push_back(e::DADDU(src, reg::k1, reg::t8)); break;
++		case kQuad: p.push_back(e::LQ(src, 0, reg::k0)); break;
++		case kConst:
++			p.push_back(LUI(src, static_cast<u16>(v >> 16)));
++			p.push_back(ORI(src, src, static_cast<u16>(v)));
++			break;
++		default: break;
++	}
++	const auto here = [&] { return kPc + static_cast<u32>(p.size()) * 4; };
++	u32 split_pc = 0;
++	switch (c.placement)
++	{
++		case kDelayTaken: p.push_back(BEQ(reg::zero, reg::zero, 1)); break;
++		case kDelaySwap: p.push_back(BNE(reg::k0, reg::zero, 1)); break;
++		case kDelayCont: p.push_back(BEQ(reg::k0, reg::zero, 2)); break;
++		case kDelaySkip: p.push_back(BNE(reg::k0, reg::zero, 2)); break;
++		default: break;
++	}
++	p.push_back(first);
++	if (c.placement == kSplit)
++		split_pc = here();
++	p.push_back(second);
++	if (c.placement == kSplit)
++	{
++		p.push_back(ADDIU(reg::t9, reg::t9, -1));
++		p.push_back(BNE(reg::t9, reg::zero, -3));
++		p.push_back(NOP);
++	}
++	else if (c.placement == kDelayCont || c.placement == kDelaySkip)
++		p.push_back(ADDIU(reg::t7, reg::zero, 1));
++	else if (c.placement == kBeforeBranch)
++	{
++		p.push_back(BEQ(reg::zero, reg::zero, 2));
++		p.push_back(e::DADDU(reg::t6, dest, reg::zero));
++		p.push_back(ADDIU(reg::t7, reg::zero, 1)); // skipped
++	}
++	if (c.readback == kNextBlock)
++	{
++		p.push_back(J(here() + 8));
++		p.push_back(NOP);
++	}
++	if (c.readback != kNoRead)
++	{
++		p.push_back(e::DADDU(reg::t7, dest, reg::t6));
++		p.push_back(e::SQ(dest, 0x20, reg::k0));
++		if (c.variant == kDestOther)
++			p.push_back(e::SQ(other, 0x30, reg::k0));
++	}
++
++	std::ostringstream desc;
++	desc << kFamilyName[c.pair.family] << " first=0x" << std::hex << first << " second=0x" << second << std::dec
++		 << " src=r" << src << " dest=r" << dest << " home=" << c.home << " " << kPlacementName[c.placement]
++		 << " variant=" << c.variant << " readback=" << c.readback << " v=0x" << std::hex << v;
++	SCOPED_TRACE(desc.str());
++
++	EeRecTestHarness h;
++	for (u32 g : {reg::t0, reg::t1, reg::t2, reg::t3, reg::t4, reg::t5, reg::t6, reg::t7, reg::a0, reg::a1, reg::a2,
++			 reg::s0, reg::v1})
++		h.SetGpr128(g, r.next64(), r.next64());
++	h.SetGpr64(reg::k0, kData);
++	h.SetGpr64(reg::t9, 2);
++	const u64 addend = r.next64();
++	h.SetGpr64(reg::k1, v - addend);
++	h.SetGpr64(reg::t8, addend);
++	if (c.home == kSeeded)
++		h.SetGpr128(src, v, r.next64());
++	h.WriteU64(kData, v);
++	for (u32 i = 8; i < 0x40; i += 8)
++		h.WriteU64(kData + i, r.next64());
++	h.TrackMemWindow(kData, 0x40);
++	const u64 other2_v = r.next64();
++	h.SetGpr64(other2, other2_v);
++	h.LoadProgram(p);
++	h.Run();
++
++	t.runs++;
++	t.families[c.pair.family]++;
++	t.homes[c.home]++;
++	t.placements[c.placement]++;
++	t.variants[c.variant]++;
++	t.readbacks[c.readback]++;
++	t.regs[c.regs]++;
++	t.wide += Sext(static_cast<u32>(v)) != v;
++	if (c.placement == kSplit)
++	{
++		uptr fn = 0, lut = 0;
++		u32 size = 0;
++		t.split_blocks += recEeBlockHostInfo(split_pc, &fn, &size, &lut);
++	}
++
++	// How many times the second instruction runs.
++	const u32 runs = c.placement == kDelaySkip ? 0 : c.placement == kSplit ? 2 : 1;
++	const u64 mid = Apply(first, v);
++	u64 want = mid;
++	if (c.variant == kFuse)
++		for (u32 k = 0; k < runs; k++)
++			want = Apply(second, want);
++	else if (c.variant == kSrcOther && runs != 0)
++		want = Apply(second, other2_v);
++	EXPECT_EQ(h.GetGpr64Jit(dest), want);
++	EXPECT_EQ(h.GetGpr64Interp(dest), want);
++	if (c.variant == kDestOther && runs != 0)
++		EXPECT_EQ(h.GetGpr64Jit(other), Apply(second, mid));
++}
++
++void CheckTally(const Tally& t)
++{
++	::testing::Test::RecordProperty("runs", static_cast<int>(t.runs));
++	for (u32 x = 0; x < kHomeCount; x++)
++		EXPECT_GE(t.homes[x], t.runs / 7) << "home " << x;
++	for (u32 x = 0; x < kPlacementCount; x++)
++		EXPECT_GE(t.placements[x], t.runs / 10) << kPlacementName[x];
++	for (u32 x = 0; x < kVariantCount; x++)
++		EXPECT_GE(t.variants[x], t.runs / 5) << "variant " << x;
++	for (u32 x = 0; x < kReadbackCount; x++)
++		EXPECT_GE(t.readbacks[x], t.runs / 5) << "readback " << x;
++	for (u32 x = 0; x < std::size(kRegs); x++)
++		EXPECT_GE(t.regs[x], t.runs / 9) << "regs " << x;
++	EXPECT_GE(t.wide, t.runs / 4);
++	EXPECT_EQ(t.split_blocks, t.placements[kSplit]) << "a block starts at the second instruction";
++}
++
++// Every pair of the family, fused inline on a value and its complement, then
++// once more with the other dimensions rotated.
++void RunFamily(Family f, u64 seed)
++{
++	ResetRecAndPageProtection();
++	Tally t, inline_runs;
++	Lcg r{seed};
++	u32 i = 0;
++	for (const Pair& pr : AllPairs())
++	{
++		if (pr.family != f)
++			continue;
++		const u64 v = r.next64();
++		for (const u64 value : {v, ~v})
++		{
++			const Case c{pr, i % static_cast<u32>(std::size(kRegs)), i % 3, kInline, kFuse, i % kReadbackCount, value};
++			RunOne(c, r, inline_runs);
++		}
++		Case c;
++		c.pair = pr;
++		c.regs = i % std::size(kRegs);
++		// kFuse is half the runs; the rest split between the two non-pairs.
++		c.variant = (i / 7) % 4 < 2 ? kFuse : ((i / 7) % 4 == 2 ? kDestOther : kSrcOther);
++		c.home = (i / 3) % kHomeCount;
++		c.placement = (i / 5 + i / 35) % kPlacementCount;
++		c.readback = (i / 2 + i / 11) % kReadbackCount;
++		c.value = (i % 3 == 0) ? kEdgeValues[(i / 3) % std::size(kEdgeValues)] : r.next64();
++		RunOne(c, r, t);
++		i++;
++		if (::testing::Test::HasFailure())
++			return;
++	}
++	EXPECT_EQ(inline_runs.runs, 2 * t.runs);
++	CheckTally(t);
++}
++
++} // namespace
++
++TEST(EeRecShiftPair, LeftThenRight32)
++{
++	RunFamily(kLeftRight32, 0x736c6c737261ull);
++}
++
++TEST(EeRecShiftPair, LeftThenRight64)
++{
++	RunFamily(kLeftRight64, 0x64736c6c64737261ull);
++}
++
++TEST(EeRecShiftPair, RightThenMask)
++{
++	RunFamily(kRightMask, 0x7372616e6469ull);
++}
++
++TEST(EeRecShiftPair, MaskThenLeft)
++{
++	RunFamily(kMaskLeft, 0x616e64697366ull);
++}
++
++// Every pair, seeded source, alone in its block. A pair that fuses is one
++// shift-class instruction. One that does not is the first instruction's and
++// the second's, which is nothing for a 64-bit shift by 0 of a register onto
++// itself. The block's tail adds its own, counted from a block of NOPs.
++TEST(EeRecShiftPair, FusedPairIsOneInstruction)
++{
++	ResetRecAndPageProtection();
++	const bool dump = std::getenv("EESHIFTPAIR_DUMP") != nullptr;
++	u32 fused = 0, unfused = 0, wrong = 0;
++	u32 floor;
++	{
++		EeRecTestHarness h;
++		h.LoadProgram({NOP, NOP});
++		h.Run();
++		floor = ShapeAt(kPc).ops;
++	}
++	for (const Pair& pr : AllPairs())
++	{
++		const u32 first = WithRegs(pr.first, reg::t0, reg::t1);
++		const u32 second = WithRegs(pr.second, reg::t1, reg::t1);
++		EeRecTestHarness h;
++		h.SetGpr64(reg::t0, 0x0123456789ABCDEFull);
++		h.LoadProgram({first, second});
++		h.Run();
++		const Shape s = ShapeAt(kPc);
++		ASSERT_TRUE(s.found);
++		const u32 want = floor + (pr.fuses ? 1 : 1 + !Is64BitShiftByZero(pr.second));
++		fused += pr.fuses;
++		unfused += !pr.fuses;
++		const bool ok = s.ops == want;
++		if (!ok && wrong++ == 0)
++			ADD_FAILURE() << kFamilyName[pr.family] << std::hex << " first=0x" << first << " second=0x" << second
++						  << std::dec << ": " << s.ops << " shift-class and mov instructions, want " << want;
++		if (dump || (!ok && wrong == 1))
++			DumpBlock(kPc);
++	}
++	EXPECT_EQ(wrong, 0u);
++	EXPECT_EQ(floor, 1u);
++	EXPECT_EQ(fused, 2048u + 8190u + 2832u + 1536u);
++	EXPECT_EQ(unfused, AllPairs().size() - fused);
++}
++
++// The second instruction is still charged, and the instruction after the
++// pair still runs: a fused pair costs the cycles of the same pair writing
++// another register.
++TEST(EeRecShiftPair, FusedPairChargesBothInstructions)
++{
++	ResetRecAndPageProtection();
++	const std::pair<u32, u32> pairs[] = {
++		{WithAmount(kSll, 16), WithAmount(kSra, 16)},
++		{WithAmount(kSrl, 8), WithMask(0xFF)},
++		{WithMask(0xFF), WithAmount(kSll, 4)},
++		{WithAmount(kDsll32, 0), WithAmount(kDsra32, 0)},
++	};
++	constexpr u64 kV = 0xFEDCBA9876543210ull;
++	for (const auto& [first, second] : pairs)
++	{
++		SCOPED_TRACE(::testing::Message() << std::hex << "first=0x" << first << " second=0x" << second);
++		u64 cycles[2];
++		for (u32 twin = 0; twin < 2; twin++)
++		{
++			const u32 dest = twin ? reg::t2 : reg::t1;
++			EeRecTestHarness h;
++			h.SetGpr64(reg::t0, kV);
++			h.LoadProgram({WithRegs(first, reg::t0, reg::t1), WithRegs(second, reg::t1, dest),
++				e::DADDU(reg::t3, dest, dest)});
++			h.Run();
++			cycles[twin] = h.GetCycleDeltaJit();
++			EXPECT_EQ(h.GetGpr64Jit(reg::t3), 2 * Apply(second, Apply(first, kV)));
++		}
++		EXPECT_EQ(cycles[0], cycles[1]);
++		EXPECT_GT(cycles[0], 0u);
++	}
++}
++
++TEST(EeRecShiftPair, PairOntoR0WritesNothing)
++{
++	ResetRecAndPageProtection();
++	for (const auto& [first, second] : {std::pair{WithAmount(kSll, 16), WithAmount(kSra, 16)},
++			 std::pair{WithMask(0xFF), WithAmount(kSll, 4)}, std::pair{WithAmount(kDsll32, 0), WithAmount(kDsra32, 0)}})
++	{
++		SCOPED_TRACE(::testing::Message() << std::hex << "first=0x" << first << " second=0x" << second);
++		EeRecTestHarness h;
++		h.SetGpr64(reg::t0, 0xFEDCBA9876543210ull);
++		h.LoadProgram({WithRegs(first, reg::t0, reg::zero), WithRegs(second, reg::zero, reg::zero),
++			e::DADDU(reg::t1, reg::zero, reg::t0)});
++		h.Run();
++		h.ExpectGpr64(reg::zero, 0);
++		h.ExpectGpr64(reg::t1, 0xFEDCBA9876543210ull);
++	}
++}
++
++// A second instruction forced to the interpreter runs there on the first
++// one's result, so the first emits what it emits alone.
++TEST(EeRecShiftPair, FallbackSecondHalfDoesNotFuse)
++{
++	struct Row
++	{
++		u32 group;
++		u32 first, second;
++	};
++	const Row rows[] = {
++		{EERecFallback::Shift, WithMask(0x0FFF), WithAmount(kSll, 20)},
++		{EERecFallback::Shift, WithMask(0x00FF), WithAmount(kDsll32, 3)},
++		{EERecFallback::Arith, WithAmount(kSrl, 7), WithMask(0x001F)},
++		{EERecFallback::Arith, WithAmount(kDsra32, 2), WithMask(0x00FF)},
++	};
++	constexpr u64 kV = 0x89ABCDEF12345678ull;
++	const u32 saved = EERecFallback::g_groups;
++	for (const Row& row : rows)
++	{
++		const u32 first = WithRegs(row.first, reg::t0, reg::t1);
++		const u32 second = WithRegs(row.second, reg::t1, reg::t1);
++		SCOPED_TRACE(::testing::Message() << std::hex << "first=0x" << first << " second=0x" << second);
++		Shape alone, native, forced;
++		for (u32 leg = 0; leg < 3; leg++)
++		{
++			EERecFallback::g_groups = leg == 2 ? row.group : 0;
++			ResetRecAndPageProtection();
++			EeRecTestHarness h;
++			h.SetGpr64(reg::t0, kV);
++			if (leg == 0)
++				h.LoadProgram({first});
++			else
++				h.LoadProgram({first, second});
++			h.Run();
++			(leg == 0 ? alone : leg == 1 ? native : forced) = ShapeAt(kPc);
++			EERecFallback::g_groups = saved;
++			if (leg != 0)
++				EXPECT_EQ(h.GetGpr64Jit(reg::t1), Apply(second, Apply(first, kV)));
++		}
++		EXPECT_GT(forced.calls, native.calls) << "the second instruction went to the interpreter";
++		EXPECT_NE(native.first_shift_class, alone.first_shift_class) << "the pair fuses natively";
++		EXPECT_EQ(forced.first_shift_class, alone.first_shift_class);
++	}
++	EERecFallback::g_groups = saved;
++	ResetRecAndPageProtection();
++}

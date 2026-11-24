@@ -63,6 +63,10 @@ Slot slots[kSlots];
 uint64_t submitted, shown;     // frame serials: last copy submitted, last handed over
 std::vector<uint32_t> pixels;  // RGBA for a BGRA frame (swapped)
 unsigned waits;                // times both slots were busy (diagnostics)
+bool measure = false;
+HandoffStats handoff{};
+
+uint64_t elapsedNs(uint64_t start) { return armTicksToNs(armGetSystemTick() - start); }
 
 std::recursive_mutex queueLock;
 retro_hw_render_interface_vulkan iface;
@@ -237,6 +241,14 @@ void setFrameSize(unsigned w, unsigned h) { frameW = w; frameH = h; }
 void* hwInterface() { return deviceUp ? &iface : nullptr; }
 bool active() { return deviceUp; }
 unsigned slotWaits() { return waits; }
+void measureHandoff(bool enabled) { measure = enabled; handoff = {}; waits = 0; }
+bool measuringHandoff() { return measure; }
+void recordUpload(uint64_t ns) {
+  handoff.uploads++;
+  handoff.uploadNs += ns;
+  if (ns > handoff.maxUploadNs) handoff.maxUploadNs = ns;
+}
+HandoffStats handoffStats() { return handoff; }
 
 const uint32_t* grab(int* w, int* h) {
   if (!deviceUp) return nullptr;
@@ -248,11 +260,21 @@ const uint32_t* grab(int* w, int* h) {
     for (Slot& s : slots) if (!s.busy) { freeSlot = &s; break; }
     if (!freeSlot) {  // both busy: drop the older copy (a newer frame supersedes it)
       Slot* older = slots[0].serial < slots[1].serial ? &slots[0] : &slots[1];
+      const uint64_t start = measure ? armGetSystemTick() : 0;
       vkWaitForFences(device, 1, &older->fence, VK_TRUE, UINT64_MAX);
+      if (measure) handoff.waitsNs += elapsedNs(start);
       older->busy = false; waits++;
       freeSlot = older;
     }
-    submitCopy(*freeSlot);
+    const uint64_t start = measure ? armGetSystemTick() : 0;
+    const bool submittedCopy = submitCopy(*freeSlot);
+    if (measure) {
+      handoff.submitsNs += elapsedNs(start);
+      if (submittedCopy) {
+        handoff.copies++;
+        handoff.bytes += (uint64_t)frameW * frameH * 4;
+      }
+    }
   }
   // Hand over the newest finished copy that is newer than the last one shown.
   Slot* best = nullptr;
@@ -260,7 +282,10 @@ const uint32_t* grab(int* w, int* h) {
     if (s.busy && s.serial > shown && done(s) && (!best || s.serial > best->serial)) best = &s;
   if (!best) return nullptr;
   for (Slot& s : slots) if (s.busy && s.serial < best->serial) s.busy = false;  // older copies are stale now
-  return take(*best, w, h);
+  const uint64_t start = measure ? armGetSystemTick() : 0;
+  const auto* pixels = take(*best, w, h);
+  if (measure) handoff.mapNs += elapsedNs(start);
+  return pixels;
 }
 
 void end() {
