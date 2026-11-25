@@ -4,6 +4,9 @@
 #include <string>
 namespace vkp {
 bool prepare(std::string& err);  // the instance (kept for the app's life)
+// At app exit, after the last game: destroy the session's device and the instance. hbloader runs
+// the next program in this same process, so whatever the driver still holds would carry over.
+void shutdown();
 // After retro_load_game: the core's device (negotiation).
 bool begin(const void* negotiationInterface, std::string& err);
 void* hwInterface();          // retro_hw_render_interface_vulkan* for GET_HW_RENDER_INTERFACE

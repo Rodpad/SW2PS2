@@ -9,9 +9,11 @@ $(error "Please set DEVKITPRO in your environment. export DEVKITPRO=<path to>/de
 endif
 TOPDIR ?= $(CURDIR)
 include $(DEVKITPRO)/libounce/switch2_rules
-# OUNCEVK: a newer OunceVK driver (lib/, include/) to use ahead of the devkit's portlibs copy. Default:
-# the portlibs one (third_party/ouncevk-20261118 was ~3% faster but crashed on relaunch in hbmenu).
-OUNCEVK	?=
+# OUNCEVK: the OunceVK driver (lib/, include/) to use ahead of the devkit's portlibs copy. Default: the
+# 20261123.1 release that tools/setup_third_party.sh unpacks into third_party/ (faster at 2x; stable over
+# relaunches since the app destroys its Vulkan device and instance at exit); the devkit's copy if absent.
+# OUNCEVK= (empty) builds with the devkit's driver.
+OUNCEVK	?=	$(wildcard $(TOPDIR)/third_party/ouncevk-20261123.1)
 ifneq ($(strip $(OUNCEVK)),)
 OVERLAY_LIBPATHS	:=	-L$(OUNCEVK)/lib $(OVERLAY_LIBPATHS)
 CPPFLAGS	:=	-I$(OUNCEVK)/include $(CPPFLAGS)
@@ -19,7 +21,7 @@ endif
 
 APP_TITLE	:=	SW2PS2
 APP_AUTHOR	:=	Rodpad
-APP_VERSION	:=	1.1.0-exp.4
+APP_VERSION	:=	1.1.0-exp.3
 
 TARGET		:=	sw2ps2
 BUILD		:=	build

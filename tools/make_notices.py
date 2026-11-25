@@ -21,7 +21,7 @@ def text(s): return ("text", s)
 # (component, what it does in SW2PS2, licence, texts)
 COMPONENTS = [
     ("OunceSX2 / ARMSX2 / PCSX2", "the PS2 emulator core", "GPL-3.0-or-later", [text("The GNU GPL v3: GPL-3.0.txt in this folder (LICENSE in the SW2PS2 source). Source: https://github.com/Rodpad/SW2PS2 with patches/ against https://github.com/nyathea/OunceSX2.")]),
-    ("OunceVK (Mesa NVK + Zink)", "Vulkan / OpenGL ES graphics driver", "MIT (Mesa)", [f(f"{DKP}/portlibs/switch2/share/licenses/ouncevk/mesa-license.rst"), f(f"{DKP}/portlibs/switch2/share/licenses/ouncevk/zlib-license.txt")]),
+    ("OunceVK (Mesa NVK + Zink)", "Vulkan / OpenGL ES graphics driver", "MIT (Mesa)", [f(os.path.join(ROOT, "third_party/ouncevk-20261123.1/share/licenses/ouncevk/mesa-license.rst")), f(os.path.join(ROOT, "third_party/ouncevk-20261123.1/share/licenses/ouncevk/zlib-license.txt"))]),
     ("kaiHEN", "JIT and system services on the Switch 2", "ISC", [f(f"{DKP}/portlibs/switch2/share/licenses/kaihen/kaihen-ISC.txt")]),
     ("libounce / libnx", "Switch 2 system library", "ISC", [f(f"{DKP}/libounce/licenses/libounce-ISC.txt"), f(f"{DKP}/libounce/licenses/libnx-ISC.txt")]),
     ("FreeType", "font rendering", "FreeType Licence (FTL)", [f(f"{DKP}/portlibs/switch/licenses/switch-freetype/LICENSE.TXT"), f(f"{DKP}/portlibs/switch/licenses/switch-freetype/FTL.TXT")]),

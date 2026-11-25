@@ -68,12 +68,64 @@ index 75e613e3b2..53d4034157 100644
  	target_sources(common PRIVATE
  		HTTPDownloaderCurl.cpp
 diff --git a/common/Horizon/HorizonHostSys.cpp b/common/Horizon/HorizonHostSys.cpp
-index ba4927fb80..b62ec8ee46 100644
+index ba4927fb80..d275f074ef 100644
 --- a/common/Horizon/HorizonHostSys.cpp
 +++ b/common/Horizon/HorizonHostSys.cpp
-@@ -427,7 +427,13 @@ std::unique_ptr<SharedMemoryMappingArea> SharedMemoryMappingArea::Create(size_t
+@@ -361,6 +361,26 @@ SharedMemoryMappingArea::SharedMemoryMappingArea(u8* base_ptr, size_t size, size
+ {
+ }
+ 
++// SW2PS2: the data area (0x12500000 bytes, svcMapMemory targets) must lie in the 2 GB stack region,
++// where every thread's stack mirror lands at a random address. Searched for at game start, a free
++// stretch that large was sometimes missing (largest 417 MB, yet "failed to reserve": the game never
++// started, then the app crashed at unload). So it is reserved once, before any thread exists, and
++// kept for the whole process (each game reuses it).
++namespace
++{
++	constexpr size_t EARLY_DATA_AREA_SIZE = 0x14000000;
++	void* s_early_base = nullptr;
++	bool s_early_in_use = false;
++	__attribute__((constructor(102))) void ReserveEarlyDataArea()
++	{
++		virtmemLock();
++		void* const base = virtmemFindStack(EARLY_DATA_AREA_SIZE, 0);
++		if (base && virtmemAddReservation(base, EARLY_DATA_AREA_SIZE))
++			s_early_base = base;
++		virtmemUnlock();
++	}
++} // namespace
++
+ SharedMemoryMappingArea::~SharedMemoryMappingArea()
+ {
+ 	pxAssertRel(m_num_mappings == 0, "No mappings left");
+@@ -387,6 +407,12 @@ SharedMemoryMappingArea::~SharedMemoryMappingArea()
+ 		return;
  	}
  
++	if (m_base_ptr == s_early_base)
++	{
++		std::lock_guard lock(s_area_mutex);
++		s_early_in_use = false;  // the reservation stays for the next game
++		return;
++	}
+ 	virtmemLock();
+ 	virtmemRemoveReservation(state.reservation);
+ 	virtmemUnlock();
+@@ -426,8 +452,25 @@ std::unique_ptr<SharedMemoryMappingArea> SharedMemoryMappingArea::Create(size_t
+ 		}
+ 	}
+ 
++	if (!jit && s_early_base && size <= EARLY_DATA_AREA_SIZE)
++	{
++		std::lock_guard lock(s_area_mutex);
++		if (!s_early_in_use)
++		{
++			s_early_in_use = true;
++			s_areas.emplace(static_cast<u8*>(s_early_base), HorizonAreaState{AreaBackend::LibnxSvcMapMemory, nullptr});
++			return std::unique_ptr<SharedMemoryMappingArea>(new SharedMemoryMappingArea(static_cast<u8*>(s_early_base), size, size / __pagesize));
++		}
++	}
++
  	virtmemLock();
 -	void* const base = virtmemFindStack(size, 0);
 +	// SW2PS2: only svcMapMemory targets must lie in the stack region; the code
@@ -2506,6 +2558,926 @@ index 37981a7769..2d3c488283 100644
  		u64 CompletedCount() const noexcept { return m_completed.load(std::memory_order_acquire); }
  
  	private:
+diff --git a/pcsx2/IopThread/IopLagControl.cpp b/pcsx2/IopThread/IopLagControl.cpp
+new file mode 100644
+index 0000000000..523936139f
+--- /dev/null
++++ b/pcsx2/IopThread/IopLagControl.cpp
+@@ -0,0 +1,262 @@
++// SPDX-FileCopyrightText: 2026 ARMSX2 Contributors
++// SPDX-License-Identifier: GPL-3.0+
++
++#include "IopThread/IopLagControl.h"
++
++#include <algorithm>
++
++namespace IopThread
++{
++	const char* ReplyKind::Name(u32 kind)
++	{
++		switch (kind)
++		{
++			case SbusIrq:
++				return "sbus_irq";
++			case Call:
++				return "call";
++			case Sif0Pump:
++				return "sif0_pump";
++			case Sif1Pump:
++				return "sif1_pump";
++			default:
++				return "?";
++		}
++	}
++
++	u32 LateBucket(u64 late)
++	{
++		u32 i = 0;
++		while (i < kLateEdgeCount && late >= kLateEdges[i])
++			i++;
++		return i;
++	}
++
++	void LateHist::Add(u64 late)
++	{
++		count++;
++		sum += late;
++		max = std::max(max, late);
++		bucket[LateBucket(late)]++;
++	}
++
++	u32 FrameBin(u64 events)
++	{
++		if (events <= 2)
++			return static_cast<u32>(events);
++		if (events <= 4)
++			return 3;
++		if (events <= 8)
++			return 4;
++		return 5;
++	}
++
++	void ReplyMonitor::Reset()
++	{
++		const bool trace = m_trace_on;
++		m_stats = ReplyStats();
++		m_prev = 0;
++		m_have_prev = false;
++		m_event_ff = false;
++		m_in_streak = false;
++		m_streak_start = 0;
++		m_ff_cum = 0;
++		m_first = 0;
++		m_frame = 0;
++		m_have_frame = false;
++		m_f_replies = m_f_late = m_f_events = m_f_max_late = m_f_ff_start = m_f_cycle_start = 0;
++		m_f_unbroken = m_f_share90 = 0;
++		m_wake_n = 0;
++		m_trace.clear();
++		m_trace_on = trace;
++		std::fill(std::begin(m_ring), std::end(m_ring), Sample{0, 0});
++	}
++
++	void ReplyMonitor::EndFrame()
++	{
++		m_stats.frames++;
++		if (m_f_events != 0)
++			m_stats.frames_with_overshoot++;
++		m_stats.frame_bins[FrameBin(m_f_events)]++;
++		if (m_trace_on && m_trace.size() < kMaxTrace)
++		{
++			m_trace.push_back({m_frame, static_cast<u32>(m_f_replies), static_cast<u32>(m_f_late), static_cast<u32>(m_f_events),
++				static_cast<u32>(m_f_unbroken), static_cast<u32>(m_f_share90), m_f_max_late, m_ff_cum - m_f_ff_start, m_prev - m_f_cycle_start});
++		}
++		m_f_replies = m_f_late = m_f_events = m_f_max_late = 0;
++		m_f_unbroken = m_f_share90 = 0;
++		m_f_ff_start = m_ff_cum;
++		m_f_cycle_start = m_prev;
++	}
++
++	bool ReplyMonitor::OnEventTest(u64 cycle, bool via_ff, u32 frame)
++	{
++		// A clock that went backwards (a state was loaded) starts the books of the interval again.
++		if (m_have_prev && cycle < m_prev)
++		{
++			m_prev = cycle;
++			m_in_streak = false;
++			m_f_cycle_start = cycle;
++		}
++
++		bool new_frame = false;
++		if (!m_have_frame)
++		{
++			m_have_frame = true;
++			m_frame = frame;
++			m_first = cycle;
++			m_f_ff_start = m_ff_cum;
++			m_f_cycle_start = cycle;
++		}
++		else if (frame != m_frame)
++		{
++			EndFrame();
++			m_frame = frame;
++			new_frame = true;
++		}
++
++		const u64 prev = m_have_prev ? m_prev : cycle;
++		for (u32 i = 0; i < m_wake_n;)
++		{
++			Wake& w = m_wake[i];
++			const u64 lo = std::max(prev, w.from);
++			const u64 hi = std::min(cycle, w.until);
++			if (!via_ff && hi > lo)
++				w.busy += hi - lo;
++			if (cycle >= w.until)
++			{
++				m_stats.wake_decile[std::min<u64>(w.busy * 10 / (w.until - w.from), 10)]++;
++				m_stats.wake_done++;
++				m_wake[i] = m_wake[--m_wake_n];
++			}
++			else
++			{
++				i++;
++			}
++		}
++		m_stats.event_tests++;
++		if (via_ff)
++		{
++			m_ff_cum += cycle - prev;
++			m_stats.ff_event_tests++;
++			if (!m_in_streak)
++			{
++				m_in_streak = true;
++				m_streak_start = prev;
++			}
++		}
++		else
++		{
++			m_in_streak = false;
++		}
++		m_event_ff = via_ff;
++		m_prev = cycle;
++		m_have_prev = true;
++
++		const u64 bucket = cycle >> kBucketShift;
++		m_ring[bucket % kBuckets] = Sample{static_cast<u32>(bucket), m_ff_cum};
++		m_stats.ff_cycles = m_ff_cum;
++		m_stats.ee_cycles = cycle - m_first;
++		return new_frame;
++	}
++
++	bool ReplyMonitor::IdleCyclesAt(u64 t, u64& cum) const
++	{
++		if (!m_have_prev || t <= m_first)
++		{
++			cum = 0;
++			return m_have_prev;
++		}
++		const u64 b = t >> kBucketShift;
++		const u64 now_bucket = m_prev >> kBucketShift;
++		if (now_bucket - std::min(now_bucket, b) >= kBuckets - 2)
++			return false; // older than the samples
++		for (u32 k = 1; k <= 8 && k <= b; k++)
++		{
++			const u64 want = b - k;
++			const Sample& s = m_ring[want % kBuckets];
++			if (s.tag == static_cast<u32>(want))
++			{
++				cum = s.cum;
++				return true;
++			}
++		}
++		// Nothing sampled in the eight buckets before t's: the EE ran no event test for 32,768 cycles. That is a single long
++		// stretch with no fast-forward in it.
++		cum = m_ff_cum;
++		return false;
++	}
++
++	ReplyMonitor::Verdict ReplyMonitor::OnReply(u32 kind, u32 stamp_lo, u64 now, bool in_event_test)
++	{
++		Verdict v{0, false};
++		if (kind >= ReplyKind::kCount)
++			kind = ReplyKind::Call;
++
++		const s32 diff = static_cast<s32>(static_cast<u32>(now) - stamp_lo);
++		const u64 late = diff > 0 ? static_cast<u64>(diff) : 0;
++		v.late = late;
++
++		m_stats.replies++;
++		m_stats.all[kind].Add(late);
++		m_f_replies++;
++		if (late < static_cast<u64>(kOvershootMin))
++			return v;
++
++		m_stats.late++;
++		m_f_late++;
++		m_f_max_late = std::max(m_f_max_late, late);
++
++		const u64 t = now - late;
++		const bool idle_now = in_event_test && m_event_ff;
++
++		u64 cum_t = 0;
++		const bool known = IdleCyclesAt(t, cum_t);
++		u64 idle = 0;
++		if (known)
++		{
++			idle = std::min(m_ff_cum - std::min(m_ff_cum, cum_t), late);
++			m_stats.coverage_decile[std::min<u64>(idle * 10 / late, 10)]++;
++		}
++		else
++		{
++			m_stats.late_idle_unknown++;
++		}
++
++		const bool unbroken = idle_now && m_in_streak && t >= m_streak_start;
++		const bool share_ok = idle_now && known && idle * 100 >= late * kIdleShareMin;
++		if (unbroken)
++		{
++			m_stats.idle_overshoots_unbroken++;
++			m_f_unbroken++;
++		}
++		if (idle_now && known && idle * 10 >= late * 9)
++		{
++			m_stats.idle_overshoots_90++;
++			m_f_share90++;
++		}
++
++		if (share_ok)
++		{
++			v.overshoot = true;
++			m_stats.idle_overshoots++;
++			m_stats.idle_overshoot_cycles += late;
++			m_stats.idle_overshoot_max = std::max(m_stats.idle_overshoot_max, late);
++			m_stats.overshoot[kind].Add(late);
++			m_f_events++;
++			if (m_wake_n < kMaxWake)
++				m_wake[m_wake_n++] = Wake{now, now + kWakeWindow, 0};
++		}
++		else if (!idle_now)
++		{
++			m_stats.late_ee_busy++;
++			m_stats.late_ee_busy_cycles += late;
++		}
++		else
++		{
++			m_stats.late_idle_light++;
++			m_stats.late_idle_light_cycles += late;
++		}
++		return v;
++	}
++} // namespace IopThread
+diff --git a/pcsx2/IopThread/IopLagControl.h b/pcsx2/IopThread/IopLagControl.h
+new file mode 100644
+index 0000000000..adaa27c727
+--- /dev/null
++++ b/pcsx2/IopThread/IopLagControl.h
+@@ -0,0 +1,206 @@
++// SPDX-FileCopyrightText: 2026 ARMSX2 Contributors
++// SPDX-License-Identifier: GPL-3.0+
++
++// How late the EE takes what the IOP produced, and whether the EE was idle across the lateness.
++//
++// With a lag bound L above the default the EE may run up to L EE cycles ahead of the IOP. What the IOP produces for the EE
++// (the SBUS interrupt, a SIF pump it started) then reaches the EE up to L cycles after the IOP's time of production
++// (I2EItem::stamp). If the guest is idle in between (the EE fast-forwarded its clock through a wait loop, FastForward in
++// IopThreadMode.h) and it was waiting for exactly that reply, the guest's idle time ran past the reply and the game slows
++// down by the lateness. If the guest was waiting for something else (the next vsync) the lateness costs it nothing.
++//
++// ReplyMonitor keeps the EE-side books to tell the two apart, with no knowledge of what the guest waits for:
++//  - OnEventTest(): at every EE event test, whether it was reached by a fast-forward. An event test reached that way ends an
++//    idle interval, from the previous event test to this one. The monitor keeps the start of the unbroken run of idle
++//    intervals that ends now (the idle streak), and the idle cycles summed since the start (the ledger), with a sample of the
++//    sum per 4096-cycle bucket of EE time so that it can be read back at an earlier cycle.
++//  - OnReply(): the EE takes a reply that was produced at IOP time t, at EE cycle `now`. The lateness is now - t. The reply is
++//    an OVERSHOOT IN IDLE when it is late by at least kOvershootMin, and the event test it is taken in was reached by a
++//    fast-forward, and at least kIdleShareMin percent of [t, now] was idle by the ledger: the EE idled across the reply.
++//    A guest idles with interruptions (an interrupt handler, a thread that wakes and sleeps again), so an unbroken run of idle
++//    event tests back to t is too strict; the monitor also counts that reading (idle_overshoots_unbroken) and a 90 percent
++//    share (idle_overshoots_90) to show how much the choice matters.
++//    The late replies that are not overshoots are counted by why: the EE was not in an idle event test (late_ee_busy), or it
++//    was but idle for less than the share (late_idle_light).
++//
++// The class is pure: it reads no global, so a test drives it with numbers. It belongs to the EE thread; in Lockstep the IOP
++// thread calls OnReply with the EE blocked in the handoff, which orders the two.
++
++#pragma once
++
++#include "IopThread/IopThreadMode.h"
++
++#include "common/Pcsx2Types.h"
++
++#include <cstddef>
++#include <vector>
++
++namespace IopThread
++{
++	/// A reply is an overshoot only if it is at least this late: twice the default lag bound. With L at the default a reply is
++	/// late by at most about L plus two event-test spacings (about 31,000 cycles), so nothing is an overshoot at the default
++	/// bound, whatever the guest does.
++	inline constexpr s32 kOvershootMin = 2 * kDefaultLag;
++
++	/// The share of [production, taken] that has to have been idle, by the ledger, for a late reply taken in an idle event test to be
++	/// an overshoot in idle, in percent.
++	inline constexpr u32 kIdleShareMin = 50;
++
++	/// How long after an overshoot in idle the monitor watches the EE, to see whether the reply woke the guest (it ran for a good part
++	/// of the window) or only ran a handler and went back to idle. In EE cycles.
++	inline constexpr u32 kWakeWindow = 2 * kOvershootMin;
++
++	/// What the EE takes from the IOP.
++	namespace ReplyKind
++	{
++		inline constexpr u32 SbusIrq = 0; // the SBUS interrupt (Threaded: an I2E item; Lockstep: raised directly)
++		inline constexpr u32 Call = 1; // a function the IOP had the EE run (Threaded CallOnEE: the SIF pumps the IOP starts)
++		inline constexpr u32 Sif0Pump = 2; // Lockstep only: a SIF0 pump the IOP started, run directly
++		inline constexpr u32 Sif1Pump = 3; // Lockstep only: a SIF1 pump the IOP started, run directly
++		inline constexpr u32 kCount = 4;
++		const char* Name(u32 kind);
++	} // namespace ReplyKind
++
++	/// Lateness histogram bucket edges, in EE cycles. Bucket i holds late < kLateEdges[i] and late >= kLateEdges[i-1]; the last
++	/// holds everything from the last edge up. 4,915,200 is one NTSC frame.
++	inline constexpr u32 kLateEdgeCount = 13;
++	inline constexpr u32 kLateEdges[kLateEdgeCount] = {1024, 3072, 6144, 12288, 24576, 49152, 98304, 196608, 393216, 786432, 1179648, 2359296, 4915200};
++	inline constexpr u32 kLateBuckets = kLateEdgeCount + 1;
++	u32 LateBucket(u64 late);
++
++	struct LateHist
++	{
++		u64 count = 0;
++		u64 sum = 0;
++		u64 max = 0;
++		u64 bucket[kLateBuckets] = {};
++		void Add(u64 late);
++		double Mean() const { return count ? static_cast<double>(sum) / static_cast<double>(count) : 0.0; }
++	};
++
++	/// Frames are binned by how many overshoots in idle they had: 0, 1, 2, 3 to 4, 5 to 8, 9 or more.
++	inline constexpr u32 kFrameBins = 6;
++	u32 FrameBin(u64 events);
++
++	struct ReplyStats
++	{
++		LateHist all[ReplyKind::kCount]; // every reply taken, by kind
++		LateHist overshoot[ReplyKind::kCount]; // the overshoots in idle, by kind
++		u64 replies = 0;
++		u64 late = 0; // late by at least kOvershootMin
++		u64 idle_overshoots = 0; // ... taken in an idle event test, with at least kIdleShareMin percent of [production, taken] idle: the signal
++		u64 idle_overshoot_cycles = 0; // their lateness, summed
++		u64 idle_overshoot_max = 0;
++		u64 idle_overshoots_unbroken = 0; // late, idle event test, and the idle streak reaches back to the production: no EE run in between
++		u64 idle_overshoots_90 = 0; // late, idle event test, and at least 90 percent of [production, taken] idle
++		u64 late_ee_busy = 0; // late, and the event test the EE took the reply in was not reached by a fast-forward (or it was no event test)
++		u64 late_ee_busy_cycles = 0;
++		u64 late_idle_light = 0; // late, idle event test, but less than kIdleShareMin percent of [production, taken] idle
++		u64 late_idle_light_cycles = 0;
++		u64 late_idle_unknown = 0; // late replies whose production time is older than the ledger's samples (counted in the groups above too)
++		u64 wake_decile[11] = {}; // overshoots in idle by the share of the kWakeWindow after them that the EE ran (was not idle), in tenths: 0 .. 10
++		u64 wake_done = 0; // overshoots whose window has ended
++		u64 coverage_decile[11] = {}; // late replies by the idle share of [production, now], in tenths: 0 .. 10
++		u64 frames = 0; // frames seen (completed)
++		u64 frames_with_overshoot = 0;
++		u64 frame_bins[kFrameBins] = {}; // completed frames by overshoots in idle in the frame
++		u64 event_tests = 0;
++		u64 ff_event_tests = 0; // event tests reached by a fast-forward
++		u64 ff_cycles = 0; // EE cycles of the idle intervals, summed (the ledger)
++		u64 ee_cycles = 0; // EE cycles from the first event test to the last
++	};
++
++	/// One completed frame, when the trace is on.
++	struct FrameRecord
++	{
++		u32 frame;
++		u32 replies;
++		u32 late;
++		u32 idle_overshoots;
++		u32 unbroken;
++		u32 share90;
++		u64 max_late;
++		u64 ff_cycles; // idle cycles of the frame, by the ledger
++		u64 ee_cycles;
++	};
++
++	class ReplyMonitor
++	{
++	public:
++		/// What OnReply found.
++		struct Verdict
++		{
++			u64 late; // now - production, 0 when the IOP was ahead
++			bool overshoot; // late, in an idle event test, idle for kIdleShareMin percent or more of the lateness: the signal
++		};
++
++		void Reset();
++
++		/// Keeps the FrameRecord of every completed frame (bounded at kMaxTrace). Set before the run.
++		void EnableTrace(bool on) { m_trace_on = on; }
++		const std::vector<FrameRecord>& Trace() const { return m_trace; }
++
++		/// An EE event test begins at EE cycle `cycle`, in frame `frame`. `via_ff`: reached by a fast-forward. Returns true if
++		/// this event test begins a new frame.
++		bool OnEventTest(u64 cycle, bool via_ff, u32 frame);
++
++		/// The EE takes a reply of `kind` produced at the IOP time with low 32 bits `stamp_lo`, at EE cycle `now`.
++		/// `in_event_test`: the EE is inside the event test OnEventTest last saw. A reply taken elsewhere (a hold on the guest's access
++		/// to IOP space) cannot be an overshoot in idle: the guest was running.
++		Verdict OnReply(u32 kind, u32 stamp_lo, u64 now, bool in_event_test);
++
++		/// The counters. The frame in progress is not in the frame bins.
++		const ReplyStats& Stats() const { return m_stats; }
++
++		/// EE cycles of the idle ledger up to now, and the sample for `bucket` (tests).
++		u64 IdleCycles() const { return m_ff_cum; }
++		/// The start of the current idle streak: the EE cycle of the event test before the first of the unbroken run of event tests
++		/// reached by a fast-forward that ends now. Meaningful while the last event test was one of them.
++		u64 StreakStart() const { return m_streak_start; }
++		bool LastEventTestWasIdle() const { return m_event_ff; }
++
++		static constexpr u32 kBucketShift = 12;
++		static constexpr u32 kBuckets = 4096; // 16.7 million cycles of history: more than kMaxLag, less than 4 frames
++		static constexpr std::size_t kMaxTrace = 1 << 14;
++
++	private:
++		struct Sample
++		{
++			u32 tag; // the bucket number, low 32 bits
++			u64 cum; // the ledger at the last event test in the bucket
++		};
++
++		/// The ledger at the end of the last bucket that finished at or before `t`. False if the samples do not reach back that far.
++		bool IdleCyclesAt(u64 t, u64& cum) const;
++		void EndFrame();
++
++		// Overshoots in idle whose kWakeWindow is still open.
++		struct Wake
++		{
++			u64 from, until, busy;
++		};
++		static constexpr u32 kMaxWake = 8;
++		Wake m_wake[kMaxWake] = {};
++		u32 m_wake_n = 0;
++
++		ReplyStats m_stats;
++
++		u64 m_prev = 0; // the cycle of the previous event test
++		bool m_have_prev = false;
++		bool m_event_ff = false; // the last event test was reached by a fast-forward
++		bool m_in_streak = false;
++		u64 m_streak_start = 0;
++		u64 m_ff_cum = 0;
++		u64 m_first = 0;
++		u32 m_frame = 0;
++		bool m_have_frame = false;
++
++		// The frame in progress.
++		u64 m_f_unbroken = 0, m_f_share90 = 0;
++		u64 m_f_replies = 0, m_f_late = 0, m_f_events = 0, m_f_max_late = 0, m_f_ff_start = 0, m_f_cycle_start = 0;
++
++		bool m_trace_on = false;
++		std::vector<FrameRecord> m_trace;
++		Sample m_ring[kBuckets] = {};
++	};
++} // namespace IopThread
+diff --git a/pcsx2/IopThread/IopLagRules.cpp b/pcsx2/IopThread/IopLagRules.cpp
+new file mode 100644
+index 0000000000..163d57734a
+--- /dev/null
++++ b/pcsx2/IopThread/IopLagRules.cpp
+@@ -0,0 +1,172 @@
++// SPDX-FileCopyrightText: 2026 ARMSX2 Contributors
++// SPDX-License-Identifier: GPL-3.0+
++
++#include "IopThread/IopLagRules.h"
++
++#include <algorithm>
++
++#ifdef __SWITCH__
++extern "C" uint32_t sw2_ee_wait_cycles;
++#endif
++
++namespace IopThread
++{
++	const char* LagRule::Name(u32 rule)
++	{
++		switch (rule)
++		{
++			case Window:
++				return "window";
++			case IdleOutstanding:
++				return "idle-outstanding";
++			case IdleAny:
++				return "idle-any";
++			case Stream:
++				return "stream";
++			case Boot:
++				return "boot";
++			case Mailbox:
++				return "mailbox";
++			case Poll:
++				return "poll";
++			default:
++				return "?";
++		}
++	}
++
++	void LagRules::Configure(const LagRulesConfig& config)
++	{
++		m_cfg = config;
++		m_cfg.mask &= LagRule::kAll;
++#ifdef __SWITCH__
++		const s32 minLag = (s32)sw2_ee_wait_cycles + 1024;
++		m_cfg.tight = std::max<s32>(m_cfg.tight, minLag);
++#else
++		m_cfg.tight = std::max<s32>(m_cfg.tight, kMinLag);
++#endif
++	}
++
++	void LagRules::Reset(u32 frame)
++	{
++		m_stats = {};
++		m_window_until = m_mailbox_until = m_poll_until = 0;
++		m_outstanding = false;
++		m_outstanding_since = 0;
++		m_was_idle_out = m_was_idle_any = m_was_stream = m_was_boot = false;
++		m_boot_from = frame;
++		m_have_prev = false;
++		m_prev = m_first = 0;
++		m_last_rule = -1;
++	}
++
++	void LagRules::OnEeSifStart(u64 cycle, u32 channel)
++	{
++		if (!m_cfg.mask || channel > 1)
++			return;
++		if (channel == 1)
++		{
++			// A new send is the request now; an older one nobody answered is forgotten.
++			m_outstanding = true;
++			m_outstanding_since = cycle;
++		}
++		if ((m_cfg.mask & LagRule::Bit(LagRule::Window)) && ((m_cfg.window_channels >> channel) & 1))
++		{
++			m_window_until = cycle + m_cfg.window;
++			m_stats.activations[LagRule::Window]++;
++		}
++	}
++
++	void LagRules::OnIopReply(u64 cycle)
++	{
++		if (!m_cfg.mask || !m_cfg.close_on_reply)
++			return;
++		m_outstanding = false;
++		if (m_cfg.window_close_on_reply && Open(m_window_until, cycle))
++		{
++			m_window_until = cycle;
++			m_stats.window_closed_by_reply++;
++		}
++	}
++
++	void LagRules::OnMailboxAccess(u64 cycle)
++	{
++		if (!(m_cfg.mask & LagRule::Bit(LagRule::Mailbox)))
++			return;
++		m_mailbox_until = cycle + m_cfg.mailbox_window;
++		m_stats.activations[LagRule::Mailbox]++;
++	}
++
++	void LagRules::OnEePoll(u64 cycle)
++	{
++		if (!(m_cfg.mask & LagRule::Bit(LagRule::Poll)))
++			return;
++		m_poll_until = cycle + m_cfg.poll_window;
++		m_stats.activations[LagRule::Poll]++;
++	}
++
++	s64 LagRules::Bound(u64 cycle, bool idle, u32 streams, u32 frame, s64 loose)
++	{
++		m_stats.total_event_tests++;
++		const u64 span = m_have_prev ? cycle - m_prev : 0;
++		if (!m_have_prev)
++		{
++			m_have_prev = true;
++			m_first = cycle;
++		}
++		m_prev = cycle;
++		m_stats.total_cycles = cycle - m_first;
++
++		if (m_cfg.mask == 0 || loose <= m_cfg.tight)
++		{
++			m_last_rule = -1;
++			return loose;
++		}
++
++		const u32 mask = m_cfg.mask;
++		const bool stream = (mask & LagRule::Bit(LagRule::Stream)) && (streams & m_cfg.stream_bits) != 0;
++		const bool window = (mask & LagRule::Bit(LagRule::Window)) && Open(m_window_until, cycle);
++		const bool poll = (mask & LagRule::Bit(LagRule::Poll)) && Open(m_poll_until, cycle);
++		const bool mailbox = (mask & LagRule::Bit(LagRule::Mailbox)) && Open(m_mailbox_until, cycle);
++		const bool idle_out = (mask & LagRule::Bit(LagRule::IdleOutstanding)) && idle && m_outstanding &&
++		                      static_cast<u64>(cycle - m_outstanding_since) <= m_cfg.outstanding_max_age;
++		const bool idle_any = (mask & LagRule::Bit(LagRule::IdleAny)) && idle;
++		const bool boot = (mask & LagRule::Bit(LagRule::Boot)) && static_cast<u32>(frame - m_boot_from) < m_cfg.boot_frames;
++
++		// Edges of the conditions that last across event tests. A window counts when it opens (On*).
++		if (stream && !m_was_stream)
++			m_stats.activations[LagRule::Stream]++;
++		if (idle_out && !m_was_idle_out)
++			m_stats.activations[LagRule::IdleOutstanding]++;
++		if (idle_any && !m_was_idle_any)
++			m_stats.activations[LagRule::IdleAny]++;
++		if (boot && !m_was_boot)
++			m_stats.activations[LagRule::Boot]++;
++		m_was_stream = stream;
++		m_was_idle_out = idle_out;
++		m_was_idle_any = idle_any;
++		m_was_boot = boot;
++
++		s32 rule = -1;
++		if (stream)
++			rule = LagRule::Stream;
++		else if (window)
++			rule = LagRule::Window;
++		else if (poll)
++			rule = LagRule::Poll;
++		else if (mailbox)
++			rule = LagRule::Mailbox;
++		else if (idle_out)
++			rule = LagRule::IdleOutstanding;
++		else if (idle_any)
++			rule = LagRule::IdleAny;
++		else if (boot)
++			rule = LagRule::Boot;
++
++		m_last_rule = rule;
++		if (rule < 0)
++			return loose;
++		m_stats.event_tests[rule]++;
++		m_stats.cycles[rule] += span;
++		return m_cfg.tight;
++	}
++} // namespace IopThread
+diff --git a/pcsx2/IopThread/IopLagRules.h b/pcsx2/IopThread/IopLagRules.h
+new file mode 100644
+index 0000000000..e62f35076c
+--- /dev/null
++++ b/pcsx2/IopThread/IopLagRules.h
+@@ -0,0 +1,256 @@
++// SPDX-FileCopyrightText: 2026 ARMSX2 Contributors
++// SPDX-License-Identifier: GPL-3.0+
++
++// When the EE must not run far ahead of the IOP.
++//
++// The lag bound L (IopThread.h) is how many EE cycles the EE may run ahead of the IOP. A large L lets the EE overlap its work with the
++// IOP's, which pays when the IOP thread is slow (a little core). It costs when the EE is waiting for the IOP: the EE races to the
++// bound while it waits, so what the IOP produces reaches the EE up to L cycles after the IOP produced it, and a game that sends a
++// request and waits for the reply spends L cycles of guest time per request.
++//
++// These rules say, from operations the emulator can see, when the EE is waiting for the IOP. While one holds, the bound is the tight
++// bound (the default lag, 24,576 cycles) instead of L. Nothing else changes: no rule changes what the guest sees except through the
++// time it takes, so a rule that fires when it was not needed costs speed and never correctness. With no rule on, the bound is L.
++//
++// The class is pure: it reads no global and owns no thread. The EE thread calls the On* functions and Bound() (in Lockstep the IOP
++// thread calls OnIopSif0Reply while the EE is blocked in the handoff, which orders them). The streams word is the one input the IOP
++// thread writes, and the caller passes it in.
++
++#pragma once
++
++#include "IopThread/IopThreadMode.h"
++
++#include "common/Pcsx2Types.h"
++
++namespace IopThread
++{
++	/// The rules, as indices (stats) and as bits (LagRulesConfig::mask).
++	namespace LagRule
++	{
++		/// The EE started a SIF transfer: a request went to the IOP, or the EE armed SIF0 to receive. Tight for `window` EE cycles,
++		/// or until the IOP's next SIF0 transfer reaches the EE, whichever is first.
++		inline constexpr u32 Window = 0;
++		/// The EE is idle (the event test was reached by a fast-forward) and a request is outstanding: the EE started a SIF1 transfer
++		/// and no SIF0 transfer or SBUS interrupt has come from the IOP since, for at most `outstanding_max_age` cycles from the latest send.
++		inline constexpr u32 IdleOutstanding = 1;
++		/// The EE is idle, whatever it has sent. Experiment: what idle alone costs a game whose EE is mostly busy.
++		inline constexpr u32 IdleAny = 2;
++		/// A stream is running on the IOP: SPU2 auto-DMA input, a CDVD read or a call to the memory card server (the streams word; StreamBit).
++		inline constexpr u32 Stream = 3;
++		/// The first `boot_frames` frames after the VM booted or reset: modules load, the IOP reboots, custom disc drivers handshake.
++		inline constexpr u32 Boot = 4;
++		/// The EE touched an SBUS mailbox word (the handshake of an IOP reboot; gameplay makes none). Tight for `mailbox_window` cycles.
++		inline constexpr u32 Mailbox = 5;
++		/// The EE read the status of a SIF DMA channel (D5 or D6 CHCR) with its STR bit set: it is polling for the end of a transfer.
++		/// Tight for `poll_window` cycles.
++		inline constexpr u32 Poll = 6;
++		inline constexpr u32 kCount = 7;
++
++		inline constexpr u32 Bit(u32 rule) { return 1u << rule; }
++		inline constexpr u32 kAll = (1u << kCount) - 1;
++		const char* Name(u32 rule);
++	} // namespace LagRule
++
++	/// The streams word: what the IOP thread publishes about the IOP's devices.
++	namespace StreamBit
++	{
++		inline constexpr u32 SpuAdmaCore0 = 1 << 0; // SPU2 core 0 auto-DMA input on
++		inline constexpr u32 SpuAdmaCore1 = 1 << 1; // SPU2 core 1 auto-DMA input on
++		inline constexpr u32 CdvdBusy = 1 << 2; // a disc read or a drive action is running
++		inline constexpr u32 McServerCall = 1 << 3; // a call to the memory card server is in progress (McServerCalls)
++	} // namespace StreamBit
++
++	/// StreamBit::McServerCall: the calls to the IOP's memory card server (the RPC server with id 0x80000400) that the server has not
++	/// finished. A game that loads or saves sends one call per operation (open, read, close, directory, ...) and polls for its end; at a
++	/// large bound each end reached the EE up to a frame late, and a game that times its operations reports a good save as damaged.
++	///
++	/// The IOP side of SIF sees every command packet: the EE's RPC calls land in IOP memory over SIF1, and the server's replies leave
++	/// over SIF0. A call packet names the server it is for by the address of the server's data, whose first word is the server's id. A
++	/// call is in progress from its packet's arrival until the server's RPC end packet for its client leaves, or, for a call made
++	/// without the no-wait mode, until the IOP writes the end straight into the EE's copy of the call packet (a SIF0 transfer to the
++	/// call's packet address). The IOP thread owns it (whichever thread runs the IOP, in Off). A savestate load and a VM reset forget
++	/// the calls (ResyncClocks).
++	class McServerCalls
++	{
++	public:
++		/// The memory card server's RPC id (mcserv and its successors).
++		static constexpr u32 kServerId = 0x80000400;
++		/// A call older than this, in EE cycles of IOP time, is forgotten: two seconds. A call whose end never comes (the IOP was
++		/// rebooted under it) would otherwise hold the bound tight for good.
++		static constexpr u64 kMaxAge = 120 * 4915200ull;
++
++		// SIF command ids (sifcmd).
++		static constexpr u32 kCmdRpcEnd = 0x80000008;
++		static constexpr u32 kCmdRpcCall = 0x8000000A;
++
++		/// A transfer the EE sent over SIF1 landed in IOP memory: `count` words at `words`. `read_iop(addr)` reads an IOP word.
++		template <typename ReadIop>
++		void OnSif1Transfer(const u32* words, u32 count, ReadIop&& read_iop)
++		{
++			// SifRpcCallPkt: the command header {size, dest, cid, opt}, rec_id, pkt_addr, rpc_id, client, rpc_number, send_size,
++			// receive, recv_size, rmode, server. The size in the header's low byte covers at least those.
++			if (count < 14 || words[2] != kCmdRpcCall || (words[0] & 0xff) < 56)
++				return;
++			if (read_iop(words[13]) != kServerId)
++				return;
++			const Call call = {words[7], words[5], kNotSeen};
++			for (u32 i = 0; i < m_count; i++)
++			{
++				if (m_calls[i].client == call.client)
++				{
++					m_calls[i] = call;
++					return;
++				}
++			}
++			// Full: the oldest call goes, its end most likely lost.
++			if (m_count == kSlots)
++			{
++				for (u32 i = 1; i < kSlots; i++)
++					m_calls[i - 1] = m_calls[i];
++				m_count--;
++			}
++			m_calls[m_count++] = call;
++		}
++
++		/// A transfer the IOP sends over SIF0: `count` words at `words` in IOP memory, to EE address `ee_dest`.
++		void OnSif0Transfer(const u32* words, u32 count, u32 ee_dest)
++		{
++			// SifRpcRendPkt: the command header, rec_id, pkt_addr, rpc_id, client, cid, server, buff, cbuff.
++			const bool end_packet = count >= 8 && words[2] == kCmdRpcEnd;
++			for (u32 i = 0; i < m_count;)
++			{
++				const Call& c = m_calls[i];
++				if ((end_packet && c.client == words[7]) || SameEeAddress(c.pkt_addr, ee_dest))
++					m_calls[i] = m_calls[--m_count];
++				else
++					i++;
++			}
++		}
++
++		/// Whether a call is in progress at IOP position `now`. Ages the calls from the first look at each.
++		bool InProgress(u64 now)
++		{
++			for (u32 i = 0; i < m_count;)
++			{
++				Call& c = m_calls[i];
++				if (c.since == kNotSeen)
++					c.since = now;
++				if (now - c.since > kMaxAge)
++					c = m_calls[--m_count];
++				else
++					i++;
++			}
++			return m_count != 0;
++		}
++
++		void Reset() { m_count = 0; }
++
++	private:
++		// EE RAM through any of its mappings (cached, uncached, uncached accelerated).
++		static bool SameEeAddress(u32 a, u32 b) { return ((a ^ b) & 0x0FFFFFFF) == 0; }
++
++		static constexpr u64 kNotSeen = ~0ull;
++		static constexpr u32 kSlots = 4;
++		struct Call
++		{
++			u32 client;
++			u32 pkt_addr; // the EE's copy of the call packet
++			u64 since;
++		};
++		Call m_calls[kSlots] = {};
++		u32 m_count = 0;
++	};
++
++	struct LagRulesConfig
++	{
++		/// LagRule::Bit() of every rule that is on. 0 is no rules: Bound() returns the loose bound.
++		u32 mask = 0;
++		/// The bound a rule imposes, in EE cycles. At or above the loose bound it changes nothing.
++		s32 tight = kDefaultLag;
++		/// LagRule::Window: how long after an EE-started transfer the bound stays tight if no reply comes.
++		u32 window = 98304;
++		/// LagRule::Window: which channels' starts open it: bit 0 SIF0 (the EE arms to receive), bit 1 SIF1 (the EE sends).
++		u32 window_channels = 3;
++		/// LagRule::Window and IdleOutstanding: a SIF0 transfer or SBUS interrupt from the IOP ends the window and the outstanding request.
++		bool close_on_reply = true;
++		/// LagRule::Window: with close_on_reply, whether a reply ends the window too. Off, the window runs its full length: the first thing
++		/// the IOP sends back after a request is often not the end of the request (God of War II's movie player, IopThreadVm.cpp).
++		bool window_close_on_reply = true;
++		/// LagRule::IdleOutstanding: a request older than this (EE cycles) is no longer outstanding.
++		u32 outstanding_max_age = 4915200;
++		/// LagRule::Mailbox and Poll: window lengths.
++		u32 mailbox_window = 4915200;
++		u32 poll_window = 98304;
++		/// LagRule::Stream: which StreamBit bits count. SPU2 auto-DMA and memory card server calls, not a disc read: with a disc read counted the rule held the
++		/// bound tight for 59 percent of the EE's cycles in a God of War II state, whose engine reads the disc all the time, and gained nothing for the
++		/// games that need it.
++		u32 stream_bits = StreamBit::SpuAdmaCore0 | StreamBit::SpuAdmaCore1 | StreamBit::McServerCall;
++		/// LagRule::Boot: frames after a boot or reset.
++		u32 boot_frames = 600;
++	};
++
++	struct LagRulesStats
++	{
++		u64 activations[LagRule::kCount] = {}; // times the rule began to hold (a window opened, an idle stretch began, a stream started)
++		u64 event_tests[LagRule::kCount] = {}; // event tests it made tight (the first rule in the order below that held gets the credit)
++		u64 cycles[LagRule::kCount] = {}; // EE cycles of the intervals ending in those event tests
++		u64 window_closed_by_reply = 0; // windows a reply ended before their time
++		u64 total_event_tests = 0; // event tests seen
++		u64 total_cycles = 0; // EE cycles from the first to the last
++	};
++
++	class LagRules
++	{
++	public:
++		void Configure(const LagRulesConfig& config);
++		const LagRulesConfig& Config() const { return m_cfg; }
++		/// Forget the state (a window, an outstanding request, the stats) and set the boot clock to `frame`.
++		void Reset(u32 frame = 0);
++
++		/// Anything on at all for this loose bound? False lets the caller skip the rest.
++		bool Live(s64 loose) const { return m_cfg.mask != 0 && loose > m_cfg.tight; }
++
++		// ---- EE thread
++		/// The EE started a SIF transfer (`channel` 0 or 1) at EE cycle `cycle`.
++		void OnEeSifStart(u64 cycle, u32 channel);
++		/// A SIF0 transfer or an SBUS interrupt from the IOP reached the EE.
++		void OnIopReply(u64 cycle);
++		/// The EE touched an SBUS mailbox word.
++		void OnMailboxAccess(u64 cycle);
++		/// The EE read D5 or D6 CHCR with STR set.
++		void OnEePoll(u64 cycle);
++
++		/// The bound for an event test at `cycle`. `idle`: the event test was reached by a fast-forward. `streams`: StreamBit bits.
++		/// `frame`: the frame count. `loose`: the bound with no rule. Returns at most `loose`. Counts the event test.
++		s64 Bound(u64 cycle, bool idle, u32 streams, u32 frame, s64 loose);
++
++		/// The rule that held at the last Bound() call that was tight, or -1.
++		s32 LastRule() const { return m_last_rule; }
++
++		const LagRulesStats& Stats() const { return m_stats; }
++
++	private:
++		bool Open(u64 until, u64 cycle) const { return static_cast<s64>(until - cycle) > 0; }
++
++		LagRulesConfig m_cfg;
++		LagRulesStats m_stats;
++
++		u64 m_window_until = 0; // LagRule::Window
++		u64 m_mailbox_until = 0;
++		u64 m_poll_until = 0;
++		bool m_outstanding = false;
++		u64 m_outstanding_since = 0;
++
++		// Edge detection for the activation counts of the conditions that last across event tests.
++		bool m_was_idle_out = false;
++		bool m_was_idle_any = false;
++		bool m_was_stream = false;
++		bool m_was_boot = false;
++
++		u32 m_boot_from = 0;
++		bool m_have_prev = false;
++		u64 m_prev = 0;
++		u64 m_first = 0;
++		s32 m_last_rule = -1;
++	};
++} // namespace IopThread
 diff --git a/pcsx2/IopThread/IopPlacement.cpp b/pcsx2/IopThread/IopPlacement.cpp
 index 8d133286c3..c4cca1c54e 100644
 --- a/pcsx2/IopThread/IopPlacement.cpp
@@ -5475,6 +6447,34 @@ index 16a24ebbdc..f8ccb4bb85 100644
  	__fi static u8* GetVTLBVirtualMapEnd() { return GetDataPtr(HostMemoryMap::VTLBVirtualMapOffset + HostMemoryMap::VTLBVirtualMapSize); }
  	__fi static u8* GetVTLBAddressMap() { return GetDataPtr(HostMemoryMap::VTLBAddressMapOffset); }
  	__fi static u8* GetVTLBAddressMapEnd() { return GetDataPtr(HostMemoryMap::VTLBAddressMapOffset + HostMemoryMap::VTLBAddressMapSize); }
+diff --git a/pcsx2/MfifoWriteRange.h b/pcsx2/MfifoWriteRange.h
+new file mode 100644
+index 0000000000..7ae3986238
+--- /dev/null
++++ b/pcsx2/MfifoWriteRange.h
+@@ -0,0 +1,22 @@
++// SPDX-FileCopyrightText: 2026 SW2PS2 Contributors
++// SPDX-License-Identifier: GPL-3.0+
++#pragma once
++
++// Qword spans in a circular MFIFO that must be invalidated after a write.
++// The caller guarantees ring > 0 and start < ring. For oversized writes,
++// conservatively keep the entire ring, matching the old behaviour.
++struct MfifoWriteRanges
++{
++    unsigned first_start;
++    unsigned first_count;
++    unsigned second_count;
++};
++
++constexpr MfifoWriteRanges GetMfifoWriteRanges(unsigned start, unsigned ring, unsigned count)
++{
++    if (count >= ring)
++        return {0, ring, 0};
++    const unsigned available = ring - start;
++    const unsigned first = count < available ? count : available;
++    return {start, first, count - first};
++}
 diff --git a/pcsx2/Patch.cpp b/pcsx2/Patch.cpp
 index 842ba4717c..e5aad14797 100644
 --- a/pcsx2/Patch.cpp
@@ -7240,966 +8240,6 @@ index b601f1b894..474c20d0eb 100644
  	ee_rec_skipmpeg_tests.cpp
  	ee_rec_smc_manual_tests.cpp
  	ee_rec_smc_tests.cpp
-diff --git a/tests/ctest/core/recompilers/harness/EeRecTestHarness.h b/tests/ctest/core/recompilers/harness/EeRecTestHarness.h
-index 60eab3205d..c266b52755 100644
---- a/tests/ctest/core/recompilers/harness/EeRecTestHarness.h
-+++ b/tests/ctest/core/recompilers/harness/EeRecTestHarness.h
-@@ -175,6 +175,7 @@ public:
- 
- 	u64 GetGpr64Interp(u32 reg_idx) const;
- 	u64 GetGpr64Jit   (u32 reg_idx) const;
-+	u64 GetCycleDeltaJit() const { return jit_snapshot_.regs.cycle - pre_snapshot_.regs.cycle; }
- 	u32 GetGprInterp  (u32 reg_idx) const { return static_cast<u32>(GetGpr64Interp(reg_idx)); }
- 	u32 GetGprJit     (u32 reg_idx) const { return static_cast<u32>(GetGpr64Jit(reg_idx)); }
- 	u64 GetHi64Interp() const;
-diff --git a/pcsx2/IopThread/IopLagControl.cpp b/pcsx2/IopThread/IopLagControl.cpp
-new file mode 100644
-index 0000000000..523936139f
---- /dev/null
-+++ b/pcsx2/IopThread/IopLagControl.cpp
-@@ -0,0 +1,262 @@
-+// SPDX-FileCopyrightText: 2026 ARMSX2 Contributors
-+// SPDX-License-Identifier: GPL-3.0+
-+
-+#include "IopThread/IopLagControl.h"
-+
-+#include <algorithm>
-+
-+namespace IopThread
-+{
-+	const char* ReplyKind::Name(u32 kind)
-+	{
-+		switch (kind)
-+		{
-+			case SbusIrq:
-+				return "sbus_irq";
-+			case Call:
-+				return "call";
-+			case Sif0Pump:
-+				return "sif0_pump";
-+			case Sif1Pump:
-+				return "sif1_pump";
-+			default:
-+				return "?";
-+		}
-+	}
-+
-+	u32 LateBucket(u64 late)
-+	{
-+		u32 i = 0;
-+		while (i < kLateEdgeCount && late >= kLateEdges[i])
-+			i++;
-+		return i;
-+	}
-+
-+	void LateHist::Add(u64 late)
-+	{
-+		count++;
-+		sum += late;
-+		max = std::max(max, late);
-+		bucket[LateBucket(late)]++;
-+	}
-+
-+	u32 FrameBin(u64 events)
-+	{
-+		if (events <= 2)
-+			return static_cast<u32>(events);
-+		if (events <= 4)
-+			return 3;
-+		if (events <= 8)
-+			return 4;
-+		return 5;
-+	}
-+
-+	void ReplyMonitor::Reset()
-+	{
-+		const bool trace = m_trace_on;
-+		m_stats = ReplyStats();
-+		m_prev = 0;
-+		m_have_prev = false;
-+		m_event_ff = false;
-+		m_in_streak = false;
-+		m_streak_start = 0;
-+		m_ff_cum = 0;
-+		m_first = 0;
-+		m_frame = 0;
-+		m_have_frame = false;
-+		m_f_replies = m_f_late = m_f_events = m_f_max_late = m_f_ff_start = m_f_cycle_start = 0;
-+		m_f_unbroken = m_f_share90 = 0;
-+		m_wake_n = 0;
-+		m_trace.clear();
-+		m_trace_on = trace;
-+		std::fill(std::begin(m_ring), std::end(m_ring), Sample{0, 0});
-+	}
-+
-+	void ReplyMonitor::EndFrame()
-+	{
-+		m_stats.frames++;
-+		if (m_f_events != 0)
-+			m_stats.frames_with_overshoot++;
-+		m_stats.frame_bins[FrameBin(m_f_events)]++;
-+		if (m_trace_on && m_trace.size() < kMaxTrace)
-+		{
-+			m_trace.push_back({m_frame, static_cast<u32>(m_f_replies), static_cast<u32>(m_f_late), static_cast<u32>(m_f_events),
-+				static_cast<u32>(m_f_unbroken), static_cast<u32>(m_f_share90), m_f_max_late, m_ff_cum - m_f_ff_start, m_prev - m_f_cycle_start});
-+		}
-+		m_f_replies = m_f_late = m_f_events = m_f_max_late = 0;
-+		m_f_unbroken = m_f_share90 = 0;
-+		m_f_ff_start = m_ff_cum;
-+		m_f_cycle_start = m_prev;
-+	}
-+
-+	bool ReplyMonitor::OnEventTest(u64 cycle, bool via_ff, u32 frame)
-+	{
-+		// A clock that went backwards (a state was loaded) starts the books of the interval again.
-+		if (m_have_prev && cycle < m_prev)
-+		{
-+			m_prev = cycle;
-+			m_in_streak = false;
-+			m_f_cycle_start = cycle;
-+		}
-+
-+		bool new_frame = false;
-+		if (!m_have_frame)
-+		{
-+			m_have_frame = true;
-+			m_frame = frame;
-+			m_first = cycle;
-+			m_f_ff_start = m_ff_cum;
-+			m_f_cycle_start = cycle;
-+		}
-+		else if (frame != m_frame)
-+		{
-+			EndFrame();
-+			m_frame = frame;
-+			new_frame = true;
-+		}
-+
-+		const u64 prev = m_have_prev ? m_prev : cycle;
-+		for (u32 i = 0; i < m_wake_n;)
-+		{
-+			Wake& w = m_wake[i];
-+			const u64 lo = std::max(prev, w.from);
-+			const u64 hi = std::min(cycle, w.until);
-+			if (!via_ff && hi > lo)
-+				w.busy += hi - lo;
-+			if (cycle >= w.until)
-+			{
-+				m_stats.wake_decile[std::min<u64>(w.busy * 10 / (w.until - w.from), 10)]++;
-+				m_stats.wake_done++;
-+				m_wake[i] = m_wake[--m_wake_n];
-+			}
-+			else
-+			{
-+				i++;
-+			}
-+		}
-+		m_stats.event_tests++;
-+		if (via_ff)
-+		{
-+			m_ff_cum += cycle - prev;
-+			m_stats.ff_event_tests++;
-+			if (!m_in_streak)
-+			{
-+				m_in_streak = true;
-+				m_streak_start = prev;
-+			}
-+		}
-+		else
-+		{
-+			m_in_streak = false;
-+		}
-+		m_event_ff = via_ff;
-+		m_prev = cycle;
-+		m_have_prev = true;
-+
-+		const u64 bucket = cycle >> kBucketShift;
-+		m_ring[bucket % kBuckets] = Sample{static_cast<u32>(bucket), m_ff_cum};
-+		m_stats.ff_cycles = m_ff_cum;
-+		m_stats.ee_cycles = cycle - m_first;
-+		return new_frame;
-+	}
-+
-+	bool ReplyMonitor::IdleCyclesAt(u64 t, u64& cum) const
-+	{
-+		if (!m_have_prev || t <= m_first)
-+		{
-+			cum = 0;
-+			return m_have_prev;
-+		}
-+		const u64 b = t >> kBucketShift;
-+		const u64 now_bucket = m_prev >> kBucketShift;
-+		if (now_bucket - std::min(now_bucket, b) >= kBuckets - 2)
-+			return false; // older than the samples
-+		for (u32 k = 1; k <= 8 && k <= b; k++)
-+		{
-+			const u64 want = b - k;
-+			const Sample& s = m_ring[want % kBuckets];
-+			if (s.tag == static_cast<u32>(want))
-+			{
-+				cum = s.cum;
-+				return true;
-+			}
-+		}
-+		// Nothing sampled in the eight buckets before t's: the EE ran no event test for 32,768 cycles. That is a single long
-+		// stretch with no fast-forward in it.
-+		cum = m_ff_cum;
-+		return false;
-+	}
-+
-+	ReplyMonitor::Verdict ReplyMonitor::OnReply(u32 kind, u32 stamp_lo, u64 now, bool in_event_test)
-+	{
-+		Verdict v{0, false};
-+		if (kind >= ReplyKind::kCount)
-+			kind = ReplyKind::Call;
-+
-+		const s32 diff = static_cast<s32>(static_cast<u32>(now) - stamp_lo);
-+		const u64 late = diff > 0 ? static_cast<u64>(diff) : 0;
-+		v.late = late;
-+
-+		m_stats.replies++;
-+		m_stats.all[kind].Add(late);
-+		m_f_replies++;
-+		if (late < static_cast<u64>(kOvershootMin))
-+			return v;
-+
-+		m_stats.late++;
-+		m_f_late++;
-+		m_f_max_late = std::max(m_f_max_late, late);
-+
-+		const u64 t = now - late;
-+		const bool idle_now = in_event_test && m_event_ff;
-+
-+		u64 cum_t = 0;
-+		const bool known = IdleCyclesAt(t, cum_t);
-+		u64 idle = 0;
-+		if (known)
-+		{
-+			idle = std::min(m_ff_cum - std::min(m_ff_cum, cum_t), late);
-+			m_stats.coverage_decile[std::min<u64>(idle * 10 / late, 10)]++;
-+		}
-+		else
-+		{
-+			m_stats.late_idle_unknown++;
-+		}
-+
-+		const bool unbroken = idle_now && m_in_streak && t >= m_streak_start;
-+		const bool share_ok = idle_now && known && idle * 100 >= late * kIdleShareMin;
-+		if (unbroken)
-+		{
-+			m_stats.idle_overshoots_unbroken++;
-+			m_f_unbroken++;
-+		}
-+		if (idle_now && known && idle * 10 >= late * 9)
-+		{
-+			m_stats.idle_overshoots_90++;
-+			m_f_share90++;
-+		}
-+
-+		if (share_ok)
-+		{
-+			v.overshoot = true;
-+			m_stats.idle_overshoots++;
-+			m_stats.idle_overshoot_cycles += late;
-+			m_stats.idle_overshoot_max = std::max(m_stats.idle_overshoot_max, late);
-+			m_stats.overshoot[kind].Add(late);
-+			m_f_events++;
-+			if (m_wake_n < kMaxWake)
-+				m_wake[m_wake_n++] = Wake{now, now + kWakeWindow, 0};
-+		}
-+		else if (!idle_now)
-+		{
-+			m_stats.late_ee_busy++;
-+			m_stats.late_ee_busy_cycles += late;
-+		}
-+		else
-+		{
-+			m_stats.late_idle_light++;
-+			m_stats.late_idle_light_cycles += late;
-+		}
-+		return v;
-+	}
-+} // namespace IopThread
-diff --git a/pcsx2/IopThread/IopLagControl.h b/pcsx2/IopThread/IopLagControl.h
-new file mode 100644
-index 0000000000..adaa27c727
---- /dev/null
-+++ b/pcsx2/IopThread/IopLagControl.h
-@@ -0,0 +1,206 @@
-+// SPDX-FileCopyrightText: 2026 ARMSX2 Contributors
-+// SPDX-License-Identifier: GPL-3.0+
-+
-+// How late the EE takes what the IOP produced, and whether the EE was idle across the lateness.
-+//
-+// With a lag bound L above the default the EE may run up to L EE cycles ahead of the IOP. What the IOP produces for the EE
-+// (the SBUS interrupt, a SIF pump it started) then reaches the EE up to L cycles after the IOP's time of production
-+// (I2EItem::stamp). If the guest is idle in between (the EE fast-forwarded its clock through a wait loop, FastForward in
-+// IopThreadMode.h) and it was waiting for exactly that reply, the guest's idle time ran past the reply and the game slows
-+// down by the lateness. If the guest was waiting for something else (the next vsync) the lateness costs it nothing.
-+//
-+// ReplyMonitor keeps the EE-side books to tell the two apart, with no knowledge of what the guest waits for:
-+//  - OnEventTest(): at every EE event test, whether it was reached by a fast-forward. An event test reached that way ends an
-+//    idle interval, from the previous event test to this one. The monitor keeps the start of the unbroken run of idle
-+//    intervals that ends now (the idle streak), and the idle cycles summed since the start (the ledger), with a sample of the
-+//    sum per 4096-cycle bucket of EE time so that it can be read back at an earlier cycle.
-+//  - OnReply(): the EE takes a reply that was produced at IOP time t, at EE cycle `now`. The lateness is now - t. The reply is
-+//    an OVERSHOOT IN IDLE when it is late by at least kOvershootMin, and the event test it is taken in was reached by a
-+//    fast-forward, and at least kIdleShareMin percent of [t, now] was idle by the ledger: the EE idled across the reply.
-+//    A guest idles with interruptions (an interrupt handler, a thread that wakes and sleeps again), so an unbroken run of idle
-+//    event tests back to t is too strict; the monitor also counts that reading (idle_overshoots_unbroken) and a 90 percent
-+//    share (idle_overshoots_90) to show how much the choice matters.
-+//    The late replies that are not overshoots are counted by why: the EE was not in an idle event test (late_ee_busy), or it
-+//    was but idle for less than the share (late_idle_light).
-+//
-+// The class is pure: it reads no global, so a test drives it with numbers. It belongs to the EE thread; in Lockstep the IOP
-+// thread calls OnReply with the EE blocked in the handoff, which orders the two.
-+
-+#pragma once
-+
-+#include "IopThread/IopThreadMode.h"
-+
-+#include "common/Pcsx2Types.h"
-+
-+#include <cstddef>
-+#include <vector>
-+
-+namespace IopThread
-+{
-+	/// A reply is an overshoot only if it is at least this late: twice the default lag bound. With L at the default a reply is
-+	/// late by at most about L plus two event-test spacings (about 31,000 cycles), so nothing is an overshoot at the default
-+	/// bound, whatever the guest does.
-+	inline constexpr s32 kOvershootMin = 2 * kDefaultLag;
-+
-+	/// The share of [production, taken] that has to have been idle, by the ledger, for a late reply taken in an idle event test to be
-+	/// an overshoot in idle, in percent.
-+	inline constexpr u32 kIdleShareMin = 50;
-+
-+	/// How long after an overshoot in idle the monitor watches the EE, to see whether the reply woke the guest (it ran for a good part
-+	/// of the window) or only ran a handler and went back to idle. In EE cycles.
-+	inline constexpr u32 kWakeWindow = 2 * kOvershootMin;
-+
-+	/// What the EE takes from the IOP.
-+	namespace ReplyKind
-+	{
-+		inline constexpr u32 SbusIrq = 0; // the SBUS interrupt (Threaded: an I2E item; Lockstep: raised directly)
-+		inline constexpr u32 Call = 1; // a function the IOP had the EE run (Threaded CallOnEE: the SIF pumps the IOP starts)
-+		inline constexpr u32 Sif0Pump = 2; // Lockstep only: a SIF0 pump the IOP started, run directly
-+		inline constexpr u32 Sif1Pump = 3; // Lockstep only: a SIF1 pump the IOP started, run directly
-+		inline constexpr u32 kCount = 4;
-+		const char* Name(u32 kind);
-+	} // namespace ReplyKind
-+
-+	/// Lateness histogram bucket edges, in EE cycles. Bucket i holds late < kLateEdges[i] and late >= kLateEdges[i-1]; the last
-+	/// holds everything from the last edge up. 4,915,200 is one NTSC frame.
-+	inline constexpr u32 kLateEdgeCount = 13;
-+	inline constexpr u32 kLateEdges[kLateEdgeCount] = {1024, 3072, 6144, 12288, 24576, 49152, 98304, 196608, 393216, 786432, 1179648, 2359296, 4915200};
-+	inline constexpr u32 kLateBuckets = kLateEdgeCount + 1;
-+	u32 LateBucket(u64 late);
-+
-+	struct LateHist
-+	{
-+		u64 count = 0;
-+		u64 sum = 0;
-+		u64 max = 0;
-+		u64 bucket[kLateBuckets] = {};
-+		void Add(u64 late);
-+		double Mean() const { return count ? static_cast<double>(sum) / static_cast<double>(count) : 0.0; }
-+	};
-+
-+	/// Frames are binned by how many overshoots in idle they had: 0, 1, 2, 3 to 4, 5 to 8, 9 or more.
-+	inline constexpr u32 kFrameBins = 6;
-+	u32 FrameBin(u64 events);
-+
-+	struct ReplyStats
-+	{
-+		LateHist all[ReplyKind::kCount]; // every reply taken, by kind
-+		LateHist overshoot[ReplyKind::kCount]; // the overshoots in idle, by kind
-+		u64 replies = 0;
-+		u64 late = 0; // late by at least kOvershootMin
-+		u64 idle_overshoots = 0; // ... taken in an idle event test, with at least kIdleShareMin percent of [production, taken] idle: the signal
-+		u64 idle_overshoot_cycles = 0; // their lateness, summed
-+		u64 idle_overshoot_max = 0;
-+		u64 idle_overshoots_unbroken = 0; // late, idle event test, and the idle streak reaches back to the production: no EE run in between
-+		u64 idle_overshoots_90 = 0; // late, idle event test, and at least 90 percent of [production, taken] idle
-+		u64 late_ee_busy = 0; // late, and the event test the EE took the reply in was not reached by a fast-forward (or it was no event test)
-+		u64 late_ee_busy_cycles = 0;
-+		u64 late_idle_light = 0; // late, idle event test, but less than kIdleShareMin percent of [production, taken] idle
-+		u64 late_idle_light_cycles = 0;
-+		u64 late_idle_unknown = 0; // late replies whose production time is older than the ledger's samples (counted in the groups above too)
-+		u64 wake_decile[11] = {}; // overshoots in idle by the share of the kWakeWindow after them that the EE ran (was not idle), in tenths: 0 .. 10
-+		u64 wake_done = 0; // overshoots whose window has ended
-+		u64 coverage_decile[11] = {}; // late replies by the idle share of [production, now], in tenths: 0 .. 10
-+		u64 frames = 0; // frames seen (completed)
-+		u64 frames_with_overshoot = 0;
-+		u64 frame_bins[kFrameBins] = {}; // completed frames by overshoots in idle in the frame
-+		u64 event_tests = 0;
-+		u64 ff_event_tests = 0; // event tests reached by a fast-forward
-+		u64 ff_cycles = 0; // EE cycles of the idle intervals, summed (the ledger)
-+		u64 ee_cycles = 0; // EE cycles from the first event test to the last
-+	};
-+
-+	/// One completed frame, when the trace is on.
-+	struct FrameRecord
-+	{
-+		u32 frame;
-+		u32 replies;
-+		u32 late;
-+		u32 idle_overshoots;
-+		u32 unbroken;
-+		u32 share90;
-+		u64 max_late;
-+		u64 ff_cycles; // idle cycles of the frame, by the ledger
-+		u64 ee_cycles;
-+	};
-+
-+	class ReplyMonitor
-+	{
-+	public:
-+		/// What OnReply found.
-+		struct Verdict
-+		{
-+			u64 late; // now - production, 0 when the IOP was ahead
-+			bool overshoot; // late, in an idle event test, idle for kIdleShareMin percent or more of the lateness: the signal
-+		};
-+
-+		void Reset();
-+
-+		/// Keeps the FrameRecord of every completed frame (bounded at kMaxTrace). Set before the run.
-+		void EnableTrace(bool on) { m_trace_on = on; }
-+		const std::vector<FrameRecord>& Trace() const { return m_trace; }
-+
-+		/// An EE event test begins at EE cycle `cycle`, in frame `frame`. `via_ff`: reached by a fast-forward. Returns true if
-+		/// this event test begins a new frame.
-+		bool OnEventTest(u64 cycle, bool via_ff, u32 frame);
-+
-+		/// The EE takes a reply of `kind` produced at the IOP time with low 32 bits `stamp_lo`, at EE cycle `now`.
-+		/// `in_event_test`: the EE is inside the event test OnEventTest last saw. A reply taken elsewhere (a hold on the guest's access
-+		/// to IOP space) cannot be an overshoot in idle: the guest was running.
-+		Verdict OnReply(u32 kind, u32 stamp_lo, u64 now, bool in_event_test);
-+
-+		/// The counters. The frame in progress is not in the frame bins.
-+		const ReplyStats& Stats() const { return m_stats; }
-+
-+		/// EE cycles of the idle ledger up to now, and the sample for `bucket` (tests).
-+		u64 IdleCycles() const { return m_ff_cum; }
-+		/// The start of the current idle streak: the EE cycle of the event test before the first of the unbroken run of event tests
-+		/// reached by a fast-forward that ends now. Meaningful while the last event test was one of them.
-+		u64 StreakStart() const { return m_streak_start; }
-+		bool LastEventTestWasIdle() const { return m_event_ff; }
-+
-+		static constexpr u32 kBucketShift = 12;
-+		static constexpr u32 kBuckets = 4096; // 16.7 million cycles of history: more than kMaxLag, less than 4 frames
-+		static constexpr std::size_t kMaxTrace = 1 << 14;
-+
-+	private:
-+		struct Sample
-+		{
-+			u32 tag; // the bucket number, low 32 bits
-+			u64 cum; // the ledger at the last event test in the bucket
-+		};
-+
-+		/// The ledger at the end of the last bucket that finished at or before `t`. False if the samples do not reach back that far.
-+		bool IdleCyclesAt(u64 t, u64& cum) const;
-+		void EndFrame();
-+
-+		// Overshoots in idle whose kWakeWindow is still open.
-+		struct Wake
-+		{
-+			u64 from, until, busy;
-+		};
-+		static constexpr u32 kMaxWake = 8;
-+		Wake m_wake[kMaxWake] = {};
-+		u32 m_wake_n = 0;
-+
-+		ReplyStats m_stats;
-+
-+		u64 m_prev = 0; // the cycle of the previous event test
-+		bool m_have_prev = false;
-+		bool m_event_ff = false; // the last event test was reached by a fast-forward
-+		bool m_in_streak = false;
-+		u64 m_streak_start = 0;
-+		u64 m_ff_cum = 0;
-+		u64 m_first = 0;
-+		u32 m_frame = 0;
-+		bool m_have_frame = false;
-+
-+		// The frame in progress.
-+		u64 m_f_unbroken = 0, m_f_share90 = 0;
-+		u64 m_f_replies = 0, m_f_late = 0, m_f_events = 0, m_f_max_late = 0, m_f_ff_start = 0, m_f_cycle_start = 0;
-+
-+		bool m_trace_on = false;
-+		std::vector<FrameRecord> m_trace;
-+		Sample m_ring[kBuckets] = {};
-+	};
-+} // namespace IopThread
-diff --git a/pcsx2/IopThread/IopLagRules.cpp b/pcsx2/IopThread/IopLagRules.cpp
-new file mode 100644
-index 0000000000..163d57734a
---- /dev/null
-+++ b/pcsx2/IopThread/IopLagRules.cpp
-@@ -0,0 +1,172 @@
-+// SPDX-FileCopyrightText: 2026 ARMSX2 Contributors
-+// SPDX-License-Identifier: GPL-3.0+
-+
-+#include "IopThread/IopLagRules.h"
-+
-+#include <algorithm>
-+
-+#ifdef __SWITCH__
-+extern "C" uint32_t sw2_ee_wait_cycles;
-+#endif
-+
-+namespace IopThread
-+{
-+	const char* LagRule::Name(u32 rule)
-+	{
-+		switch (rule)
-+		{
-+			case Window:
-+				return "window";
-+			case IdleOutstanding:
-+				return "idle-outstanding";
-+			case IdleAny:
-+				return "idle-any";
-+			case Stream:
-+				return "stream";
-+			case Boot:
-+				return "boot";
-+			case Mailbox:
-+				return "mailbox";
-+			case Poll:
-+				return "poll";
-+			default:
-+				return "?";
-+		}
-+	}
-+
-+	void LagRules::Configure(const LagRulesConfig& config)
-+	{
-+		m_cfg = config;
-+		m_cfg.mask &= LagRule::kAll;
-+#ifdef __SWITCH__
-+		const s32 minLag = (s32)sw2_ee_wait_cycles + 1024;
-+		m_cfg.tight = std::max<s32>(m_cfg.tight, minLag);
-+#else
-+		m_cfg.tight = std::max<s32>(m_cfg.tight, kMinLag);
-+#endif
-+	}
-+
-+	void LagRules::Reset(u32 frame)
-+	{
-+		m_stats = {};
-+		m_window_until = m_mailbox_until = m_poll_until = 0;
-+		m_outstanding = false;
-+		m_outstanding_since = 0;
-+		m_was_idle_out = m_was_idle_any = m_was_stream = m_was_boot = false;
-+		m_boot_from = frame;
-+		m_have_prev = false;
-+		m_prev = m_first = 0;
-+		m_last_rule = -1;
-+	}
-+
-+	void LagRules::OnEeSifStart(u64 cycle, u32 channel)
-+	{
-+		if (!m_cfg.mask || channel > 1)
-+			return;
-+		if (channel == 1)
-+		{
-+			// A new send is the request now; an older one nobody answered is forgotten.
-+			m_outstanding = true;
-+			m_outstanding_since = cycle;
-+		}
-+		if ((m_cfg.mask & LagRule::Bit(LagRule::Window)) && ((m_cfg.window_channels >> channel) & 1))
-+		{
-+			m_window_until = cycle + m_cfg.window;
-+			m_stats.activations[LagRule::Window]++;
-+		}
-+	}
-+
-+	void LagRules::OnIopReply(u64 cycle)
-+	{
-+		if (!m_cfg.mask || !m_cfg.close_on_reply)
-+			return;
-+		m_outstanding = false;
-+		if (m_cfg.window_close_on_reply && Open(m_window_until, cycle))
-+		{
-+			m_window_until = cycle;
-+			m_stats.window_closed_by_reply++;
-+		}
-+	}
-+
-+	void LagRules::OnMailboxAccess(u64 cycle)
-+	{
-+		if (!(m_cfg.mask & LagRule::Bit(LagRule::Mailbox)))
-+			return;
-+		m_mailbox_until = cycle + m_cfg.mailbox_window;
-+		m_stats.activations[LagRule::Mailbox]++;
-+	}
-+
-+	void LagRules::OnEePoll(u64 cycle)
-+	{
-+		if (!(m_cfg.mask & LagRule::Bit(LagRule::Poll)))
-+			return;
-+		m_poll_until = cycle + m_cfg.poll_window;
-+		m_stats.activations[LagRule::Poll]++;
-+	}
-+
-+	s64 LagRules::Bound(u64 cycle, bool idle, u32 streams, u32 frame, s64 loose)
-+	{
-+		m_stats.total_event_tests++;
-+		const u64 span = m_have_prev ? cycle - m_prev : 0;
-+		if (!m_have_prev)
-+		{
-+			m_have_prev = true;
-+			m_first = cycle;
-+		}
-+		m_prev = cycle;
-+		m_stats.total_cycles = cycle - m_first;
-+
-+		if (m_cfg.mask == 0 || loose <= m_cfg.tight)
-+		{
-+			m_last_rule = -1;
-+			return loose;
-+		}
-+
-+		const u32 mask = m_cfg.mask;
-+		const bool stream = (mask & LagRule::Bit(LagRule::Stream)) && (streams & m_cfg.stream_bits) != 0;
-+		const bool window = (mask & LagRule::Bit(LagRule::Window)) && Open(m_window_until, cycle);
-+		const bool poll = (mask & LagRule::Bit(LagRule::Poll)) && Open(m_poll_until, cycle);
-+		const bool mailbox = (mask & LagRule::Bit(LagRule::Mailbox)) && Open(m_mailbox_until, cycle);
-+		const bool idle_out = (mask & LagRule::Bit(LagRule::IdleOutstanding)) && idle && m_outstanding &&
-+		                      static_cast<u64>(cycle - m_outstanding_since) <= m_cfg.outstanding_max_age;
-+		const bool idle_any = (mask & LagRule::Bit(LagRule::IdleAny)) && idle;
-+		const bool boot = (mask & LagRule::Bit(LagRule::Boot)) && static_cast<u32>(frame - m_boot_from) < m_cfg.boot_frames;
-+
-+		// Edges of the conditions that last across event tests. A window counts when it opens (On*).
-+		if (stream && !m_was_stream)
-+			m_stats.activations[LagRule::Stream]++;
-+		if (idle_out && !m_was_idle_out)
-+			m_stats.activations[LagRule::IdleOutstanding]++;
-+		if (idle_any && !m_was_idle_any)
-+			m_stats.activations[LagRule::IdleAny]++;
-+		if (boot && !m_was_boot)
-+			m_stats.activations[LagRule::Boot]++;
-+		m_was_stream = stream;
-+		m_was_idle_out = idle_out;
-+		m_was_idle_any = idle_any;
-+		m_was_boot = boot;
-+
-+		s32 rule = -1;
-+		if (stream)
-+			rule = LagRule::Stream;
-+		else if (window)
-+			rule = LagRule::Window;
-+		else if (poll)
-+			rule = LagRule::Poll;
-+		else if (mailbox)
-+			rule = LagRule::Mailbox;
-+		else if (idle_out)
-+			rule = LagRule::IdleOutstanding;
-+		else if (idle_any)
-+			rule = LagRule::IdleAny;
-+		else if (boot)
-+			rule = LagRule::Boot;
-+
-+		m_last_rule = rule;
-+		if (rule < 0)
-+			return loose;
-+		m_stats.event_tests[rule]++;
-+		m_stats.cycles[rule] += span;
-+		return m_cfg.tight;
-+	}
-+} // namespace IopThread
-diff --git a/pcsx2/IopThread/IopLagRules.h b/pcsx2/IopThread/IopLagRules.h
-new file mode 100644
-index 0000000000..e62f35076c
---- /dev/null
-+++ b/pcsx2/IopThread/IopLagRules.h
-@@ -0,0 +1,256 @@
-+// SPDX-FileCopyrightText: 2026 ARMSX2 Contributors
-+// SPDX-License-Identifier: GPL-3.0+
-+
-+// When the EE must not run far ahead of the IOP.
-+//
-+// The lag bound L (IopThread.h) is how many EE cycles the EE may run ahead of the IOP. A large L lets the EE overlap its work with the
-+// IOP's, which pays when the IOP thread is slow (a little core). It costs when the EE is waiting for the IOP: the EE races to the
-+// bound while it waits, so what the IOP produces reaches the EE up to L cycles after the IOP produced it, and a game that sends a
-+// request and waits for the reply spends L cycles of guest time per request.
-+//
-+// These rules say, from operations the emulator can see, when the EE is waiting for the IOP. While one holds, the bound is the tight
-+// bound (the default lag, 24,576 cycles) instead of L. Nothing else changes: no rule changes what the guest sees except through the
-+// time it takes, so a rule that fires when it was not needed costs speed and never correctness. With no rule on, the bound is L.
-+//
-+// The class is pure: it reads no global and owns no thread. The EE thread calls the On* functions and Bound() (in Lockstep the IOP
-+// thread calls OnIopSif0Reply while the EE is blocked in the handoff, which orders them). The streams word is the one input the IOP
-+// thread writes, and the caller passes it in.
-+
-+#pragma once
-+
-+#include "IopThread/IopThreadMode.h"
-+
-+#include "common/Pcsx2Types.h"
-+
-+namespace IopThread
-+{
-+	/// The rules, as indices (stats) and as bits (LagRulesConfig::mask).
-+	namespace LagRule
-+	{
-+		/// The EE started a SIF transfer: a request went to the IOP, or the EE armed SIF0 to receive. Tight for `window` EE cycles,
-+		/// or until the IOP's next SIF0 transfer reaches the EE, whichever is first.
-+		inline constexpr u32 Window = 0;
-+		/// The EE is idle (the event test was reached by a fast-forward) and a request is outstanding: the EE started a SIF1 transfer
-+		/// and no SIF0 transfer or SBUS interrupt has come from the IOP since, for at most `outstanding_max_age` cycles from the latest send.
-+		inline constexpr u32 IdleOutstanding = 1;
-+		/// The EE is idle, whatever it has sent. Experiment: what idle alone costs a game whose EE is mostly busy.
-+		inline constexpr u32 IdleAny = 2;
-+		/// A stream is running on the IOP: SPU2 auto-DMA input, a CDVD read or a call to the memory card server (the streams word; StreamBit).
-+		inline constexpr u32 Stream = 3;
-+		/// The first `boot_frames` frames after the VM booted or reset: modules load, the IOP reboots, custom disc drivers handshake.
-+		inline constexpr u32 Boot = 4;
-+		/// The EE touched an SBUS mailbox word (the handshake of an IOP reboot; gameplay makes none). Tight for `mailbox_window` cycles.
-+		inline constexpr u32 Mailbox = 5;
-+		/// The EE read the status of a SIF DMA channel (D5 or D6 CHCR) with its STR bit set: it is polling for the end of a transfer.
-+		/// Tight for `poll_window` cycles.
-+		inline constexpr u32 Poll = 6;
-+		inline constexpr u32 kCount = 7;
-+
-+		inline constexpr u32 Bit(u32 rule) { return 1u << rule; }
-+		inline constexpr u32 kAll = (1u << kCount) - 1;
-+		const char* Name(u32 rule);
-+	} // namespace LagRule
-+
-+	/// The streams word: what the IOP thread publishes about the IOP's devices.
-+	namespace StreamBit
-+	{
-+		inline constexpr u32 SpuAdmaCore0 = 1 << 0; // SPU2 core 0 auto-DMA input on
-+		inline constexpr u32 SpuAdmaCore1 = 1 << 1; // SPU2 core 1 auto-DMA input on
-+		inline constexpr u32 CdvdBusy = 1 << 2; // a disc read or a drive action is running
-+		inline constexpr u32 McServerCall = 1 << 3; // a call to the memory card server is in progress (McServerCalls)
-+	} // namespace StreamBit
-+
-+	/// StreamBit::McServerCall: the calls to the IOP's memory card server (the RPC server with id 0x80000400) that the server has not
-+	/// finished. A game that loads or saves sends one call per operation (open, read, close, directory, ...) and polls for its end; at a
-+	/// large bound each end reached the EE up to a frame late, and a game that times its operations reports a good save as damaged.
-+	///
-+	/// The IOP side of SIF sees every command packet: the EE's RPC calls land in IOP memory over SIF1, and the server's replies leave
-+	/// over SIF0. A call packet names the server it is for by the address of the server's data, whose first word is the server's id. A
-+	/// call is in progress from its packet's arrival until the server's RPC end packet for its client leaves, or, for a call made
-+	/// without the no-wait mode, until the IOP writes the end straight into the EE's copy of the call packet (a SIF0 transfer to the
-+	/// call's packet address). The IOP thread owns it (whichever thread runs the IOP, in Off). A savestate load and a VM reset forget
-+	/// the calls (ResyncClocks).
-+	class McServerCalls
-+	{
-+	public:
-+		/// The memory card server's RPC id (mcserv and its successors).
-+		static constexpr u32 kServerId = 0x80000400;
-+		/// A call older than this, in EE cycles of IOP time, is forgotten: two seconds. A call whose end never comes (the IOP was
-+		/// rebooted under it) would otherwise hold the bound tight for good.
-+		static constexpr u64 kMaxAge = 120 * 4915200ull;
-+
-+		// SIF command ids (sifcmd).
-+		static constexpr u32 kCmdRpcEnd = 0x80000008;
-+		static constexpr u32 kCmdRpcCall = 0x8000000A;
-+
-+		/// A transfer the EE sent over SIF1 landed in IOP memory: `count` words at `words`. `read_iop(addr)` reads an IOP word.
-+		template <typename ReadIop>
-+		void OnSif1Transfer(const u32* words, u32 count, ReadIop&& read_iop)
-+		{
-+			// SifRpcCallPkt: the command header {size, dest, cid, opt}, rec_id, pkt_addr, rpc_id, client, rpc_number, send_size,
-+			// receive, recv_size, rmode, server. The size in the header's low byte covers at least those.
-+			if (count < 14 || words[2] != kCmdRpcCall || (words[0] & 0xff) < 56)
-+				return;
-+			if (read_iop(words[13]) != kServerId)
-+				return;
-+			const Call call = {words[7], words[5], kNotSeen};
-+			for (u32 i = 0; i < m_count; i++)
-+			{
-+				if (m_calls[i].client == call.client)
-+				{
-+					m_calls[i] = call;
-+					return;
-+				}
-+			}
-+			// Full: the oldest call goes, its end most likely lost.
-+			if (m_count == kSlots)
-+			{
-+				for (u32 i = 1; i < kSlots; i++)
-+					m_calls[i - 1] = m_calls[i];
-+				m_count--;
-+			}
-+			m_calls[m_count++] = call;
-+		}
-+
-+		/// A transfer the IOP sends over SIF0: `count` words at `words` in IOP memory, to EE address `ee_dest`.
-+		void OnSif0Transfer(const u32* words, u32 count, u32 ee_dest)
-+		{
-+			// SifRpcRendPkt: the command header, rec_id, pkt_addr, rpc_id, client, cid, server, buff, cbuff.
-+			const bool end_packet = count >= 8 && words[2] == kCmdRpcEnd;
-+			for (u32 i = 0; i < m_count;)
-+			{
-+				const Call& c = m_calls[i];
-+				if ((end_packet && c.client == words[7]) || SameEeAddress(c.pkt_addr, ee_dest))
-+					m_calls[i] = m_calls[--m_count];
-+				else
-+					i++;
-+			}
-+		}
-+
-+		/// Whether a call is in progress at IOP position `now`. Ages the calls from the first look at each.
-+		bool InProgress(u64 now)
-+		{
-+			for (u32 i = 0; i < m_count;)
-+			{
-+				Call& c = m_calls[i];
-+				if (c.since == kNotSeen)
-+					c.since = now;
-+				if (now - c.since > kMaxAge)
-+					c = m_calls[--m_count];
-+				else
-+					i++;
-+			}
-+			return m_count != 0;
-+		}
-+
-+		void Reset() { m_count = 0; }
-+
-+	private:
-+		// EE RAM through any of its mappings (cached, uncached, uncached accelerated).
-+		static bool SameEeAddress(u32 a, u32 b) { return ((a ^ b) & 0x0FFFFFFF) == 0; }
-+
-+		static constexpr u64 kNotSeen = ~0ull;
-+		static constexpr u32 kSlots = 4;
-+		struct Call
-+		{
-+			u32 client;
-+			u32 pkt_addr; // the EE's copy of the call packet
-+			u64 since;
-+		};
-+		Call m_calls[kSlots] = {};
-+		u32 m_count = 0;
-+	};
-+
-+	struct LagRulesConfig
-+	{
-+		/// LagRule::Bit() of every rule that is on. 0 is no rules: Bound() returns the loose bound.
-+		u32 mask = 0;
-+		/// The bound a rule imposes, in EE cycles. At or above the loose bound it changes nothing.
-+		s32 tight = kDefaultLag;
-+		/// LagRule::Window: how long after an EE-started transfer the bound stays tight if no reply comes.
-+		u32 window = 98304;
-+		/// LagRule::Window: which channels' starts open it: bit 0 SIF0 (the EE arms to receive), bit 1 SIF1 (the EE sends).
-+		u32 window_channels = 3;
-+		/// LagRule::Window and IdleOutstanding: a SIF0 transfer or SBUS interrupt from the IOP ends the window and the outstanding request.
-+		bool close_on_reply = true;
-+		/// LagRule::Window: with close_on_reply, whether a reply ends the window too. Off, the window runs its full length: the first thing
-+		/// the IOP sends back after a request is often not the end of the request (God of War II's movie player, IopThreadVm.cpp).
-+		bool window_close_on_reply = true;
-+		/// LagRule::IdleOutstanding: a request older than this (EE cycles) is no longer outstanding.
-+		u32 outstanding_max_age = 4915200;
-+		/// LagRule::Mailbox and Poll: window lengths.
-+		u32 mailbox_window = 4915200;
-+		u32 poll_window = 98304;
-+		/// LagRule::Stream: which StreamBit bits count. SPU2 auto-DMA and memory card server calls, not a disc read: with a disc read counted the rule held the
-+		/// bound tight for 59 percent of the EE's cycles in a God of War II state, whose engine reads the disc all the time, and gained nothing for the
-+		/// games that need it.
-+		u32 stream_bits = StreamBit::SpuAdmaCore0 | StreamBit::SpuAdmaCore1 | StreamBit::McServerCall;
-+		/// LagRule::Boot: frames after a boot or reset.
-+		u32 boot_frames = 600;
-+	};
-+
-+	struct LagRulesStats
-+	{
-+		u64 activations[LagRule::kCount] = {}; // times the rule began to hold (a window opened, an idle stretch began, a stream started)
-+		u64 event_tests[LagRule::kCount] = {}; // event tests it made tight (the first rule in the order below that held gets the credit)
-+		u64 cycles[LagRule::kCount] = {}; // EE cycles of the intervals ending in those event tests
-+		u64 window_closed_by_reply = 0; // windows a reply ended before their time
-+		u64 total_event_tests = 0; // event tests seen
-+		u64 total_cycles = 0; // EE cycles from the first to the last
-+	};
-+
-+	class LagRules
-+	{
-+	public:
-+		void Configure(const LagRulesConfig& config);
-+		const LagRulesConfig& Config() const { return m_cfg; }
-+		/// Forget the state (a window, an outstanding request, the stats) and set the boot clock to `frame`.
-+		void Reset(u32 frame = 0);
-+
-+		/// Anything on at all for this loose bound? False lets the caller skip the rest.
-+		bool Live(s64 loose) const { return m_cfg.mask != 0 && loose > m_cfg.tight; }
-+
-+		// ---- EE thread
-+		/// The EE started a SIF transfer (`channel` 0 or 1) at EE cycle `cycle`.
-+		void OnEeSifStart(u64 cycle, u32 channel);
-+		/// A SIF0 transfer or an SBUS interrupt from the IOP reached the EE.
-+		void OnIopReply(u64 cycle);
-+		/// The EE touched an SBUS mailbox word.
-+		void OnMailboxAccess(u64 cycle);
-+		/// The EE read D5 or D6 CHCR with STR set.
-+		void OnEePoll(u64 cycle);
-+
-+		/// The bound for an event test at `cycle`. `idle`: the event test was reached by a fast-forward. `streams`: StreamBit bits.
-+		/// `frame`: the frame count. `loose`: the bound with no rule. Returns at most `loose`. Counts the event test.
-+		s64 Bound(u64 cycle, bool idle, u32 streams, u32 frame, s64 loose);
-+
-+		/// The rule that held at the last Bound() call that was tight, or -1.
-+		s32 LastRule() const { return m_last_rule; }
-+
-+		const LagRulesStats& Stats() const { return m_stats; }
-+
-+	private:
-+		bool Open(u64 until, u64 cycle) const { return static_cast<s64>(until - cycle) > 0; }
-+
-+		LagRulesConfig m_cfg;
-+		LagRulesStats m_stats;
-+
-+		u64 m_window_until = 0; // LagRule::Window
-+		u64 m_mailbox_until = 0;
-+		u64 m_poll_until = 0;
-+		bool m_outstanding = false;
-+		u64 m_outstanding_since = 0;
-+
-+		// Edge detection for the activation counts of the conditions that last across event tests.
-+		bool m_was_idle_out = false;
-+		bool m_was_idle_any = false;
-+		bool m_was_stream = false;
-+		bool m_was_boot = false;
-+
-+		u32 m_boot_from = 0;
-+		bool m_have_prev = false;
-+		u64 m_prev = 0;
-+		u64 m_first = 0;
-+		s32 m_last_rule = -1;
-+	};
-+} // namespace IopThread
-diff --git a/pcsx2/MfifoWriteRange.h b/pcsx2/MfifoWriteRange.h
-new file mode 100644
-index 0000000000..7ae3986238
---- /dev/null
-+++ b/pcsx2/MfifoWriteRange.h
-@@ -0,0 +1,22 @@
-+// SPDX-FileCopyrightText: 2026 SW2PS2 Contributors
-+// SPDX-License-Identifier: GPL-3.0+
-+#pragma once
-+
-+// Qword spans in a circular MFIFO that must be invalidated after a write.
-+// The caller guarantees ring > 0 and start < ring. For oversized writes,
-+// conservatively keep the entire ring, matching the old behaviour.
-+struct MfifoWriteRanges
-+{
-+    unsigned first_start;
-+    unsigned first_count;
-+    unsigned second_count;
-+};
-+
-+constexpr MfifoWriteRanges GetMfifoWriteRanges(unsigned start, unsigned ring, unsigned count)
-+{
-+    if (count >= ring)
-+        return {0, ring, 0};
-+    const unsigned available = ring - start;
-+    const unsigned first = count < available ? count : available;
-+    return {start, first, count - first};
-+}
 diff --git a/tests/ctest/core/recompilers/ee_rec_shift_pair_tests.cpp b/tests/ctest/core/recompilers/ee_rec_shift_pair_tests.cpp
 new file mode 100644
 index 0000000000..9b9ea26207
@@ -8808,3 +8848,15 @@ index 0000000000..9b9ea26207
 +	EERecFallback::g_groups = saved;
 +	ResetRecAndPageProtection();
 +}
+diff --git a/tests/ctest/core/recompilers/harness/EeRecTestHarness.h b/tests/ctest/core/recompilers/harness/EeRecTestHarness.h
+index 60eab3205d..c266b52755 100644
+--- a/tests/ctest/core/recompilers/harness/EeRecTestHarness.h
++++ b/tests/ctest/core/recompilers/harness/EeRecTestHarness.h
+@@ -175,6 +175,7 @@ public:
+ 
+ 	u64 GetGpr64Interp(u32 reg_idx) const;
+ 	u64 GetGpr64Jit   (u32 reg_idx) const;
++	u64 GetCycleDeltaJit() const { return jit_snapshot_.regs.cycle - pre_snapshot_.regs.cycle; }
+ 	u32 GetGprInterp  (u32 reg_idx) const { return static_cast<u32>(GetGpr64Interp(reg_idx)); }
+ 	u32 GetGprJit     (u32 reg_idx) const { return static_cast<u32>(GetGpr64Jit(reg_idx)); }
+ 	u64 GetHi64Interp() const;

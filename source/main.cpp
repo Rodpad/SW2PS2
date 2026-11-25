@@ -351,6 +351,7 @@ static const char* switchButtonName(int bit) {
 }
 // Automated test (autotest.json, see main): overrides apply to one run and are not saved.
 static bool autoTest = false, autoAgent = false, autoWaiting = false;
+static bool autoNoActivity = true;  // test: no periodic appletReportUserIsActive unless "activity": true
 static double autoActivityNext = 0;
 static bool autoActivityLogged = false;
 static bool autoFixedSettings = false;
@@ -1239,13 +1240,32 @@ static void clockMaxApply(bool on) {
 // loading a fight after two or three game switches, OpenGL and Vulkan alike; earlier a switched-to
 // game could freeze). A second game in a session is started by relaunching the app (homebrew
 // loader next-load) with launch.json naming it; startup starts it straight away.
+// The homebrew loader opens the next program after this one returns, and kaiHEN 20261117.1's loader
+// drops to HOME if it cannot. A file still open for writing (just copied over FTP or SW2Transfer,
+// which keep a handle up to ~2 s) cannot be opened, so wait until it opens for reading.
+static bool nextLoadReadable(const string& path) {
+  for (int i = 0; i < 40; i++) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (f) { const bool ok = fgetc(f) != EOF; fclose(f); if (ok) { if (i) record("next load: %s readable after %d ms", path.c_str(), i * 250); return true; } }
+    svcSleepThread(250000000ull);
+  }
+  record("next load: %s still cannot be opened after 10 s", path.c_str());
+  return false;
+}
+static Result safeSetNextLoad(const string& path) {
+  if (!nextLoadReadable(path)) return MAKERESULT(Module_Libnx, LibnxError_NotFound);
+  return envSetNextLoad(path.c_str(), ("\"" + path + "\"").c_str());
+}
 static bool gameStartedThisProcess = false;
 static string appSelfPath;
 static bool relaunchFor(const Rom& rom) {
-  if (autoTest || !gameStartedThisProcess || appSelfPath.empty() || !envHasNextLoad()) return false;
+  // Off: kaiHEN 20261117.1's loader sometimes drops to HOME when a program returns and the next is
+  // loaded, so the next game now starts in this process (the core reuses its memory areas).
+  static const bool relaunchPerGame = false;
+  if (!relaunchPerGame || autoTest || !gameStartedThisProcess || appSelfPath.empty() || !envHasNextLoad()) return false;
   Json j = Json::object(); j.set("dir", Json::string(rom.dir)); j.set("name", Json::string(rom.name));
   if (!writeText(string(DATA_DIR) + "/launch.json", j.dump())) return false;
-  if (R_FAILED(envSetNextLoad(appSelfPath.c_str(), ("\"" + appSelfPath + "\"").c_str()))) { remove((string(DATA_DIR) + "/launch.json").c_str()); return false; }
+  if (R_FAILED(safeSetNextLoad(appSelfPath))) { remove((string(DATA_DIR) + "/launch.json").c_str()); return false; }
   record("relaunching for %s (fresh process per game)", rom.name.c_str());
   quitApp = true;
   return true;
@@ -3490,7 +3510,7 @@ int main(int argc, char** argv) {
       string self = argc > 0 && argv[0] ? argv[0] : "", want = nro && nro->isStr() && !nro->s.empty() ? string(DATA_DIR) + "/" + nro->s : "";
       appSelfPath = self;
       if (!want.empty() && exists(want) && self.size() >= nro->s.size() && self.compare(self.size() - nro->s.size(), nro->s.size(), nro->s) != 0) {
-        Result rc = envHasNextLoad() ? envSetNextLoad(want.c_str(), ("\"" + want + "\"").c_str()) : -1;
+        Result rc = envHasNextLoad() ? safeSetNextLoad(want) : -1;
         record("autotest: this is '%s'; handing over to '%s' (rc %x)", self.c_str(), want.c_str(), rc);
         if (R_SUCCEEDED(rc)) quitApp = true;
       }
@@ -3498,6 +3518,9 @@ int main(int argc, char** argv) {
         const Json* rp = autoJson.get("repeat"); const Json* ag = autoJson.get("agent");
         if (!(rp && rp->isBool() && rp->b)) { remove((string(DATA_DIR) + "/autotest.done.json").c_str()); rename(path.c_str(), (string(DATA_DIR) + "/autotest.done.json").c_str()); }
         autoTest = true; autoRun = 0; autoAgent = ag && ag->isBool() && ag->b;
+        // Periodic appletReportUserIsActive is opt-in ("activity": true): every 45 s over a few minutes
+        // it made the next program loaded into this process crash before its first line (2026-11-25).
+        { const Json* ac = autoJson.get("activity"); autoNoActivity = !(ac && ac->isBool() && ac->b); }
         { const Json* rb = autoJson.get("runBase"); autoRunBase = rb && rb->isNum() ? (int)rb->n : 0; }
         if (const Json* pr = autoJson.get("probe")) if (pr->isBool() && pr->b) probeAliasing();
         if (const Json* pr = autoJson.get("glprobe")) if (pr->isBool() && pr->b) record("gl probe: %s", gfx::probeDesktopGL().c_str());
@@ -3526,7 +3549,7 @@ int main(int argc, char** argv) {
   gfx::setHighRefresh(displayMode == 1);
 
   while (appletMainLoop() && !quitApp) {
-    if (autoTest) {
+    if (autoTest && !autoNoActivity) {
       const double activityNow = nowMs();
       if (activityNow >= autoActivityNext) {
         const Result rc = appletReportUserIsActive();
@@ -3706,7 +3729,7 @@ int main(int argc, char** argv) {
           string selfPath = appSelfPath.empty() ? string(DATA_DIR) + "/sw2ps2.nro" : appSelfPath;
           if (writeText(string(DATA_DIR) + "/autotest.json", next.dump()) && writeText(string(DATA_DIR) + "/autotest.append", "1\n")) {
             record("autotest: restarting for the next game (%d left)", (int)rest.a.size());
-            envSetNextLoad(selfPath.c_str(), ("\"" + selfPath + "\"").c_str());
+            safeSetNextLoad(selfPath);
             quitApp = true; break;
           }
         }
@@ -3766,7 +3789,7 @@ int main(int argc, char** argv) {
             remove((string(DATA_DIR) + "/autotest.json").c_str());
             continue;
           }
-          Result rc = envHasNextLoad() ? envSetNextLoad(want.c_str(), ("\"" + want + "\"").c_str()) : -1;
+          Result rc = envHasNextLoad() ? safeSetNextLoad(want) : -1;
           char rcText[32]; snprintf(rcText, sizeof rcText, "%08x", rc);
           writeText(string(DATA_DIR) + "/autotest.handoff", "from " + self + "\nto " + want + "\nnext-load rc " + rcText + "\n");
           if (R_FAILED(rc)) {
@@ -3931,6 +3954,9 @@ int main(int argc, char** argv) {
   gfx::imageDestroy(graphImage);
   gfx::pictureDestroy(picture);
   audio::shutdown();
+#ifdef SW2_VK
+  vkp::shutdown();  // before EGL: the driver is shared with Zink
+#endif
   gfx::shutdown();
   record("exit");
   if (logFile) fclose(logFile);

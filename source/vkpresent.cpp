@@ -73,6 +73,7 @@ retro_hw_render_interface_vulkan iface;
 retro_vulkan_image image;  // the core's latest frame
 bool haveImage, newImage;
 bool deviceUp;
+VkDevice sessionDevice = VK_NULL_HANDLE;  // the core's device, kept across games (destroyed by shutdown())
 unsigned frameW, frameH;
 
 void ifSetImage(void*, const retro_vulkan_image* im, uint32_t, const VkSemaphore*, uint32_t) {
@@ -184,6 +185,19 @@ const uint32_t* take(Slot& s, int* w, int* h) {
 }
 }  // namespace
 
+void shutdown() {
+  // The core's session device (VKLibretro.cpp keeps one for every game of the process) and our
+  // instance. Without this, a few launches in one hbloader session ran the driver out of
+  // something and the next start crashed (OunceVK 20261123.1: the 8th launch).
+  if (sessionDevice) {
+    vkDeviceWaitIdle(sessionDevice);
+    vkDestroyDevice(sessionDevice, nullptr);
+    record("vulkan: session device destroyed");
+    sessionDevice = VK_NULL_HANDLE;
+  }
+  if (instance) { vkDestroyInstance(instance, nullptr); instance = VK_NULL_HANDLE; record("vulkan: instance destroyed"); }
+}
+
 bool prepare(std::string& err) {
   if (instance) return true;
   VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -208,6 +222,7 @@ bool begin(const void* negotiation, std::string& err) {
     err = "the core could not create its Vulkan device"; return false;
   }
   device = ctx.device; queue = ctx.queue; queueFamily = ctx.queue_family_index; gpu = ctx.gpu;
+  sessionDevice = ctx.device;
   deviceUp = true;
   VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
   pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; pci.queueFamilyIndex = queueFamily;
