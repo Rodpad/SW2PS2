@@ -117,8 +117,6 @@ static const vector<string> VOLUMES = {"0%", "10%", "20%", "30%", "40%", "50%", 
 static const vector<string> FILTERS = {"Off", "Soft", "Strong"};
 static const vector<string> LIST_VIEWS = {"All", "Favourites", "Recent"};
 static const int RECENT_MAX = 5, SLOT_COUNT = 4;
-static const vector<string> EE_WAIT_CHOICES = {"0.125x (384)", "0.25x (768)", "0.5x (1536)", "0.75x (2304)", "1x (3072)", "2x (6144)", "4x (12288)", "8x (24576)", "16x (49152)", "32x (98304)"};
-static const vector<uint32_t> EE_WAIT_VALUES = {384, 768, 1536, 2304, 3072, 6144, 12288, 24576, 49152, 98304};
 extern "C" uint32_t sw2_ee_wait_cycles;
 
 /* ---------------- State ---------------- */
@@ -1709,18 +1707,6 @@ static vector<MenuItem> menuItemsFor(int cat, bool adv) {
           [] { auto it = gameSkip.find(running->name); return it == gameSkip.end() ? 0 : it->second; },
           [](int v) { gameSkip[running->name] = v; },
           [] { saveSettings(); applySkipLive(); }),
-      opt("EE event wait", [] { return EE_WAIT_CHOICES; },
-          [] {
-            for (size_t i = 0; i < EE_WAIT_VALUES.size(); i++)
-              if (sw2_ee_wait_cycles == EE_WAIT_VALUES[i]) return (int)i;
-            return 4;
-          },
-          [](int v) {
-            if (v >= 0 && v < (int)EE_WAIT_VALUES.size()) {
-              sw2_ee_wait_cycles = EE_WAIT_VALUES[v];
-              record("live: %s EE event wait %s", running->name.c_str(), EE_WAIT_CHOICES[v].c_str());
-            }
-          }),
       opt("GPU readbacks", [] { return vector<string>{"Auto (Fast)", "Accurate", "Fast"}; },
           [] { auto it = gameReadback.find(running->name); return it != gameReadback.end() ? it->second : 0; },
           [](int v) { fastReadbackGames.erase(std::remove(fastReadbackGames.begin(), fastReadbackGames.end(), running->name), fastReadbackGames.end()); gameReadback[running->name] = v; },
@@ -1779,7 +1765,7 @@ static vector<MenuItem> menuItemsFor(int cat, bool adv) {
   };
   {
     vector<MenuItem> kept;
-    static const vector<string> EMU = {"PS2 CPU speed", "PS2 CPU cycle skip", "EE event wait", "GPU readbacks", "Blending accuracy", "Switch 2 CPU clock", "Resolution", "Widescreen", "Stats"};
+    static const vector<string> EMU = {"PS2 CPU speed", "PS2 CPU cycle skip", "GPU readbacks", "Blending accuracy", "Switch 2 CPU clock", "Resolution", "Widescreen", "Stats"};
     static const vector<string> PIC = {"Aspect", "Scale", "Overscan", "Signal", "Shader", "Brightness boost", "Curvature", "Corner radius", "Corner softness",
                                        "Vignette", "Vignette size", "Settings for"};
     static const vector<string> CTL = {"Pair controllers", "Player 1 buttons", "Player 2 buttons", "Multitap (players 3-4)", "Player 3 buttons", "Player 4 buttons", "Use Settings buttons", "Reset buttons to standard"};
@@ -3248,6 +3234,7 @@ static void handleUi(u64 bits) {
       if (pressed & B_LEFT) { int v = std::max(0, listView - 1); if (v != listView) { listView = v; roms.clear(); orderRoms(); } }
       if (pressed & B_RIGHT) { int v = std::min((int)LIST_VIEWS.size() - 1, listView + 1); if (v != listView) { listView = v; roms.clear(); orderRoms(); } }
       if (ev.down) { focusArea = roms.empty() ? "buttons" : "list"; selected = 0; }
+      else if (ev.up) focusArea = "buttons";  // wraps round to the bottom
     } else if (focusArea == "list" && !roms.empty()) {
       if (ev.up) { if (selected == 0) focusArea = "tabs"; else selected--; }
       if (ev.down) { if (selected == (int)roms.size() - 1) focusArea = "buttons"; else selected++; }
@@ -3256,6 +3243,7 @@ static void handleUi(u64 bits) {
       if ((pressed & B_A) && selected < (int)roms.size()) { startGame(roms[selected]); return; }
     } else {
       if (ev.up) { focusArea = roms.empty() ? "tabs" : "list"; if (!roms.empty()) selected = (int)roms.size() - 1; }
+      else if (ev.down) focusArea = "tabs";  // wraps round to the top
       if (pressed & B_LEFT) btnIndex = std::max(0, btnIndex - 1);
       if (pressed & B_RIGHT) btnIndex = std::min(2, btnIndex + 1);
       if (pressed & B_A) {
@@ -3329,11 +3317,12 @@ static void handleUi(u64 bits) {
       int v = (pressed & B_LEFT) ? std::max(0, settingsCat - 1) : (pressed & B_RIGHT) ? std::min(last, settingsCat + 1) : settingsCat;
       if (v != settingsCat) { settingsCat = v; rebuildSettings(); settingsTop = 0; }
       if (ev.down) settingsIndex = 0;
+      else if (ev.up) { settingsIndex = nItems; return; }  // wraps round to the bottom
       if (pressed & B_B) { saveSettings(); mode = "browser"; }
       return;
     }
     if (ev.up) { if (settingsIndex == 0) { settingsIndex = -1; return; } settingsIndex--; }
-    if (ev.down && settingsIndex < nItems) settingsIndex++;
+    if (ev.down) { if (settingsIndex >= nItems) { settingsIndex = -1; return; } settingsIndex++; }  // wraps round to the tabs
     if (settingsIndex < nItems) {
       SettingItem it = SETTINGS_ITEMS[settingsIndex];  // copy: the advanced toggle rebuilds the list
       int n = (int)it.choices().size();
@@ -3363,12 +3352,13 @@ static void handleUi(u64 bits) {
       int v = (pressed & B_LEFT) ? std::max(0, menuCat - 1) : (pressed & B_RIGHT) ? std::min(last, menuCat + 1) : menuCat;
       if (v != menuCat) { menuCat = v; openMenu(); menuIndex = -1; return; }
       if (ev.down) menuIndex = 0;
+      else if (ev.up && n > 0) { menuIndex = n - 1; return; }  // wraps round to the bottom
       if ((pressed & B_B) && mode == "menu") closeMenu();
       return;
     }
-    if (menuHasTabs) {  // no wrapping, as the game list: up from the first row reaches the tabs
+    if (menuHasTabs) {  // as the game list: up from the first row reaches the tabs, down from the last wraps to them
       if (ev.up) { if (menuIndex == 0) { menuIndex = -1; return; } menuIndex--; }
-      if (ev.down && menuIndex < n - 1) menuIndex++;
+      if (ev.down) { if (menuIndex >= n - 1) { menuIndex = -1; return; } menuIndex++; }
     } else {
       if (ev.up) menuIndex = (menuIndex - 1 + n) % n;
       if (ev.down) menuIndex = (menuIndex + 1) % n;

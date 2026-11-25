@@ -22,6 +22,8 @@ folders can be changed in Settings -> App. The app keeps its own files in `/swit
   `.bin`. The BIOS is found the same way, in its folder or folders inside it.
 - **Per-game settings:** a setting changed in a game's menu is kept for that game; Settings holds
   the defaults for all games.
+- **Menus wrap round:** in the game list, Settings and the in-game menu, going past the bottom
+  jumps to the top and past the top to the bottom.
 - **Built-in speed settings** for demanding games, measured on the Switch 2 or taken from the
   community AetherSX2/NetherSX2 lists, so most games start well without tuning.
 
@@ -99,6 +101,11 @@ SW2PS2 uses the [OunceSX2](https://github.com/nyathea/OunceSX2) core with its ow
   its own core using ARMSX2's latest IOP thread, including its lag control. SW2PS2 adds the
   Switch 2 fixes it needs: detecting the console's CPU cores correctly (the standard check
   reports none) and waiting without WFE instructions, which never wake on the Switch 2.
+- **Faster hand-offs between the emulated processors.** The emulated CPU no longer waits for
+  memory to settle each time it hands graphics work to the vector unit or checks on the I/O
+  processor, and EE interrupt scheduling skips a needless read from the I/O processor's core.
+- **Newer graphics driver.** SW2PS2 links the OunceVK 20261123.1 release (faster at higher
+  resolutions) and shuts its Vulkan device down fully at exit.
 - **Per-game speed settings built in.** Demanding games start with emulated-CPU settings
   measured on the Switch 2, falling back to the community-tested AetherSX2/NetherSX2 lists. Any
   game can be adjusted from the in-game menu, and the app tells you once if a game falls below
@@ -108,9 +115,14 @@ SW2PS2 uses the [OunceSX2](https://github.com/nyathea/OunceSX2) core with its ow
 
 - **Several games in one session.** Starting a second game and loading a state no longer
   crashes. The cause was the core's background VU compiler, which SW2PS2 turns off; it gave no
-  measurable speed.
-- **Relaunching from hbmenu.** The emulated PS2's memory is reserved once and released when the
-  app exits; before, repeated use fragmented memory until the app could no longer start.
+  measurable speed. A new game now starts in the same session instead of restarting the app
+  through the homebrew loader, which on kaiHEN 20261117.1 could drop to the HOME menu.
+- **Memory reserved up front.** The emulated PS2's 293 MB data area must sit in a 2 GB region
+  where thread stacks land at random addresses. It is now reserved as soon as the app starts and
+  reused by every game; searched for at game start, it was sometimes missing, and the game stayed
+  on a black screen.
+- **Burnout Revenge boots.** Two game-database graphics hooks meant for the other Burnout games
+  stopped the hardware renderer on the Switch 2; Burnout Revenge skips them.
 - **Loading a state right after boot.** A state load is held until the game itself has
   started; loading while the BIOS was still booting crashed God of War II.
 
@@ -134,7 +146,8 @@ Needs devkitPro (devkitA64) with the ounce-devkit Switch 2 additions (libounce, 
 1. `tools/setup_third_party.sh` clones the cores at the pinned commits and applies `patches/`.
 2. `tools/build_core.sh` builds libjpeg-turbo (from the core's own copy) and the core, with the
    exact settings the app is built with (CMake + Ninja).
-3. `make` builds the app (the Vulkan build on the devkit's OunceVK driver).
+3. `make` builds the app, linking the OunceVK 20261123.1 driver that step 1 unpacks into
+   `third_party/` (`make OUNCEVK=` uses the devkit's copy instead).
 
 After changing what the app links, `tools/make_notices.py` regenerates
 `romfs/licenses/THIRD_PARTY_NOTICES.txt`.
