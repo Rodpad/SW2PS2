@@ -1,6 +1,7 @@
 // SW2PS2 front end (from SW2NES): OpenGL ES 3 drawing (rects, text, game picture).
 #include "uigfx.h"
 
+#include <math.h>
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
 #include <GLES2/gl2ext.h>
@@ -233,7 +234,12 @@ static void quad(float x, float y, float w, float h, float u0, float v0, float u
 void rect(float x, float y, float w, float h, Color fill, float radius, float border, Color bc) {
   if (windowReleased) return;
   if (w <= 0 || h <= 0) return;
-  x *= UI_SCALE; y *= UI_SCALE; w *= UI_SCALE; h *= UI_SCALE; radius *= UI_SCALE; border *= UI_SCALE;
+  // To whole screen pixels (the UI is drawn 1.25x): edges and borders that land between pixels
+  // come out soft or uneven, so every side is snapped and a border is a whole number of pixels.
+  const float x2 = roundf((x + w) * UI_SCALE), y2 = roundf((y + h) * UI_SCALE);
+  x = roundf(x * UI_SCALE); y = roundf(y * UI_SCALE); w = x2 - x; h = y2 - y;
+  if (w <= 0 || h <= 0) return;
+  radius *= UI_SCALE; border = border > 0 ? fmaxf(1.0f, roundf(border * UI_SCALE)) : 0;
   glUseProgram(rectProg); setScreen(rScreen);
   glUniform4f(rRect, x, y, w, h);
   float r = radius; if (r > w / 2) r = w / 2; if (r > h / 2) r = h / 2;

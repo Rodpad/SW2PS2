@@ -24,6 +24,15 @@ folders can be changed in Settings -> App. The app keeps its own files in `/swit
   the defaults for all games.
 - **Menus wrap round:** in the game list, Settings and the in-game menu, going past the bottom
   jumps to the top and past the top to the bottom.
+- **Search and sort:** the game list's header row has the tabs, a search field (with a clear
+  button) and the sort order (name, last played, date added); left / right moves along it and A
+  uses it. The footer has Play, Favourite (−), Search (+), Settings (Y), Refresh (X) and Exit (B,
+  press twice), reachable with the D-pad.
+- **Touch on every screen:** tap anything (it lights while held and acts when released), drag to
+  scroll, tap outside a window to close it. During play an on-screen Menu button appears when
+  the game is touched (Settings -> App: When touched / Always / Hidden).
+- **UI size:** Normal (larger rows and text, easier to tap; the default) or Compact, in
+  Settings -> App.
 - **Built-in speed settings** for demanding games, measured on the Switch 2 or taken from the
   community AetherSX2/NetherSX2 lists, so most games start well without tuning.
 

@@ -269,12 +269,48 @@ static int cornerRadius = 0, cornerSoftness = 1, vignette = 0, vignetteSize = 0,
 static int faceMap[NFACE] = {0, 1, 2, 3, 4, 5}, faceMap2[NFACE] = {0, 1, 2, 3, 4, 5};
 static int remapPlayer = 0;  // Settings: whose buttons the mapping rows edit (not saved)
 static int* curMap() { return remapPlayer ? faceMap2 : faceMap; }
+// Touch always works (taps and drags on every screen). "UI size" (Settings -> App): Compact, or
+// Normal with taller rows and larger row text (easier to tap).
+static bool touchControls = true;  // UI size: Normal (the default) or Compact  // the larger spacing
+// The in-game on-screen Menu button (Settings -> App): 0 when the game is touched (3 s), 1 always, 2 hidden.
+static int menuButtonMode = 0;
+static const vector<string> MENU_BUTTON_MODES = {"When touched", "Always", "Hidden"};
+static int ROW_H = 72;  // 72 at UI size Normal (the default), 40 at Compact
+// Touch controls make everything to tap larger: tab rows, buttons, the scroll bar.
+static const float BTN_RADIUS = 12;  // buttons and tabs: corners like the windows' (14), not pills
+static float tabH() { return 48; }                          // a tab (one size, touch or not)
+static float tabRowH() { return tabH() + 2; }               // the tab bar's line
+static float btnH() { return 56; }                          // a button (one size, touch or not)
+// Row text: larger at UI size Normal, filling the taller rows.
+static float rowText() { return touchControls ? 24 : 20; }   // a row's label and value
+static float rowSmall() { return touchControls ? 19 : 16; }  // secondary text in a row (time played, dates)
+static float headText() { return touchControls ? 16 : 14; }  // column headings
+static float barW() { return touchControls ? 14 : 8; }      // the scroll bar
+// A drag scrolls the page (as on a phone), leaving the selection where it is; the next button
+// press brings the view back to the selection.
+static bool touchScrolled = false;
+struct Hit { float x, y, w, h; std::function<void()> tap; std::function<void(int)> drag; };  // drag: rows moved (+ down)
+static std::vector<Hit> hits;  // registered while drawing; the next frame's touches use them
+static void addHit(float x, float y, float w, float h, std::function<void()> tap, std::function<void(int)> drag = nullptr) {
+  hits.push_back(Hit{x, y, w, h, std::move(tap), std::move(drag)});
+}
+// The finger now (UI units): what it is on lights up while held; a tap acts on release.
+static bool touchIsDown = false, touchDragging = false;
+static float touchX = 0, touchY = 0, touchStartX = 0, touchStartY = 0;
+static bool touchHolding(float x, float y, float w, float h) {
+  auto in = [&](float px, float py) { return px >= x && px < x + w && py >= y && py < y + h; };
+  return touchIsDown && !touchDragging && in(touchX, touchY) && in(touchStartX, touchStartY);
+}
+static u64 touchPress = 0;
+static bool tapThisFrame = false;  // a tap was let go this frame (its target was already lit while held)  // buttons a tap presses for one frame (read by the menus)
+static bool touchUp = false, touchDown = false;  // a tap's one-step move
 static int turboRate = 1, volumeLevel = 10, audioFilter = 0;
 static bool autoLoadState = false, pauseInMenu = false, dimInMenu = false;
 // At most one frame in flight: input is read only after the previous frame
 // finished on the GPU (the driver default let frames queue up: 100+ ms lag).
 static const int frameQueue = 1;
 static vector<string> recentGames, favourites, playHistory;
+static string searchQuery;  // game list filter (+ / Search), not saved
 static Json lastPlayedDates = Json::object();
 static const vector<string> VIB_LEVELS = {"Off", "Low", "Normal", "High"};
 static const float VIB_GAIN[4] = {0.0f, 0.5f, 1.0f, 1.6f};
@@ -538,7 +574,7 @@ static Json settingsJson(const GameVals& g) {
   { Json rb = Json::object(); for (auto& kv : gameReadback) if (kv.second) rb.set(kv.first, Json::number(kv.second)); j.set("gameReadback", rb); }
   { Json b = Json::object(); for (auto& kv : gameBlending) if (kv.second) b.set(kv.first, Json::number(kv.second)); j.set("gameBlending", b); }
   { Json r = Json::object(), k = Json::object(); for (auto& kv : gameRate) if (kv.second) r.set(kv.first, Json::number(kv.second)); for (auto& kv : gameSkip) if (kv.second) k.set(kv.first, Json::number(kv.second)); j.set("gameRate", r); j.set("gameSkip", k);
-    Json rs = Json::object(); for (auto& kv : gameRes) if (kv.second) rs.set(kv.first, Json::number(kv.second)); j.set("gameRes", rs); j.set("res1x", Json::boolean(true)); j.set("debugLog", Json::boolean(debugLog));
+    Json rs = Json::object(); for (auto& kv : gameRes) if (kv.second) rs.set(kv.first, Json::number(kv.second)); j.set("gameRes", rs); j.set("res1x", Json::boolean(true)); j.set("debugLog", Json::boolean(debugLog)); j.set("touch", Json::boolean(touchControls)); j.set("menuButton", Json::number(menuButtonMode));
     for (int pl = 0; pl < 4; pl++) { Json m = Json::array(); for (int i = 0; i < 16; i++) m.a.push_back(Json::number(padMap[pl][i])); j.set("padMap" + std::to_string(pl + 1), m); }
     j.set("multitap", Json::boolean(multitapDefault));
     { Json g = Json::object(); for (auto& kv : gameMultitap) g.set(kv.first, Json::boolean(kv.second)); j.set("gameMultitap", g); }
@@ -600,6 +636,9 @@ static void applySettingsJson(const Json& v) {
   if (const Json* r = v.get("gameRes")) if (r->type == Json::OBJ) { gameRes.clear(); for (auto& kv : r->o) if (kv.second.isNum()) gameRes[kv.first] = pick(&kv.second, RESOLUTIONS.size() + 1, 0); }
   if (!v.get("zfastDefault") && shader == 2) shader = 6;  // zfast CRT became the default shader (2026-11-19); once, for settings saved on the old default
   if (const Json* d = v.get("debugLog")) if (d->isBool()) debugLog = d->b;
+  if (const Json* d = v.get("touch")) if (d->isBool()) touchControls = d->b;
+  menuButtonMode = pick(v.get("menuButton"), MENU_BUTTON_MODES.size(), menuButtonMode);
+  ROW_H = touchControls ? 72 : 40;
   if (const Json* b = v.get("multitap")) if (b->isBool()) multitapDefault = b->b;
   gameMultitap.clear();
   if (const Json* g = v.get("gameMultitap")) if (g->type == Json::OBJ) for (auto& kv : g->o) if (kv.second.isBool()) gameMultitap[kv.first] = kv.second.b;
@@ -715,6 +754,12 @@ static void orderRoms() {
       const string an = stripNes(a.name), bn = stripNes(b.name);
       return romSort == NameDesc ? naturalLess(bn, an) : naturalLess(an, bn);
     });
+  }
+  if (!searchQuery.empty()) {
+    const string q = lower(searchQuery);
+    vector<Rom> kept;
+    for (auto& r : list) if (lower(stripNes(r.name)).find(q) != string::npos) kept.push_back(r);
+    list = kept;
   }
   roms = list; selected = 0; top = 0;
   if (!cur.empty()) for (size_t i = 0; i < roms.size(); i++) if (roms[i].name == cur) selected = (int)i;
@@ -832,6 +877,39 @@ static void scanGames(const string& dir, int depth, vector<Rom>& found) {
     scanGames((root ? string("sdmc:") : dir) + "/" + n, depth + 1, found);
   }
 }
+static void showToast(const string& t, double ms = 1800);
+// The game list's footer buttons (Play, Favourite, Search, Settings, Refresh, Exit): one flashes in
+// the accent colour when used -- by its button, by moving to it and pressing A, or by a tap -- and
+// its action runs once the flash has shown.
+static int footFlash = -1, footPending = -1;  // 0-5 the footer buttons, 6 the search field, 7 sort
+static int headIndex = -1;  // the header row: -1 the current tab, then (tabs = 3) 3 the search field, 4 its clear button (while searching), 5 sort
+static double footFlashUntil = 0, footActAt = 0;
+// A button press flashes first, then acts; a tap acts at once (it was lit while the finger was on it).
+static void pressFooter(int i) { footFlash = footPending = i; footFlashUntil = nowMs() + 140; footActAt = tapThisFrame ? 0 : footFlashUntil; }
+static void openSearch() {
+  SwkbdConfig kbd;
+  if (R_FAILED(swkbdCreate(&kbd, 0))) { showToast("The keyboard could not open"); return; }
+  swkbdConfigMakePresetDefault(&kbd);
+  swkbdConfigSetHeaderText(&kbd, "Search games");
+  swkbdConfigSetGuideText(&kbd, "Part of a game's name (empty: show all)");
+  swkbdConfigSetInitialText(&kbd, searchQuery.c_str());
+  swkbdConfigSetStringLenMax(&kbd, 40);
+  char out[128] = "";
+  const Result rc = swkbdShow(&kbd, out, sizeof out);
+  swkbdClose(&kbd);
+  if (R_FAILED(rc)) return;  // cancelled
+  searchQuery = out;
+  orderRoms();
+  showToast(searchQuery.empty() ? "Showing all games" : std::to_string(roms.size()) + (roms.size() == 1 ? " game matches" : " games match"));
+}
+static void toggleFavourite(const string& name) {
+  const bool was = contains(favourites, name);
+  favourites.erase(std::remove(favourites.begin(), favourites.end(), name), favourites.end());
+  if (!was) favourites.push_back(name);
+  saveSettings();
+  showToast(was ? "Removed from Favourites" : "Added to Favourites");
+  if (listView == 1) orderRoms();
+}
 static void scan() {
   allRoms.clear();
   // One entry per game name (the first found wins over a same-named file deeper in the tree).
@@ -941,7 +1019,7 @@ static string scaleLabel(int i) {
 }
 
 /* ---------------- Toasts and messages ---------------- */
-static void showToast(const string& t, double ms = 1800) { toastText = t; toastUntil = nowMs() + ms; }
+static void showToast(const string& t, double ms) { toastText = t; toastUntil = nowMs() + ms; }
 static void showMessage(const string& text, std::function<void()> then) { messageText = text; messageThen = then; mode = "message"; }
 
 /* ---------------- Timing and stats ---------------- */
@@ -1585,6 +1663,7 @@ static MenuItem act(const string& l, std::function<void()> f) { MenuItem m; m.la
 static MenuItem opt(const string& l, std::function<vector<string>()> c, std::function<int()> g, std::function<void(int)> s, std::function<void()> a = nullptr) {
   MenuItem m; m.label = l; m.choices = c; m.get = g; m.set = s; m.after = a; return m;
 }
+static bool settingsOnBack = false, menuOnBack = false;  // the cursor is on the tab row's Back button
 static bool menuHasTabs = false;  // the main in-game menu: its categories show as tabs (L / R)
 static const vector<string> MENU_CATS = {"Game", "Emulation", "Picture", "Controls"};
 static int menuCat = 0;  // menuIndex -1: the cursor is on the category tabs
@@ -1693,6 +1772,7 @@ static vector<MenuItem> menuItemsFor(int cat, bool adv) {
       opt("Slot", [] { vector<string> a; for (int n = 1; n <= SLOT_COUNT; n++) a.push_back(slotLabel(n)); return a; },
           [] { return stateSlot - 1; }, [](int v) { stateSlot = v + 1; }),
       act("Reset", [] { C->reset(0); closeMenu(); showToast("Reset"); }),
+      act("Quit game", [] { quitGame(); }),
       opt("Run-ahead", [] { return RUN_AHEADS; }, [] { return runAhead; }, [](int v) { runAhead = v; }, saveSettings),
       opt("Stats", [] { return STATS_LEVELS; }, [] { return statsLevel; }, [](int v) { statsLevel = v; }, [] { resetGraph(); saveSettings(); }),
       opt("Widescreen", [] { return OFF_ON; }, [] { return contains(widescreenGames, running->name) ? 1 : 0; },
@@ -1730,8 +1810,6 @@ static vector<MenuItem> menuItemsFor(int cat, bool adv) {
       opt("Corner softness", [] { return CORNER_SOFTNESS; }, [] { return cornerSoftness; }, [](int v) { cornerSoftness = v; }, pictureChanged),
       opt("Vignette", [] { return VIGNETTES; }, [] { return vignette; }, [](int v) { vignette = v; }, pictureChanged),
       opt("Vignette size", [] { return VIGNETTE_SIZES; }, [] { return vignetteSize; }, [](int v) { vignetteSize = v; }, pictureChanged),
-      opt("Favourite", [] { return OFF_ON; }, [] { return contains(favourites, running->name) ? 1 : 0; },
-          [](int v) { favourites.erase(std::remove(favourites.begin(), favourites.end(), running->name), favourites.end()); if (v) favourites.push_back(running->name); }, saveSettings),
       opt("Settings for", [] { return vector<string>{"All games", "This game"}; }, [] { return running->perGame ? 1 : 0; }, [](int v) { setPerGame(v != 0); },
           [] { pictureChanged(); refreshPicture(); }),
       act("Save screenshot", [] { closeMenu(); captureRequested = true; }),
@@ -1761,7 +1839,6 @@ static vector<MenuItem> menuItemsFor(int cat, bool adv) {
             openMenu();
             for (int i = 0; i < (int)menuItems.size(); i++) if (menuItems[i].label == "Advanced options") menuIndex = i;
           }),
-      act("Quit game", [] { quitGame(); }),
   };
   {
     vector<MenuItem> kept;
@@ -1786,7 +1863,7 @@ static int menuFixedRows() {
 }
 static void openMenu() {
   showMenuItems(stripNes(running->name), menuItemsFor(menuCat, showAdvanced));
-  menuHasTabs = true;
+  menuHasTabs = true; menuOnBack = false;
   mode = "menu";
   saveSram(false);
 }
@@ -1879,6 +1956,8 @@ static vector<SettingItem> settingsItems() {
         if (debugLog && !logFile) { openLog(false); record("SW2PS2 %s: debug logging turned on", APP_VERSION); }
         else if (!debugLog && logFile && !autoTest) { fclose(logFile); logFile = nullptr; }
       }},
+      {"On-screen Menu button", [] { return MENU_BUTTON_MODES; }, [] { return menuButtonMode; }, [](int v) { menuButtonMode = v; }},
+      {"UI size", [] { return vector<string>{"Compact", "Normal"}; }, [] { return touchControls ? 1 : 0; }, [](int v) { touchControls = v != 0; ROW_H = touchControls ? 72 : 40; }},
       {"BIOS folder", [] { return vector<string>{biosDir.rfind("sdmc:", 0) == 0 ? biosDir.substr(5) : biosDir}; }, [] { return 0; }, [](int) { openFolderPicker(true); }},
       {"Resolution", [] { return RESOLUTIONS; }, [] { return ps2Resolution; }, [](int v) { ps2Resolution = v; }},
       {"Emulated CPU speed (next start)", [] { return EE_SPEEDS; }, [] { return ps2EeSpeed; }, [](int v) { ps2EeSpeed = v; }},
@@ -1964,6 +2043,7 @@ static vector<SettingItem> settingsFor(int cat, bool adv) {
   if (adv && cat == 3)
     items.push_back({"Reset all settings", [] { return vector<string>{"Press {A}", "Press {A} again to confirm"}; }, [] { return resetArmed ? 1 : 0; },
                      [](int v) { if (resetArmed) { resetArmed = false; resetAllSettings(); gfx::setHighRefresh(displayMode == 1); rebuildSettings(); settingsIndex = 0; settingsTop = 0; showToast("All settings reset to defaults"); } else resetArmed = true; }});
+  if (cat == 3) items.push_back({"Version", [] { return vector<string>{"v" APP_VERSION}; }, [] { return 0; }, nullptr});  // shown, not changeable
   return items;
 }
 
@@ -2057,134 +2137,261 @@ static void panelHeader(float x, float y, const string& title, const string& not
   float w = textMid(title, x + 20, y, 34, 26, col(C_TEXT), gfx::BOLD);
   if (!note.empty()) textMid(note, x + 20 + w + 12, y + 3, 34, 16, col(C_DIM));
 }
-static void scrollbar(float x, float y, float h, int total, int vis, int topIndex) {
+static void scrollbar(float x, float y, float h, int total, int vis, int topIndex, int* topRef = nullptr) {
   if (total <= vis) return;
-  gfx::rect(x, y, 8, h, col(C_LINE), 4);
+  const float bw = barW();
+  gfx::rect(x, y, bw, h, col(C_LINE), bw / 2);
   float th = std::max(24.0f, roundf(h * vis / total));
-  gfx::rect(x, y + roundf((h - th) * topIndex / (total - vis)), 8, th, col(C_DIM), 4);
+  gfx::rect(x, y + roundf((h - th) * topIndex / (total - vis)), bw, th, col(C_DIM), bw / 2);
+  if (topRef) addHit(x - 10, y, bw + 20, h, nullptr, [topRef, total, vis](int rows) {  // drag the thumb: the page follows
+    *topRef = std::max(0, std::min(total - vis, *topRef - rows * std::max(1, total / std::max(1, vis))));
+    touchScrolled = true;
+  });
 }
 
 /* ---------------- Screens ---------------- */
-static const vector<string> BROWSER_BUTTONS = {"Settings", "Refresh", "Exit"};
-static const int BROWSER_KEYS[] = {3, 2, 1};  // gamepad shortcut for each button: Y, X, B (glyph index)
-static const int ROW_H = 40;
+static const float BTN_TEXT = 20, TAB_TEXT = 19;  // button and tab labels
 static const float LIST_HEAD = 26;  // column headings above the game list
 // A row of tabs with small L / R shoulder-button caps either side: L and R cycle them.
-static void drawTabBar(float cx, float cy, const vector<string>& labels, int sel, int focusTab) {  // focusTab: the tab the cursor is on, -1 none
+static float tabWidth(const string& label) { return roundf(gfx::textWidth(label, TAB_TEXT) + 44); }
+static float equalTabsWidth(const vector<string>& labels) {  // equal tabs, each as wide as the widest needs
+  float w = 0; for (auto& l : labels) w = std::max(w, tabWidth(l));
+  return w * labels.size() + 8 * (labels.size() - 1);
+}
+static float tabsWidth(const vector<string>& labels) { float w = 0; for (auto& l : labels) w += tabWidth(l) + 8; return w - 8; }
+static void drawTabBar(float cx, float cy, const vector<string>& labels, int sel, int focusTab, std::function<void(int)> onTab = nullptr, bool caps = true, float fillW = 0) {  // focusTab: the tab the cursor is on, -1 none; fillW: equal tabs across this width
   cx = roundf(cx); cy = roundf(cy);  // whole pixels: a 1 px border at a fractional x can vanish
   auto cap = [&](const char* label, float bx) {
     bx = roundf(bx);
-    gfx::rect(bx, cy + 7, 28, 20, Color{0, 0, 0, 0}, 6, 1, col(C_DIM));
-    textMid(label, bx + 28 / 2 - gfx::textWidth(label, 13, gfx::BOLD) / 2, cy + 7, 20, 13, col(C_DIM), gfx::BOLD);
+    gfx::rect(bx, cy + (tabH() - 20) / 2, 28, 20, Color{0, 0, 0, 0}, 6, 1, col(C_DIM));
+    textMid(label, bx + 28 / 2 - gfx::textWidth(label, 13, gfx::BOLD) / 2, cy + (tabH() - 20) / 2, 20, 13, col(C_DIM), gfx::BOLD);
   };
-  cap("L", cx);
-  float tx = cx + 28 + 10;
+  if (caps) cap("L", cx);
+  float tx = caps ? cx + 28 + 10 : cx;
   for (size_t i = 0; i < labels.size(); i++) {
     bool on = (int)i == sel, focus = (int)i == focusTab;
-    float w = roundf(gfx::textWidth(labels[i], 17) + 32);
-    gfx::rect(tx, cy, w, 34, focus ? col(C_SEL) : on ? col(C_LINE) : Color{0, 0, 0, 0}, 16, 1, col(focus ? C_ACCENT : C_LINE));
-    textMid(labels[i], tx + 16, cy, 34, 17, col(on ? C_TEXT : C_DIM));
+    float w = fillW > 0 ? roundf((fillW - 8 * (labels.size() - 1)) / labels.size()) : tabWidth(labels[i]);
+    if (onTab && touchHolding(tx, cy - 6, w + 8, tabH() + 12)) focus = true;  // lit while the finger is on it
+    gfx::rect(tx, cy, w, tabH(), focus ? col(C_SEL) : on ? col(C_LINE) : Color{0, 0, 0, 0}, BTN_RADIUS, 1, col(focus ? C_ACCENT : C_LINE));
+    textMid(labels[i], tx + (w - gfx::textWidth(labels[i], TAB_TEXT)) / 2, cy, tabH(), TAB_TEXT, col(on ? C_TEXT : C_DIM));
+    if (onTab) addHit(tx, cy - 6, w + 8, tabH() + 12, [onTab, i] { onTab((int)i); });
     tx += w + 8;
   }
-  cap("R", tx + 2);
+  if (caps) cap("R", tx + 2);
+  if (onTab && caps) {  // the L / R caps: previous / next
+    const int n = (int)labels.size();
+    addHit(cx - 6, cy - 6, 40, tabH() + 12, [onTab, sel, n] { onTab((sel - 1 + n) % n); });
+    addHit(tx - 4, cy - 6, 40, tabH() + 12, [onTab, sel, n] { onTab((sel + 1) % n); });
+  }
 }
-static int maxRows() { return std::max(3, (int)((gfx::UI_H * 0.9 - 36 - 38 - 44 - 12 - 30 - 14 - LIST_HEAD) / ROW_H)); }
+// A tab row's Back button (Settings, the in-game menu): after a divider at the row's right end.
+static const float BACK_W = 132, BACK_GAP = 28;
+static bool drawTabBack(float rowX, float rowW, float cy, bool focus, std::function<void()> tap) {
+  const float bx = rowX + rowW - BACK_W;
+  gfx::rect(roundf(bx - BACK_GAP / 2) - 1, cy + 8, 2, tabH() - 16, col(C_LINE), 1);  // divider
+  const bool held = touchHolding(bx, cy - 6, BACK_W, tabH() + 12), lit = focus || held;
+  gfx::rect(bx, cy, BACK_W, tabH(), held ? col(C_ACCENT, 0.35f) : focus ? col(C_SEL) : Color{0, 0, 0, 0}, BTN_RADIUS, 1, col(lit ? C_ACCENT : C_LINE));
+  const string t = "{B} Back";
+  textMid(t, bx + (BACK_W - glyphTextWidth(t, TAB_TEXT)) / 2, cy, tabH(), TAB_TEXT, col(lit ? C_TEXT : C_DIM));
+  addHit(bx, cy - 6, BACK_W, tabH() + 12, tap);
+  return held;
+}
+// Game rows that fit: the screen less the window's padding, the header row, the column headings,
+// the footer and the list's own padding.
+static int maxRows() { return std::max(3, (int)((gfx::UI_H * 0.96 - 36 - tabRowH() - 10 - LIST_HEAD - 12 - (btnH() + 14) - 12) / ROW_H)); }
 
+// The game list: title; tabs | search field, sort (what you see); the list; a footer of button
+// legends (what you do), each also a touch button. Every control keeps one size and place.
+static const float BUB = 18;  // header controls' text
+static const float SEARCH_MIN = 240;  // the search field: at least this, otherwise the room left in the header row
+static float sortWidth() {
+  float w = 0;
+  for (auto& l : ROM_SORT_LABELS) w = std::max(w, gfx::textWidth("Sort: " + l, BUB));
+  return roundf(w + 40);
+}
+struct Legend { const char* key; string label; std::function<void()> tap; bool lit; };
+static float legendWidth(const vector<string>& labels) {  // the widest of a legend's labels, with its badge
+  float w = 0; for (auto& l : labels) w = std::max(w, gfx::textWidth(l, BTN_TEXT));
+  return roundf(30 + 10 + w + 28);
+}
+static vector<float> footerWidths() {  // every footer button one width: that of the longest label any of them shows
+  const float w = legendWidth({"Play", "Favourite", "Search", "Settings", "Refresh", "Exit", "Confirm exit"});
+  return vector<float>(6, w);
+}
 static void drawBrowser() {
-  const float winW = 960, padX = 20, padY = 18, innerW = winW - 2 * padX;
+  const float padX = 20, padY = 18, gap = 12, divGap = 28;
+  const float tabsW = tabsWidth(LIST_VIEWS), sortW = sortWidth();
+  const vector<float> fw = footerWidths();
+  float footW = 0; for (float w : fw) footW += w + 8;
+  const float titleW = roundf(10 + 12 + gfx::textWidth("SW2PS2", 26, gfx::BOLD) + 24);  // accent bar, title, space before the tabs
+  const float headW = titleW + tabsW + divGap + SEARCH_MIN + gap + sortW;
+  const float winW = std::min((float)gfx::UI_W - 24, std::max({960.0f, headW + 2 * padX + 16, footW + 2 * padX + 16})), innerW = winW - 2 * padX;  // (+16: the scroll bar's gutter)
   int VIS = std::max(1, std::min((int)roms.size(), maxRows()));
-  if (selected < top) top = selected;
-  if (selected >= top + VIS) top = selected - VIS + 1;
+  if (!touchScrolled) {
+    if (selected < top) top = selected;
+    if (selected >= top + VIS) top = selected - VIS + 1;
+  }
   if (top > std::max(0, (int)roms.size() - VIS)) top = std::max(0, (int)roms.size() - VIS);
   string empty;
-  if (roms.empty()) {
-    if (listView == 1) empty = "No favourites yet.\n\nWhile playing, open the menu (L + R + both stick clicks) and set Favourite to On.";
+  if (roms.empty() && !searchQuery.empty()) {
+    empty = string(listView == 1 ? "No favourites" : listView == 2 ? "No recently played games" : "No games") + " match \"" + searchQuery + "\".\n\n" +
+            "Clear the search with the \u00d7 in the search field, or press + to search for something else.";
+  } else if (roms.empty()) {
+    if (listView == 1) empty = "No favourites yet.\n\nHighlight a game in All or Recent and press - (or use the Favourite button).";
     else if (listView == 2) empty = "No recently played games yet.";
-    else empty = "No games found in\n\n    " + romDir + "\n\nCopy PS2 disc images (.iso, .chd, .cso or .cue with its .bin) there, for example over FTP with OunceShell, then choose Refresh. The folder can be changed in Settings.";
+    else empty = "No games found in\n\n    " + romDir + "\n\nCopy PS2 disc images (.iso, .chd, .cso or .cue with its .bin) there, or into folders inside it, for example over FTP, then choose Refresh. The folder can be changed in Settings.";
   }
   float listInnerW = innerW - 16;  // the scrollbar's gutter always kept: the list never changes width
   vector<string> emptyLines = empty.empty() ? vector<string>() : wrap(empty, listInnerW - 32, 17);
-  // One size whatever the tab or the number of games: as many rows as fit the screen.
   float listH = maxRows() * ROW_H + 12;
   float head = LIST_HEAD;
-  float winH = padY * 2 + 34 + 12 + 36 + 10 + head + listH + 12 + 40;
+  const float footH = btnH() + 14;
+  float winH = padY * 2 + tabRowH() + 10 + head + listH + 12 + footH;
   float x = (gfx::UI_W - winW) / 2, y = roundf((gfx::UI_H - winH) / 2);
   gfx::rect(x, y, winW, winH, col(C_PANEL), 14, 1, col(C_LINE));
   float cx = x + padX, cy = y + padY;
-  panelHeader(cx, cy, "SW2PS2", roms.empty() ? "" : std::to_string(roms.size()) + (roms.size() == 1 ? " game" : " games"));
-  cy += 34 + 12;
-  const string sortHint = string(singleJoyConConnected ? "Press stick: " : "Press Left Stick: ") + ROM_SORT_LABELS[romSortByView[listView]];
-  textMid(sortHint, cx + innerW - gfx::textWidth(sortHint, 16), cy, 36, 16, col(C_DIM));
-  drawTabBar(cx, cy, LIST_VIEWS, listView, focusArea == "tabs" ? listView : -1);  // (L and R cycle them)
-  cy += 36 + 10;
-  // Column headings
-  // Columns from the right: Time played, Last Played, Favourite.
+  // One row: the title, tabs | search field, sort (the game count is in the list's heading, the
+  // version in Settings -> App), so the list gets the room.
+  gfx::rect(cx, cy + (tabH() - 26) / 2, 10, 26, col(C_ACCENT), 2);
+  textMid("SW2PS2", cx + 22, cy, tabH(), 26, col(C_TEXT), gfx::BOLD);
+  // Tabs | search field, sort
+  drawTabBar(cx + titleW, cy, LIST_VIEWS, listView, focusArea == "tabs" ? (headIndex < 0 ? listView : headIndex < (int)LIST_VIEWS.size() ? headIndex : -1) : -1,
+             [](int i) { if (i != listView) { listView = i; roms.clear(); orderRoms(); } focusArea = "tabs"; headIndex = -1; }, false);  // (L and R cycle them)
+  {
+    gfx::rect(roundf(cx + titleW + tabsW + divGap / 2) - 1, cy + 8, 2, tabH() - 16, col(C_LINE), 1);  // divider
+    // the search field takes the room from the divider to the sort control (right-aligned with the list's edge)
+    const float searchX = cx + titleW + tabsW + divGap, searchW = cx + listInnerW - sortW - gap - searchX;
+    float hx = searchX;
+    const bool searching = !searchQuery.empty();
+    {
+      const bool focus = focusArea == "tabs" && headIndex == (int)LIST_VIEWS.size(), lit = (footFlash == 6 && nowMs() < footFlashUntil) || touchHolding(hx, cy - 4, searchW - (searching ? 44 : 0), tabH() + 8);
+      gfx::rect(hx, cy, searchW, tabH(), lit ? col(C_ACCENT, 0.35f) : focus ? col(C_SEL) : col(C_BG), BTN_RADIUS, focus || lit ? 2 : 1, col(searching || focus || lit ? C_ACCENT : C_LINE));
+    }
+    const float clearW = searching ? 52 : 0;  // the x: a 30 circle, 14 in from the field's right edge (clear of its rounded corner)
+    const string shown = searching ? searchQuery : "Search games";
+    textMid("+", hx + 18, cy, tabH(), BUB + 2, col(C_DIM), gfx::BOLD);
+    textMid(gfx::ellipsize(shown, searchW - 46 - clearW - 16, BUB), hx + 42, cy, tabH(), BUB, col(searching ? C_TEXT : C_DIM));
+    addHit(hx, cy - 4, searchW - clearW, tabH() + 8, [] { pressFooter(6); });
+    if (searching) {  // clear
+      const float bx = hx + searchW - clearW;
+      const bool cf = focusArea == "tabs" && headIndex == (int)LIST_VIEWS.size() + 1,
+                 cl = (footFlash == 8 && nowMs() < footFlashUntil) || touchHolding(bx - 4, cy - 4, clearW + 8, tabH() + 8);
+      const float d = 30, ox = hx + searchW - 14 - d, oy = roundf(cy + (tabH() - d) / 2);
+      gfx::rect(ox, oy, d, d, cl ? col(C_ACCENT) : cf ? col(C_ACCENT, 0.6f) : col(C_LINE), d / 2, cf ? 2 : 0, col(C_TEXT));
+      textMid("\u00d7", ox + (d - gfx::textWidth("\u00d7", 21)) / 2, oy, d, 21, col(C_TEXT));
+      addHit(bx - 4, cy - 4, clearW + 8, tabH() + 8, [] { pressFooter(8); });
+    }
+    hx += searchW + gap;
+    const string sortT = "Sort: " + ROM_SORT_LABELS[romSortByView[listView]];
+    {
+      const bool focus = focusArea == "tabs" && headIndex == (int)LIST_VIEWS.size() + 2, lit = (footFlash == 7 && nowMs() < footFlashUntil) || touchHolding(hx, cy - 4, sortW, tabH() + 8);
+      gfx::rect(hx, cy, sortW, tabH(), lit ? col(C_ACCENT, 0.35f) : focus ? col(C_SEL) : Color{0, 0, 0, 0}, BTN_RADIUS, focus || lit ? 2 : 1, col(focus || lit ? C_ACCENT : C_LINE));
+    }
+    textMid(sortT, hx + (sortW - gfx::textWidth(sortT, BUB)) / 2, cy, tabH(), BUB, col(C_DIM));
+    addHit(hx, cy - 4, sortW, tabH() + 8, [] { pressFooter(7); });
+  }
+  cy += tabRowH() + 10;
+  // Columns from the right: Time Played, Last Played, Favourite.
   const float metadataW = 128;
   const float timeC = cx + listInnerW - 18 - metadataW / 2;
   const float playedC = timeC - metadataW, favC = playedC - metadataW;
   if (!roms.empty()) {
-    gfx::text("Game", cx + 22, cy + 1, 14, col(C_DIM), gfx::BOLD);
-    gfx::text("Time Played", timeC - gfx::textWidth("Time Played", 14, gfx::BOLD) / 2, cy + 1, 14, col(C_DIM), gfx::BOLD);
-    gfx::text("Last Played", playedC - gfx::textWidth("Last Played", 14, gfx::BOLD) / 2, cy + 1, 14, col(C_DIM), gfx::BOLD);
-    gfx::text("Favourite", favC - gfx::textWidth("Favourite", 14, gfx::BOLD) / 2, cy + 1, 14, col(C_DIM), gfx::BOLD);
+    const string gameHead = searchQuery.empty() ? "Game (" + std::to_string(roms.size()) + ")" : "Game (" + std::to_string(roms.size()) + " matching)";
+    gfx::text(gameHead, cx + 22, cy + 1, headText(), col(C_DIM), gfx::BOLD);
+    gfx::text("Time Played", timeC - gfx::textWidth("Time Played", headText(), gfx::BOLD) / 2, cy + 1, headText(), col(C_DIM), gfx::BOLD);
+    gfx::text("Last Played", playedC - gfx::textWidth("Last Played", headText(), gfx::BOLD) / 2, cy + 1, headText(), col(C_DIM), gfx::BOLD);
+    gfx::text("Favourite", favC - gfx::textWidth("Favourite", headText(), gfx::BOLD) / 2, cy + 1, headText(), col(C_DIM), gfx::BOLD);
   }
   cy += head;  // (kept with no games too: the window keeps its size)
-  // List
   gfx::rect(cx, cy, listInnerW, listH, col(C_BG), 10, 1, col(C_LINE));
   if (roms.empty()) {
     float ly = cy + 16;
-    for (auto& l : emptyLines) { gfx::text(l, cx + 16, ly, 17, col(C_TEXT)); ly += 17 * 1.45f; }
+    for (auto& l : emptyLines) { glyphText(l, cx + 16, ly, 17, col(C_TEXT)); ly += 17 * 1.45f; }
   } else {
+    addHit(cx, cy, listInnerW, listH, nullptr, [VIS](int rows) {  // drag: the page scrolls
+      top = std::max(0, std::min(std::max(0, (int)roms.size() - VIS), top + rows)); touchScrolled = true;
+    });
     gfx::clip((int)cx, (int)cy, (int)listInnerW, (int)listH);
     for (int i = 0; i < VIS && top + i < (int)roms.size(); i++) {
       const Rom& r = roms[top + i];
       float ry = cy + 6 + i * ROW_H, rx = cx + 6, rw = listInnerW - 12;
-      bool active = top + i == selected && focusArea == "list";
+      bool active = (top + i == selected && focusArea == "list") || touchHolding(cx + 6, cy + 6 + i * ROW_H, listInnerW - 12, ROW_H);
       if (active) { gfx::rect(rx, ry, rw, ROW_H, col(C_SEL), 6); gfx::rect(rx, ry, 4, ROW_H, col(C_ACCENT), 2); }
+      else if (top + i == selected && focusArea == "buttons") gfx::rect(rx, ry, 4, ROW_H, col(C_DIM), 2);  // the game Play / Favourite act on
+      {  // tap: select, then start; the Favourite column toggles the mark
+        const int idx = top + i; const string nm = r.name;
+        addHit(rx, ry, rw, ROW_H, [idx] { if (focusArea == "list" && selected == idx) touchPress |= B_A; else { focusArea = "list"; selected = idx; } });
+        addHit(favC - metadataW / 2, ry, metadataW, ROW_H, [nm, idx] { focusArea = "list"; selected = idx; toggleFavourite(nm); });
+      }
       bool fav = contains(favourites, r.name);
       string played = playLabel(r.name);
-      if (!played.empty()) textMid(played, timeC - gfx::textWidth(played, 16) / 2, ry, ROW_H, 16, col(C_DIM));
+      if (!played.empty()) textMid(played, timeC - gfx::textWidth(played, rowSmall()) / 2, ry, ROW_H, rowSmall(), col(C_DIM));
       if (fav) {
-        float tw = gfx::textWidth("Favourite", 14) + 16;
-        gfx::rect(favC - tw / 2, ry + 9, tw, 22, gfx::rgb(0xf2c94c), 4);
-        textMid("Favourite", favC - tw / 2 + 8, ry + 9, 22, 14, gfx::rgb(0x1a1300));
+        const float ft = touchControls ? 16 : 14, th = touchControls ? 28 : 24;
+        float tw = gfx::textWidth("Favourite", ft) + 16;
+        const float ty = roundf(ry + (ROW_H - th) / 2.0f);  // centred in the row, whatever its height
+        gfx::rect(favC - tw / 2, ty, tw, th, gfx::rgb(0xf2c94c), 4);
+        textMid("Favourite", favC - tw / 2 + 8, ty, th, ft, gfx::rgb(0x1a1300));
       }
       const string& date = lastPlayedLabel(r.name);
-      if (!date.empty()) textMid(date, playedC - gfx::textWidth(date, 16) / 2, ry, ROW_H, 16, col(C_DIM));
-      textMid(gfx::ellipsize(stripNes(r.name), favC - metadataW / 2 - rx - 28, 20), rx + 16, ry, ROW_H, 20, col(C_TEXT));
+      if (!date.empty()) textMid(date, playedC - gfx::textWidth(date, rowSmall()) / 2, ry, ROW_H, rowSmall(), col(C_DIM));
+      textMid(gfx::ellipsize(stripNes(r.name), favC - metadataW / 2 - rx - 28, rowText()), rx + 16, ry, ROW_H, rowText(), col(C_TEXT));
     }
     gfx::noClip();
-    scrollbar(cx + listInnerW + 8, cy, listH, (int)roms.size(), VIS, top);
+    scrollbar(cx + listInnerW + 8 - (barW() - 8) / 2, cy, listH, (int)roms.size(), VIS, top, &top);
   }
   cy += listH + 12;
-  // Buttons
-  float bw = (innerW - 30) / 3;
-  for (int i = 0; i < 3; i++) {
-    bool on = focusArea == "buttons" && i == btnIndex;
-    float bx = cx + 5 + i * (bw + 10);
-    string label = i == 2 && exitArmed ? "Confirm exit" : BROWSER_BUTTONS[i];
-    gfx::rect(bx, cy, bw, 40, col(on ? C_SEL : C_BG), 8, 1, col(on ? C_ACCENT : C_LINE));
-    float tw = gfx::textWidth(label, 18), kw = 24, lx = bx + (bw - tw - kw - 8) / 2;
-    gfx::rect(lx, cy + 8, kw, kw, col(C_LINE), kw / 2);  // shortcut button badge
-    if (singleJoyConConnected) drawFaceGlyph(BROWSER_KEYS[i], lx + (kw - glyphWidth(17)) / 2, cy + 8 + (kw - 17 * 1.25f) / 2, 17, col(C_TEXT));
-    else { const string k(1, "ABXY"[BROWSER_KEYS[i]]); float kt = gfx::textWidth(k, 15); textMid(k, lx + (kw - kt) / 2, cy + 8, kw, 15, col(C_TEXT)); }
-    textMid(label, lx + kw + 8, cy, 40, 18, col(i == 2 && exitArmed ? C_ACCENT : C_TEXT));
+  // Footer: button legends, right-aligned, each one place and one size
+  gfx::rect(cx, cy - 2, listInnerW, 1, col(C_LINE));
+  const bool hasGame = selected < (int)roms.size();
+  const vector<Legend> legends = {
+      {"{A}", "Play", [] { if (selected < (int)roms.size()) pressFooter(0); }, false},
+      {"-", "Favourite", [] { if (selected < (int)roms.size()) pressFooter(1); }, false},
+      {"+", "Search", [] { pressFooter(2); }, false},
+      {"{Y}", "Settings", [] { pressFooter(3); }, false},
+      {"{X}", "Refresh", [] { pressFooter(4); }, false},
+      {"{B}", exitArmed ? "Confirm exit" : "Exit", [] { pressFooter(5); }, exitArmed != 0}};
+  // Each legend is as wide as its longest label (a label change never moves anything); the same
+  // space before, between and after them, so the row is evenly spaced and centred on the game list.
+  float sumW = 0; for (float w : fw) sumW += w;
+  const float g = std::max(4.0f, (listInnerW - sumW) / (legends.size() + 1));
+  const float ly = roundf(cy + (footH - btnH()) / 2 + 2);
+  float lx0 = cx + g;
+  for (size_t i = 0; i < legends.size(); i++) {
+    const Legend& L = legends[i];
+    const bool dim = (i == 0 || i == 1) && !hasGame;
+    const float bw = fw[i], lx = roundf(lx0);
+    lx0 += bw + g;
+    const bool focus = focusArea == "buttons" && btnIndex == (int)i, flash = (footFlash == (int)i && nowMs() < footFlashUntil) || touchHolding(lx - g / 2, ly - 4, bw + g, btnH() + 8);
+    gfx::rect(lx, ly, bw, btnH(), flash ? col(C_ACCENT) : focus || L.lit ? col(C_SEL) : col(C_BG), BTN_RADIUS, focus ? 2 : 1,
+              col(flash || focus || L.lit ? C_ACCENT : C_LINE));
+    const float kw = 30, kx = lx + (bw - (kw + 10 + gfx::textWidth(L.label, BTN_TEXT))) / 2, ky = ly + (btnH() - kw) / 2;
+    gfx::rect(kx, ky, kw, kw, col(dim ? C_LINE : C_DIM), kw / 2);
+    const string k = L.key;
+    if (k[0] == '{' && singleJoyConConnected) drawFaceGlyph(glyphToken(k, 0), kx + (kw - glyphWidth(20)) / 2, ky + (kw - 20 * 1.25f) / 2, 20, col(C_PANEL));
+    else { const string t = k[0] == '{' ? string(1, k[1]) : k; textMid(t, kx + (kw - gfx::textWidth(t, 18, gfx::BOLD)) / 2, ky, kw, 18, col(C_PANEL), gfx::BOLD); }
+    textMid(L.label, kx + kw + 10, ly, btnH(), BTN_TEXT, flash ? col(C_PANEL) : col(dim ? C_DIM : L.lit ? C_ACCENT : C_TEXT));
+    addHit(lx - g / 2, ly - 4, bw + g, btnH() + 8, L.tap);
   }
-  gfx::text("v" APP_VERSION, x + winW - padX - gfx::textWidth("v" APP_VERSION, 14), y + padY + 10, 14, col(C_DIM));
 }
 
-static const int SET_ROW_H = ROW_H;  // as the game list's rows
+#define SET_ROW_H ROW_H  // as the game list's rows (live: follows Larger spacing for touch)
 static void drawFolderPicker() {
-  const float winW = 960, padX = 20, padY = 18, rowH = 34;
+  const float winW = 960, padX = 20, padY = 18, rowH = touchControls ? 72 : 34;
   int total = pickRows();
   int vis = std::max(5, std::min(total, (int)((gfx::UI_H * 0.9 - 36 - 50 - 40 - 14) / rowH)));
-  if (pickSel < pickTop) pickTop = pickSel;
-  if (pickSel >= pickTop + vis) pickTop = pickSel - vis + 1;
+  if (!touchScrolled) {
+    if (pickSel < pickTop) pickTop = pickSel;
+    if (pickSel >= pickTop + vis) pickTop = pickSel - vis + 1;
+  }
+  pickTop = std::max(0, std::min(std::max(0, total - vis), pickTop));
   bool scroll = total > vis;
   float listW = winW - 2 * padX - (scroll ? 16 : 0), listH = vis * rowH + 12;
   float winH = padY * 2 + 34 + 12 + 30 + listH;
   float x = (gfx::UI_W - winW) / 2, y = roundf((gfx::UI_H - winH) / 2);
   gfx::rect(x, y, winW, winH, col(C_PANEL), 14, 1, col(C_LINE));
+  addHit(0, 0, gfx::UI_W, gfx::UI_H, [] { touchPress |= B_B; });  // outside: cancel
+  addHit(x, y, winW, winH, [] {});
   float cx = x + padX, cy = y + padY;
   panelHeader(cx, cy, pickForBios ? "BIOS folder" : "ROM folder", "{A}: open   {B}: cancel");
   cy += 34 + 12;
@@ -2197,29 +2404,32 @@ static void drawFolderPicker() {
   gfx::rect(cx, cy, listW, listH, col(C_BG), 10, 1, col(C_LINE));
   for (int k = 0; k < vis && pickTop + k < total; k++) {
     int i = pickTop + k;
-    bool active = i == pickSel;
+    bool active = i == pickSel || touchHolding(cx + 6, cy + 6 + k * rowH, listW - 12, rowH);
     float rx = cx + 6, ry = cy + 6 + k * rowH, rw = listW - 12;
     if (active) { gfx::rect(rx, ry, rw, rowH, col(C_SEL), 6); gfx::rect(rx, ry, 4, rowH, col(C_ACCENT), 2); }
+    addHit(rx, ry, rw, rowH, [i] { if (pickSel == i) touchPress |= B_A; else pickSel = i; });
     string label; Color c = col(C_TEXT);
     int up = pickAtRoot() ? 0 : 1;
     if (i == 0) { label = "Use this folder"; c = gfx::rgb(0x6ee26e); }
     else if (up && i == 1) label = ".. (up one level)";
     else label = pickDirs[i - 1 - up] + "/";
-    textMid(gfx::ellipsize(label, rw - 32, 18), rx + 16, ry, rowH, 18, c, i == 0 ? gfx::BOLD : gfx::REGULAR);
+    textMid(gfx::ellipsize(label, rw - 32, touchControls ? 22 : 18), rx + 16, ry, rowH, touchControls ? 22 : 18, c, i == 0 ? gfx::BOLD : gfx::REGULAR);
   }
-  scrollbar(cx + listW + 8, cy, listH, total, vis, pickTop);
+  addHit(cx, cy, listW, listH, nullptr, [total, vis](int rows) { pickTop = std::max(0, std::min(std::max(0, total - vis), pickTop + rows)); touchScrolled = true; });
+  scrollbar(cx + listW + 8 - (barW() - 8) / 2, cy, listH, total, vis, pickTop, &pickTop);
 }
 static void drawRemap() {
   const float winW = 640, padX = 20, padY = 18, innerW = winW - 2 * padX, rowH = 34;
   const bool done = remapStep >= 16, connected = padConnected(remapWho);
   const float listH = 16 * rowH + 12;
-  const float winH = padY * 2 + 34 + 12 + 30 + listH + 12 + 40;
+  const float winH = padY * 2 + 34 + 12 + 30 + listH + 12 + btnH();
   const float x = (gfx::UI_W - winW) / 2, y = roundf((gfx::UI_H - winH) / 2);
   gfx::rect(x, y, winW, winH, col(C_PANEL), 14, 1, col(C_LINE));
   float cx = x + padX, cy = y + padY;
   panelHeader(cx, cy, "Player " + std::to_string(remapWho + 1) + " buttons", remapForGame ? "for this game" : "for all games");
   cy += 34 + 12;
   string hint;
+  if (!connected) addHit(0, 0, gfx::UI_W, gfx::UI_H, [] { touchPress |= B_B; });
   if (!connected) hint = "No controller for player " + std::to_string(remapWho + 1) + " (connect one with Pair controllers). {B}: back";
   else if (!done && remapWaitRelease) hint = "Let go of all buttons...";
   else if (!done) hint = "Press the button for " + string(PS2_BUTTONS[remapStep].name) + ", or wait " +
@@ -2241,44 +2451,67 @@ static void drawRemap() {
   static const char* OPTS[3] = {"Save", "Start again", "Cancel"};
   const float bw = (innerW - 20) / 3;
   for (int i = 0; i < 3; i++) {
-    const bool on = done && i == remapPick;
+    const bool on = (done && i == remapPick) || (done && touchHolding(cx + i * (bw + 10), cy - 6, bw, btnH() + 12));
     const float bx = cx + i * (bw + 10);
-    gfx::rect(bx, cy, bw, 40, col(on ? C_SEL : C_BG), 8, 1, col(on ? C_ACCENT : C_LINE));
-    const float tw = gfx::textWidth(OPTS[i], 18);
-    textMid(OPTS[i], bx + (bw - tw) / 2, cy, 40, 18, col(done ? C_TEXT : C_DIM));
+    if (done) addHit(bx, cy - 6, bw, btnH() + 12, [i] { remapPick = i; touchPress |= B_A; });
+    gfx::rect(bx, cy, bw, btnH(), col(on ? C_SEL : C_BG), BTN_RADIUS, 1, col(on ? C_ACCENT : C_LINE));
+    const float tw = gfx::textWidth(OPTS[i], BTN_TEXT);
+    textMid(OPTS[i], bx + (bw - tw) / 2, cy, btnH(), BTN_TEXT, col(done ? C_TEXT : C_DIM));
   }
 }
 static void drawSettings() {
-  const float winW = 640, padX = 20, padY = 18, innerW = winW - 2 * padX;
+  // As wide as its tabs need (with their L / R caps), at least 640.
+  const float padX = 20, padY = 18, winW = std::max(640.0f, equalTabsWidth(SETTINGS_CATS) + BACK_GAP + BACK_W + 2 * padX + 16), innerW = winW - 2 * padX;
   int n = (int)SETTINGS_ITEMS.size(), total = n + 1;
   // One size for every category (the largest, advanced shown); more rows than fit the screen scroll.
-  int vis = std::max(5, std::min(std::max(total, settingsFixedRows()), (int)((gfx::UI_H * 0.9 - 36 - 50 - 14 - 46) / SET_ROW_H)));
-  if (settingsIndex >= 0 && settingsIndex < settingsTop) settingsTop = settingsIndex;
-  if (settingsIndex < 0) settingsTop = 0;
-  if (settingsIndex >= settingsTop + vis) settingsTop = settingsIndex - vis + 1;
+  int vis = std::max(5, std::min(std::max(total, settingsFixedRows()), (int)((gfx::UI_H * 0.94 - 36 - 50 - 14 - tabRowH() - 10) / SET_ROW_H)));
+  if (!touchScrolled) {
+    if (settingsIndex >= 0 && settingsIndex < settingsTop) settingsTop = settingsIndex;
+    if (settingsIndex < 0) settingsTop = 0;
+    if (settingsIndex >= settingsTop + vis) settingsTop = settingsIndex - vis + 1;
+  }
+  settingsTop = std::max(0, std::min(std::max(0, total - vis), settingsTop));
   float listW = innerW - 16, listH = vis * SET_ROW_H + 12;  // (scrollbar gutter always kept)
-  float winH = padY * 2 + 34 + 12 + 36 + 10 + listH;
+  float winH = padY * 2 + 34 + 12 + tabRowH() + 10 + listH;
   float x = (gfx::UI_W - winW) / 2, y = roundf((gfx::UI_H - winH) / 2);
   gfx::rect(x, y, winW, winH, col(C_PANEL), 14, 1, col(C_LINE));
   float cx = x + padX, cy = y + padY;
+  addHit(0, 0, gfx::UI_W, gfx::UI_H, [] { touchPress |= B_B; });  // outside the window: back to the game list
+  addHit(x, y, winW, winH, [] {});
   panelHeader(cx, cy, "Settings", "for all games");
+
   cy += 34 + 12;
-  drawTabBar(cx, cy, SETTINGS_CATS, settingsCat, settingsIndex < 0 ? settingsCat : -1);
-  cy += 36 + 10;
+  drawTabBar(cx, cy, SETTINGS_CATS, settingsCat, settingsIndex < 0 && !settingsOnBack ? settingsCat : -1,
+             [](int i) { if (i != settingsCat) { settingsCat = i; resetArmed = false; rebuildSettings(); settingsTop = 0; } settingsIndex = -1; settingsOnBack = false; }, false,
+             listW - BACK_GAP - BACK_W);
+  drawTabBack(cx, listW, cy, settingsIndex < 0 && settingsOnBack, [] { touchPress |= B_B; });
+  cy += tabRowH() + 10;
   gfx::rect(cx, cy, listW, listH, col(C_BG), 10, 1, col(C_LINE));
+  addHit(cx, cy, listW, listH, nullptr, [total, vis](int rows) { settingsTop = std::max(0, std::min(std::max(0, total - vis), settingsTop + rows)); touchScrolled = true; });
   for (int k = 0; k < vis; k++) {
     int i = settingsTop + k;
     if (i >= total) break;
-    bool active = i == settingsIndex;
+    bool active = i == settingsIndex || touchHolding(cx + 6, cy + 6 + k * SET_ROW_H, listW - 12, SET_ROW_H);
     float rx = cx + 6, ry = cy + 6 + k * SET_ROW_H, rw = listW - 12;
     if (active) { gfx::rect(rx, ry, rw, SET_ROW_H, col(C_SEL), 6); gfx::rect(rx, ry, 4, SET_ROW_H, col(C_ACCENT), 2); }
+    // tap: select, then act (A); on a value, its left half goes back, its right half forward
+    addHit(rx, ry, rw, SET_ROW_H, [i] { if (settingsIndex == i) touchPress |= B_A; else settingsIndex = i; });
     if (i < n) {
-      textMid(SETTINGS_ITEMS[i].label, rx + 16, ry, SET_ROW_H, 20, col(C_TEXT));
+      textMid(SETTINGS_ITEMS[i].label, rx + 16, ry, SET_ROW_H, rowText(), col(C_TEXT));
       vector<string> ch = SETTINGS_ITEMS[i].choices();
-      valueBox(ch[SETTINGS_ITEMS[i].get()], rx + rw - 12, ry, SET_ROW_H, 20, active);
-    } else textMid("Back", rx + 16, ry, SET_ROW_H, 20, col(C_TEXT));
+      if (!SETTINGS_ITEMS[i].set) {  // information only (Version)
+        const string& v = ch[0];
+        textMid(v, rx + rw - 12 - gfx::textWidth(v, rowText()), ry, SET_ROW_H, rowText(), col(C_DIM));
+        continue;
+      }
+      const float vw = valueBox(ch[SETTINGS_ITEMS[i].get()], rx + rw - 12, ry, SET_ROW_H, rowText(), active);
+      if (ch.size() > 1) {
+        addHit(rx + rw - 12 - vw - 10, ry, vw / 2 + 10, SET_ROW_H, [i] { settingsIndex = i; touchPress |= B_LEFT; });
+        addHit(rx + rw - 12 - vw / 2, ry, vw / 2 + 12, SET_ROW_H, [i] { settingsIndex = i; touchPress |= B_RIGHT; });
+      }
+    } else textMid("Back", rx + 16, ry, SET_ROW_H, rowText(), col(C_TEXT));
   }
-  scrollbar(cx + listW + 8, cy, listH, total, vis, settingsTop);
+  scrollbar(cx + listW + 8 - (barW() - 8) / 2, cy, listH, total, vis, settingsTop, &settingsTop);
 }
 
 static void drawStatsBar() {
@@ -2291,6 +2524,7 @@ static void drawStatsBar() {
   if (statsLevel == 3 && graphImage) gfx::imageDraw(graphImage, 26 + tw + 12, 12 + (h - GRAPH_H) / 2, GRAPH_W, GRAPH_H);
 }
 
+static void openMenu();
 static void drawGame(bool dim) {
   if (running) gfx::pictureDraw(picture, picX, picY, picW, picH, picCX, picCY, picCW, picCH);
   drawStatsBar();
@@ -2305,6 +2539,15 @@ static void drawGame(bool dim) {
     float w = gfx::textWidth(hint, 16);
     gfx::text(hint, gfx::UI_W - 16 - w, gfx::UI_H - 12 - 20, 16, gfx::rgb(0x8891a4));
   }
+  static double menuBtnUntil = 0;
+  if (running && mode == "running" && menuButtonMode == 0) addHit(0, 0, gfx::UI_W, gfx::UI_H, [] { menuBtnUntil = nowMs() + 3000; });  // a touch on the game shows the Menu button
+  if (running && mode == "running" && (menuButtonMode == 1 || (menuButtonMode == 0 && nowMs() < menuBtnUntil))) {  // a Menu button to tap
+    const float w = 132, h = 64, x = gfx::UI_W - 16 - w, y = 12;
+    const bool held = touchHolding(x - 8, y - 8, w + 16, h + 16);
+    gfx::rect(x, y, w, h, held ? col(C_ACCENT, 0.7f) : gfx::Color{0, 0, 0, 0.45f}, BTN_RADIUS, 1, gfx::rgb(0xffffff, held ? 0.8f : 0.35f));
+    textMid("Menu", x + (w - gfx::textWidth("Menu", 18)) / 2, y, h, 18, gfx::rgb(0xffffff, 0.8f));
+    addHit(x - 8, y - 8, w + 16, h + 16, [] { if (mode == "running") openMenu(); });
+  }
 }
 
 static void drawMenu() {
@@ -2312,14 +2555,16 @@ static void drawMenu() {
   // The game list's and Settings' layout: accent-bar title, tabs, rows of ROW_H in a list box.
   // The tabbed menu is as wide as Settings and keeps one size (its largest category); other menus
   // (cheats) fit their rows.
-  const float panelW = menuHasTabs ? 640 : 460, padX = 20, padY = 18, innerW = panelW - 2 * padX;
-  const float tabsH = menuHasTabs ? 36 + 10 : 0;
+  const float padX = 20, padY = 18, panelW = menuHasTabs ? std::max(640.0f, equalTabsWidth(MENU_CATS) + BACK_GAP + BACK_W + 2 * padX + 16) : 460, innerW = panelW - 2 * padX;
+  const float tabsH = menuHasTabs ? tabRowH() + 10 : 0;
   int n = (int)menuItems.size();
-  const int fit = (int)((gfx::UI_H * 0.9f - padY * 2 - 34 - 12 - tabsH - 12) / ROW_H);
+  const int fit = (int)((gfx::UI_H * 0.94f - padY * 2 - 34 - 12 - tabsH - 12) / ROW_H);
   int vis = std::max(4, std::min(menuHasTabs ? std::max(n, menuFixedRows()) : n, fit));
-  if (menuIndex >= 0 && menuIndex < menuTop) menuTop = menuIndex;
-  if (menuIndex < 0) menuTop = 0;
-  if (menuIndex >= menuTop + vis) menuTop = menuIndex - vis + 1;
+  if (!touchScrolled) {
+    if (menuIndex >= 0 && menuIndex < menuTop) menuTop = menuIndex;
+    if (menuIndex < 0) menuTop = 0;
+    if (menuIndex >= menuTop + vis) menuTop = menuIndex - vis + 1;
+  }
   if (menuTop > n - vis) menuTop = std::max(0, n - vis);
   const bool gutter = menuHasTabs || n > vis;  // (tabbed: the scrollbar's gutter always kept)
   float listW = innerW - (gutter ? 16 : 0), listH = vis * ROW_H + 12;
@@ -2329,19 +2574,32 @@ static void drawMenu() {
   float cx = x + padX, cy = y + padY;
   panelHeader(cx, cy, gfx::ellipsize(menuTitle, innerW - 20, 26, gfx::BOLD), "");
   cy += 34 + 12;
-  if (menuHasTabs) { drawTabBar(cx, cy, MENU_CATS, menuCat, menuIndex < 0 ? menuCat : -1); cy += tabsH; }
+  addHit(0, 0, gfx::UI_W, gfx::UI_H, [] { touchPress |= B_B; });  // outside the panel: close / back
+  addHit(x, y, panelW, h, [] {});
+  if (menuHasTabs) {
+    drawTabBar(cx, cy, MENU_CATS, menuCat, menuIndex < 0 && !menuOnBack ? menuCat : -1, [](int i) { if (i != menuCat) { menuCat = i; openMenu(); } menuIndex = -1; menuOnBack = false; }, false,
+               listW - BACK_GAP - BACK_W);
+    drawTabBack(cx, listW, cy, menuIndex < 0 && menuOnBack, [] { touchPress |= B_B; });
+    cy += tabsH;
+  }
+  addHit(cx, cy, listW, listH, nullptr, [n, vis](int rows) { menuTop = std::max(0, std::min(std::max(0, n - vis), menuTop + rows)); touchScrolled = true; });
   gfx::rect(cx, cy, listW, listH, col(C_BG), 10, 1, col(C_LINE));
   for (int k = 0; k < vis && menuTop + k < n; k++) {
     int i = menuTop + k;
-    bool active = i == menuIndex;
+    bool active = i == menuIndex || touchHolding(cx + 6, cy + 6 + k * ROW_H, listW - 12, ROW_H);
     float rx = cx + 6, ry = cy + 6 + k * ROW_H, rw = listW - 12;
     if (active) { gfx::rect(rx, ry, rw, ROW_H, col(C_SEL), 6); gfx::rect(rx, ry, 4, ROW_H, col(C_ACCENT), 2); }
     const MenuItem& m = menuItems[i];
     float vw = 0;
-    if (m.option()) { vector<string> ch = m.choices(); int v = m.get(); vw = valueBox(ch[std::max(0, std::min((int)ch.size() - 1, v))], rx + rw - 12, ry, ROW_H, 20, active) + 16; }
-    textMid(gfx::ellipsize(m.label, rw - 28 - vw, 20), rx + 16, ry, ROW_H, 20, col(C_TEXT));
+    addHit(rx, ry, rw, ROW_H, [i] { if (menuIndex == i) touchPress |= B_A; else menuIndex = i; });
+    if (m.option()) {
+      vector<string> ch = m.choices(); int v = m.get(); vw = valueBox(ch[std::max(0, std::min((int)ch.size() - 1, v))], rx + rw - 12, ry, ROW_H, rowText(), active) + 16;
+      addHit(rx + rw - 12 - vw - 4, ry, vw / 2 + 4, ROW_H, [i] { menuIndex = i; touchPress |= B_LEFT; });
+      addHit(rx + rw - 12 - vw / 2, ry, vw / 2 + 12, ROW_H, [i] { menuIndex = i; touchPress |= B_RIGHT; });
+    }
+    textMid(gfx::ellipsize(m.label, rw - 28 - vw, rowText()), rx + 16, ry, ROW_H, rowText(), col(C_TEXT));
   }
-  if (n > vis) scrollbar(cx + listW + 8, cy, listH, n, vis, menuTop);
+  scrollbar(cx + listW + 8 - (barW() - 8) / 2, cy, listH, n, vis, menuTop, &menuTop);
 }
 
 static void drawMessage() {
@@ -2353,6 +2611,7 @@ static void drawMessage() {
   float cy = y + 30;
   for (auto& l : lines) { textMid(l, x + 30, cy, lh, 22, col(C_TEXT)); cy += lh; }
   glyphText("Press {A} or {B} to continue", x + 30, cy + 18 - 2, 18, col(C_DIM));
+  addHit(0, 0, gfx::UI_W, gfx::UI_H, [] { touchPress |= B_A; });
 }
 
 static void drawToast() {
@@ -3205,57 +3464,116 @@ static void updateVibration(bool active) {
   }
 }
 
+// Touches: a tap (lifted within ~20 px of where it went down) calls the topmost hit under it; a
+// drag that starts on a hit with a drag action moves it by rows. Touch is in 1280 x 720 panel
+// points, the interface in UI_W x UI_H.
+static void touchUpdate() {
+  static bool down = false, dragging = false;
+  static float sx = 0, sy = 0, lx = 0, ly = 0, acc = 0;
+  static int dragHit = -1;
+  HidTouchScreenState st{};
+  const bool now = hidGetTouchScreenStates(&st, 1) && st.count > 0;
+  const float x = now ? st.touches[0].x * (float)gfx::UI_W / 1280.0f : lx, y = now ? st.touches[0].y * (float)gfx::UI_H / 720.0f : ly;
+  // the topmost hit under a point that taps (or drags)
+  auto hitAt = [](float px, float py, bool drag) { for (int i = (int)hits.size() - 1; i >= 0; i--) { const Hit& h = hits[i]; if ((drag ? (bool)h.drag : (bool)h.tap) && px >= h.x && px < h.x + h.w && py >= h.y && py < h.y + h.h) return i; } return -1; };
+  touchIsDown = now; touchX = x; touchY = y;
+  if (now && !down) { touchStartX = x; touchStartY = y; }
+  touchDragging = dragging || (now && down && (fabsf(x - sx) >= 20 || fabsf(y - sy) >= 20));
+  if (now && !down && debugLog) record("touch: down at panel %u, %u (UI %.0f, %.0f)", st.touches[0].x, st.touches[0].y, x, y);
+  if (now && !down) { down = true; dragging = false; sx = lx = x; sy = ly = y; acc = 0; dragHit = hitAt(x, y, true); }
+  else if (now) {
+    if (!dragging && dragHit >= 0 && fabsf(y - sy) > 20) dragging = true;
+    if (dragging && dragHit >= 0 && dragHit < (int)hits.size()) {
+      acc += y - ly;
+      const int rows = (int)(acc / ROW_H);
+      if (rows) { acc -= rows * ROW_H; hits[dragHit].drag(-rows); }
+    }
+    lx = x; ly = y;
+  } else if (down) {
+    down = false;
+    if (!dragging && fabsf(lx - sx) < 20 && fabsf(ly - sy) < 20) { const int i = hitAt(lx, ly, false); if (i >= 0) { tapThisFrame = true; auto f = hits[i].tap; f(); } }
+  }
+}
 static void handleUi(u64 bits) {
   Nav ev = navEvents(bits);
+  if (ev.up || ev.down || (ev.pressed & (B_A | B_B | B_LEFT | B_RIGHT | B_L | B_R))) touchScrolled = false;
+  ev.pressed |= touchPress; ev.up |= touchUp; ev.down |= touchDown;
+  touchPress = 0; touchUp = touchDown = false;
+  struct ClearTap { ~ClearTap() { tapThisFrame = false; } } clearTap;  // (whichever way handleUi returns)
   u64 pressed = ev.pressed;
   double t = nowMs();
   if (mode == "browser") {
-    if (pressed & (HidNpadButton_StickL | (singleJoyConConnected ? (u64)HidNpadButton_StickR : 0))) {
-      exitArmed = 0;
-      int& romSort = romSortByView[listView];
-      romSort = (romSort + 1) % ROM_SORT_LABELS.size();
-      orderRoms();
-      saveSettings();
+    if (footPending >= 0) {  // a footer button was used: its action runs when its flash has shown
+      if (t < footActAt) return;
+      const int i = footPending; footPending = -1;
+      const bool game = selected < (int)roms.size();
+      switch (i) {
+        case 0: if (game) startGame(roms[selected]); break;
+        case 1: if (game) toggleFavourite(roms[selected].name); break;
+        case 2: openSearch(); if (focusArea == "list" && roms.empty()) focusArea = "tabs"; break;
+        case 3: mode = "settings"; settingsIndex = 0; settingsTop = 0; break;
+        case 4: scan(); showToast("List refreshed"); break;
+        case 6: openSearch(); if (focusArea == "list" && roms.empty()) focusArea = "tabs"; break;
+        case 7: { int& rs = romSortByView[listView]; rs = (rs + 1) % ROM_SORT_LABELS.size(); orderRoms(); saveSettings(); break; }
+        case 8: searchQuery.clear(); orderRoms(); showToast("Search cleared"); headIndex = (int)LIST_VIEWS.size(); break;
+        case 5:
+          if (exitArmed) quitApp = true;
+          else { exitArmed = t + 3000; showToast("Press Exit again to exit", 3000); }
+          break;
+      }
       return;
     }
+    if (pressed & (HidNpadButton_StickL | (singleJoyConConnected ? (u64)HidNpadButton_StickR : 0))) { exitArmed = 0; pressFooter(7); return; }
     // L/ZL and R/ZR cycle the All/Favourites/Recent tabs from anywhere.
     int tabStep = ((pressed & (B_R | HidNpadButton_ZR)) ? 1 : 0) - ((pressed & (B_L | HidNpadButton_ZL)) ? 1 : 0);
     if (tabStep) {
       int n = (int)LIST_VIEWS.size();
       listView = (listView + tabStep + n) % n; roms.clear(); orderRoms(); selected = 0;
+      if (headIndex >= 0 && headIndex < n) headIndex = listView;
       if (focusArea == "list" && roms.empty()) focusArea = "tabs";
     }
-    // Y / X: the Settings and Refresh buttons (B is Exit, below).
-    if (pressed & B_Y) { exitArmed = 0; mode = "settings"; settingsIndex = 0; settingsTop = 0; return; }
-    if (pressed & B_X) { exitArmed = 0; scan(); showToast("List refreshed"); return; }
-    if (exitArmed && (t > exitArmed || (pressed & ~(u64)(B_A | B_B)) || ev.up || ev.down || focusArea != "buttons" || btnIndex != 2)) exitArmed = 0;
+    {  // anything but Exit again (B, or A on the Exit button) disarms it
+      const u64 again = B_B | (focusArea == "buttons" && btnIndex == 5 ? (u64)B_A : 0);
+      if (exitArmed && (t > exitArmed || (pressed & ~again) || ev.up || ev.down)) exitArmed = 0;
+    }
+    // The footer buttons' own shortcuts: - Favourite, + Search, Y Settings, X Refresh, B Exit
+    // (A plays the highlighted game from the list, or presses the footer button the cursor is on).
+    const bool game = selected < (int)roms.size();
+    if (pressed & B_MINUS) { if (game) pressFooter(1); return; }
+    if (pressed & B_PLUS) { pressFooter(2); return; }
+    if (pressed & B_Y) { pressFooter(3); return; }
+    if (pressed & B_X) { pressFooter(4); return; }
+    if (pressed & B_B) { pressFooter(5); return; }
+    if (focusArea == "list" && roms.empty()) focusArea = "tabs";
+    if (focusArea != "list" && focusArea != "buttons") focusArea = "tabs";
     int VIS = std::max(1, std::min((int)roms.size(), maxRows()));
-    if (focusArea == "tabs") {
-      if (pressed & B_LEFT) { int v = std::max(0, listView - 1); if (v != listView) { listView = v; roms.clear(); orderRoms(); } }
-      if (pressed & B_RIGHT) { int v = std::min((int)LIST_VIEWS.size() - 1, listView + 1); if (v != listView) { listView = v; roms.clear(); orderRoms(); } }
-      if (ev.down) { focusArea = roms.empty() ? "buttons" : "list"; selected = 0; }
-      else if (ev.up) focusArea = "buttons";  // wraps round to the bottom
-    } else if (focusArea == "list" && !roms.empty()) {
+    if (focusArea == "tabs") {  // the header row: tabs, search, sort. Up: the buttons (wrapping round), down: the list
+      const int nTabs = (int)LIST_VIEWS.size(), SEARCH = nTabs, CLEAR = nTabs + 1, SORT = nTabs + 2;
+      const bool searching = !searchQuery.empty();
+      int h = headIndex < 0 ? listView : headIndex;
+      if (h == CLEAR && !searching) h = SEARCH;
+      if (pressed & B_LEFT) { h = std::max(0, h - 1); if (h == CLEAR && !searching) h = SEARCH; }
+      if (pressed & B_RIGHT) { h = std::min(SORT, h + 1); if (h == CLEAR && !searching) h = SORT; }
+      headIndex = h;  // moving only highlights: A switches to a tab (L / R and taps switch at once)
+      if ((pressed & B_A) && h < nTabs) { if (h != listView) { listView = h; roms.clear(); orderRoms(); } }
+      else if ((pressed & B_A) && headIndex == SEARCH) pressFooter(6);
+      else if ((pressed & B_A) && headIndex == CLEAR) pressFooter(8);
+      else if ((pressed & B_A) && headIndex == SORT) pressFooter(7);
+      else if (ev.down) { if (roms.empty()) focusArea = "buttons"; else { focusArea = "list"; selected = 0; } }
+      else if (ev.up) focusArea = "buttons";
+    } else if (focusArea == "list") {
       if (ev.up) { if (selected == 0) focusArea = "tabs"; else selected--; }
       if (ev.down) { if (selected == (int)roms.size() - 1) focusArea = "buttons"; else selected++; }
       if (pressed & B_LEFT) selected = std::max(0, selected - VIS);
       if (pressed & B_RIGHT) selected = std::min((int)roms.size() - 1, selected + VIS);
-      if ((pressed & B_A) && selected < (int)roms.size()) { startGame(roms[selected]); return; }
-    } else {
-      if (ev.up) { focusArea = roms.empty() ? "tabs" : "list"; if (!roms.empty()) selected = (int)roms.size() - 1; }
-      else if (ev.down) focusArea = "tabs";  // wraps round to the top
-      if (pressed & B_LEFT) btnIndex = std::max(0, btnIndex - 1);
-      if (pressed & B_RIGHT) btnIndex = std::min(2, btnIndex + 1);
-      if (pressed & B_A) {
-        if (btnIndex == 0) { mode = "settings"; settingsIndex = 0; settingsTop = 0; }
-        else if (btnIndex == 1) { scan(); showToast("List refreshed"); }
-        else if (exitArmed) quitApp = true;
-        else exitArmed = t + 3000;
-        return;
-      }
+      if ((pressed & B_A) && game) pressFooter(0);
+    } else {  // the footer buttons: left / right move along them, A presses one
+      if (pressed & B_LEFT) btnIndex = (btnIndex + 5) % 6;
+      if (pressed & B_RIGHT) btnIndex = (btnIndex + 1) % 6;
+      if (ev.up) { if (roms.empty()) focusArea = "tabs"; else { focusArea = "list"; selected = std::min(selected, (int)roms.size() - 1); } }
+      if (ev.down) focusArea = "tabs";  // wraps round to the top
+      if ((pressed & B_A) && (game || btnIndex > 1)) pressFooter(btnIndex);
     }
-    if (pressed & B_B) { if (exitArmed) quitApp = true; else { focusArea = "buttons"; btnIndex = 2; exitArmed = t + 3000; } }
-    if (roms.empty() && focusArea == "list") focusArea = "buttons";
   } else if (mode == "folders") {
     int total = pickRows(), up = pickAtRoot() ? 0 : 1;
     if (ev.up) pickSel = (pickSel - 1 + total) % total;
@@ -3314,17 +3632,24 @@ static void handleUi(u64 bits) {
     if (ev.up || ev.down || (pressed & B_B)) { resetArmed = false; resetMapArmed = false; }
     if (settingsIndex < 0) {  // on the category tabs, as the game list's: left / right switch straight away, down to the list
       int last = (int)SETTINGS_CATS.size() - 1;
-      int v = (pressed & B_LEFT) ? std::max(0, settingsCat - 1) : (pressed & B_RIGHT) ? std::min(last, settingsCat + 1) : settingsCat;
-      if (v != settingsCat) { settingsCat = v; rebuildSettings(); settingsTop = 0; }
-      if (ev.down) settingsIndex = 0;
-      else if (ev.up) { settingsIndex = nItems; return; }  // wraps round to the bottom
+      if (settingsOnBack) {  // the row's Back button: left back to the tabs, A goes back
+        if (pressed & B_LEFT) settingsOnBack = false;
+        if (pressed & B_A) { settingsOnBack = false; saveSettings(); mode = "browser"; return; }
+      } else if ((pressed & B_RIGHT) && settingsCat == last) settingsOnBack = true;
+      else {
+        int v = (pressed & B_LEFT) ? std::max(0, settingsCat - 1) : (pressed & B_RIGHT) ? std::min(last, settingsCat + 1) : settingsCat;
+        if (v != settingsCat) { settingsCat = v; rebuildSettings(); settingsTop = 0; }
+      }
+      if (ev.down) { settingsIndex = 0; settingsOnBack = false; }
+      else if (ev.up) { settingsIndex = nItems; settingsOnBack = false; return; }  // wraps round to the bottom
       if (pressed & B_B) { saveSettings(); mode = "browser"; }
       return;
     }
-    if (ev.up) { if (settingsIndex == 0) { settingsIndex = -1; return; } settingsIndex--; }
-    if (ev.down) { if (settingsIndex >= nItems) { settingsIndex = -1; return; } settingsIndex++; }  // wraps round to the tabs
+    if (ev.up) { if (settingsIndex == 0) { settingsIndex = -1; settingsOnBack = false; return; } settingsIndex--; }
+    if (ev.down) { if (settingsIndex >= nItems) { settingsIndex = -1; settingsOnBack = false; return; } settingsIndex++; }  // wraps round to the tabs
     if (settingsIndex < nItems) {
       SettingItem it = SETTINGS_ITEMS[settingsIndex];  // copy: the advanced toggle rebuilds the list
+      if (!it.set) { if (pressed & B_B) { saveSettings(); mode = "browser"; } return; }  // information only (Version)
       int n = (int)it.choices().size();
       settingsByA = (pressed & B_A) != 0;
       if (pressed & B_LEFT) it.set((it.get() - 1 + n) % n);
@@ -3349,16 +3674,22 @@ static void handleUi(u64 bits) {
     int n = (int)menuItems.size();
     if (menuIndex < 0) {  // on the category tabs, as the game list's: left / right switch straight away, down to the list
       int last = (int)MENU_CATS.size() - 1;
-      int v = (pressed & B_LEFT) ? std::max(0, menuCat - 1) : (pressed & B_RIGHT) ? std::min(last, menuCat + 1) : menuCat;
-      if (v != menuCat) { menuCat = v; openMenu(); menuIndex = -1; return; }
-      if (ev.down) menuIndex = 0;
-      else if (ev.up && n > 0) { menuIndex = n - 1; return; }  // wraps round to the bottom
+      if (menuOnBack) {  // the row's Back button: left back to the tabs, A closes the menu
+        if (pressed & B_LEFT) menuOnBack = false;
+        if (pressed & B_A) { menuOnBack = false; closeMenu(); return; }
+      } else if ((pressed & B_RIGHT) && menuCat == last) menuOnBack = true;
+      else {
+        int v = (pressed & B_LEFT) ? std::max(0, menuCat - 1) : (pressed & B_RIGHT) ? std::min(last, menuCat + 1) : menuCat;
+        if (v != menuCat) { menuCat = v; openMenu(); menuIndex = -1; return; }
+      }
+      if (ev.down && n > 0) { menuIndex = 0; menuOnBack = false; }
+      else if (ev.up && n > 0) { menuIndex = n - 1; menuOnBack = false; return; }  // wraps round to the bottom
       if ((pressed & B_B) && mode == "menu") closeMenu();
       return;
     }
     if (menuHasTabs) {  // as the game list: up from the first row reaches the tabs, down from the last wraps to them
-      if (ev.up) { if (menuIndex == 0) { menuIndex = -1; return; } menuIndex--; }
-      if (ev.down) { if (menuIndex >= n - 1) { menuIndex = -1; return; } menuIndex++; }
+      if (ev.up) { if (menuIndex == 0) { menuIndex = -1; menuOnBack = false; return; } menuIndex--; }
+      if (ev.down) { if (menuIndex >= n - 1) { menuIndex = -1; menuOnBack = false; return; } menuIndex++; }
     } else {
       if (ev.up) menuIndex = (menuIndex - 1 + n) % n;
       if (ev.down) menuIndex = (menuIndex + 1) % n;
@@ -3426,6 +3757,7 @@ int main(int argc, char** argv) {
   PadState pad3, pad4; padInitialize(&pad3, HidNpadIdType_No3); padInitialize(&pad4, HidNpadIdType_No4);
   padStates[2] = &pad3; padStates[3] = &pad4;
   padStates[0] = &pad1; padStates[1] = &pad2;
+  hidInitializeTouchScreen();
   // (players 3-4 are set up just below)
 
   // The core's own output, per game: without the shortcut-binding noise (keyboard bindings that do not
@@ -3827,6 +4159,7 @@ int main(int argc, char** argv) {
     for (PadState* p : {&pad1, &pad2, &pad3, &pad4})
       if (padIsConnected(p)) { const u32 st = padGetStyleSet(p); if (st == HidNpadStyleTag_NpadJoyLeft || st == HidNpadStyleTag_NpadJoyRight) singleJoyConConnected = true; }
     u64 bits = padGetButtons(&pad1), bits2 = padGetButtons(&pad2), bits3 = padGetButtons(&pad3), bits4 = padGetButtons(&pad4);
+    touchUpdate();
     if (autoTest && running) bits |= autoPressBits();
     frameDrawn = false;
     const bool wasRunning = mode == "running";
@@ -3838,6 +4171,7 @@ int main(int argc, char** argv) {
       handleUi(uiBits(&pad1, bits) | uiBits(&pad2, bits2) | uiBits(&pad3, bits3) | uiBits(&pad4, bits4));  // every player's controller drives the menus
     }
     double t = nowMs();
+    hits.clear();  // drawing below registers this frame's touch targets
     if (toastUntil && t > toastUntil) toastUntil = 0;
     if (hintUntil && t > hintUntil) hintUntil = 0;
     if (gameView != (running && (mode == "running" || mode == "menu" || mode == "remap"))) gfx::beginFrame(running ? gfx::Color{0, 0, 0, 1} : col(C_BG));
