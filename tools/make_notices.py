@@ -21,7 +21,7 @@ def text(s): return ("text", s)
 # (component, what it does in SW2PS2, licence, texts)
 COMPONENTS = [
     ("OunceSX2 / ARMSX2 / PCSX2", "the PS2 emulator core", "GPL-3.0-or-later", [text("The GNU GPL v3: GPL-3.0.txt in this folder (LICENSE in the SW2PS2 source). Source: https://github.com/Rodpad/SW2PS2 with patches/ against https://github.com/nyathea/OunceSX2.")]),
-    ("OunceVK (Mesa NVK + Zink)", "Vulkan / OpenGL ES graphics driver", "MIT (Mesa)", [f(os.path.join(ROOT, "third_party/ouncevk-20261123.1/share/licenses/ouncevk/mesa-license.rst")), f(os.path.join(ROOT, "third_party/ouncevk-20261123.1/share/licenses/ouncevk/zlib-license.txt"))]),
+    ("OunceVK (Mesa NVK + Zink)", "Vulkan / OpenGL ES graphics driver", "MIT (Mesa)", [f(os.path.join(ROOT, "third_party/ouncevk-20261117.1/share/licenses/ouncevk/mesa-license.rst")), f(os.path.join(ROOT, "third_party/ouncevk-20261117.1/share/licenses/ouncevk/zlib-license.txt"))]),
     ("kaiHEN", "JIT and system services on the Switch 2", "ISC", [f(f"{DKP}/portlibs/switch2/share/licenses/kaihen/kaihen-ISC.txt")]),
     ("libounce / libnx", "Switch 2 system library", "ISC", [f(f"{DKP}/libounce/licenses/libounce-ISC.txt"), f(f"{DKP}/libounce/licenses/libnx-ISC.txt")]),
     ("FreeType", "font rendering", "FreeType Licence (FTL)", [f(f"{DKP}/portlibs/switch/licenses/switch-freetype/LICENSE.TXT"), f(f"{DKP}/portlibs/switch/licenses/switch-freetype/FTL.TXT")]),
@@ -29,6 +29,10 @@ COMPONENTS = [
     ("libpng", "PNG screenshots and images", "libpng licence", [f(f"{DKP}/portlibs/switch/licenses/switch-libpng/LICENSE")]),
     ("zlib", "compression", "zlib", [f(f"{DKP}/portlibs/switch/licenses/switch-zlib/LICENSE")]),
     ("minizip", "zip reading", "zlib", [head(f"{DKP}/portlibs/switch/include/minizip/unzip.h", r"^\*/|^\s*\*/")]),
+    ("curl", "downloading box art and game details (HTTPS)", "curl licence (MIT-style)", [f(os.path.join(ROOT, "romfs/licenses/curl-LICENSE.txt"))]),
+    ("Mbed TLS", "HTTPS for curl", "Apache-2.0 (or GPL-2.0-or-later)", [f(f"{DKP}/portlibs/switch/licenses/switch-mbedtls/LICENSE")]),
+    ("stb_image", "decoding box art (JPEG, PNG)", "MIT or public domain", [f(os.path.join(ROOT, "romfs/licenses/stb_image-MIT-or-PD.txt"))]),
+    ("Mozilla CA certificates", "checking HTTPS servers (romfs/net/cacert.pem)", "MPL-2.0", [f(os.path.join(ROOT, "romfs/licenses/ca-certificates-MPL-2.0.txt"))]),
     ("bzip2", "compression", "bzip2 licence (BSD-style)", [f(f"{DKP}/portlibs/switch/licenses/switch-bzip2/LICENSE")]),
     ("libjpeg-turbo", "JPEG images", "IJG / BSD-3-Clause / zlib", [f(os.path.join(ROOT, "third_party/ouncesx2-eval/deps-sw2/share/doc/libjpeg-turbo/LICENSE.md")), f(os.path.join(ROOT, "third_party/ouncesx2-eval/deps-sw2/share/doc/libjpeg-turbo/README.ijg"))]),
     ("SDL3", "audio and input plumbing inside the core", "zlib", [f(f"{AND}/sdl3/LICENSE.txt")]),

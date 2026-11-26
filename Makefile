@@ -10,10 +10,13 @@ endif
 TOPDIR ?= $(CURDIR)
 include $(DEVKITPRO)/libounce/switch2_rules
 # OUNCEVK: the OunceVK driver (lib/, include/) to use ahead of the devkit's portlibs copy. Default: the
-# 20261123.1 release that tools/setup_third_party.sh unpacks into third_party/ (faster at 2x; stable over
-# relaunches since the app destroys its Vulkan device and instance at exit); the devkit's copy if absent.
+# 20261117.1 release that tools/setup_third_party.sh unpacks into third_party/; the devkit's copy if absent.
 # OUNCEVK= (empty) builds with the devkit's driver.
-OUNCEVK	?=	$(wildcard $(TOPDIR)/third_party/ouncevk-20261123.1)
+# Not 20261118 or later (to 20261123.1, the latest on 2026-11-26): after about 10-20 s of rendering, returning
+# to hbmenu crashed ("There was a problem, and the software needed to close"), even with no game played;
+# 20261117.1 and the devkit's copy exit cleanly. Benchmarked equal (God of War II, Shadow of the Colossus,
+# Katamari Damacy, Vulkan 2x: the same frame rates). 20261118 added the chunk reserve (GPU-registered heap).
+OUNCEVK	?=	$(wildcard $(TOPDIR)/third_party/ouncevk-20261117.1)
 ifneq ($(strip $(OUNCEVK)),)
 OVERLAY_LIBPATHS	:=	-L$(OUNCEVK)/lib $(OVERLAY_LIBPATHS)
 CPPFLAGS	:=	-I$(OUNCEVK)/include $(CPPFLAGS)
@@ -21,7 +24,7 @@ endif
 
 APP_TITLE	:=	SW2PS2
 APP_AUTHOR	:=	Rodpad
-APP_VERSION	:=	1.3.0
+APP_VERSION	:=	1.4.0-exp.1
 
 TARGET		:=	sw2ps2
 BUILD		:=	build
@@ -70,7 +73,7 @@ AXLIBS	:=	$(AXWRAP) $(AX)/pcsx2/libPCSX2_LTO.a $(AX)/common/libcommon.a \
 		$(AX)/3rdparty/soundtouch/libpcsx2-soundtouch.a $(AX)/3rdparty/vixl/libvixl.a \
 		$(AX)/horizon-deps/libwebp/libwebp.a $(AX)/horizon-deps/libwebp/libsharpyuv.a $(AX)/horizon-deps/lz4/liblz4.a \
 		$(AX)/horizon-deps/sdl3/libSDL3.a $(AX)/3rdparty/glad/libglad.a $(if $(filter 1,$(ARMSX2_VK)),$(AX)/3rdparty/glslang/libglslang.a) $(AX)/liblibzstd_static.a $(TOPDIR)/third_party/ouncesx2-eval/deps-sw2/lib/libjpeg.a
-LIBS	:= -Wl,--wrap=pthread_create -Wl,--wrap=pthread_join -Wl,--wrap=smGetServiceWrapper -Wl,--wrap=smGetServiceOriginal -Wl,--start-group $(AXLIBS) -lEGL -lGLESv2 -lglapi -ldrm_nouveau -lkaihen -lfreetype -lharfbuzz -lpng16 -lbz2 -lminizip -lz -lnx -Wl,--end-group
+LIBS	:= -Wl,--wrap=pthread_create -Wl,--wrap=pthread_join -Wl,--wrap=smGetServiceWrapper -Wl,--wrap=smGetServiceOriginal -Wl,--start-group $(AXLIBS) -lEGL -lGLESv2 -lglapi -ldrm_nouveau -lkaihen -lfreetype -lharfbuzz -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lpng16 -lbz2 -lminizip -lz -lnx -Wl,--end-group
 LIBDIRS	:= $(PORTLIBS) $(LIBNX)
 
 ifneq ($(BUILD),$(notdir $(CURDIR)))
@@ -78,7 +81,7 @@ export OUTPUT	:=	$(CURDIR)/$(TARGET)
 export TOPDIR	:=	$(CURDIR)
 export VPATH	:=	$(foreach dir,$(SOURCES),$(CURDIR)/$(dir))
 export DEPSDIR	:=	$(CURDIR)/$(BUILD)
-CPPFILES	:=	main.cpp cores.cpp uigfx.cpp audio.cpp bridge_core.cpp
+CPPFILES	:=	main.cpp cores.cpp uigfx.cpp audio.cpp bridge_core.cpp boxart.cpp stb_image.cpp
 CPPFILES	+=	armsx2_compat.cpp armsx2_app.cpp
 ifeq ($(ARMSX2_VK),1)
 CPPFILES	+=	vkpresent.cpp

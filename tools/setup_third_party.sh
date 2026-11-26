@@ -12,7 +12,7 @@ while read -r dir url commit; do
 done < patches/upstreams.txt
 git -C third_party/ouncesx2-eval/src apply ../../../patches/ouncesx2.patch
 # The OunceVK driver release the app links (Makefile OUNCEVK), unpacked from its pacman package.
-OVK=20261123.1; OVK_SHA=c2ee3f72e5d30e745eff5b82efdaeac1ffdcfd590a1cf63bac9ecc6f9507654a
+OVK=20261117.1; OVK_SHA=061dd6a172255e272c5258578745533db043aff05e8b321d8a86850fd702ffeb  # not 20261118+: they crash on exit to hbmenu (see Makefile)
 if [ ! -d "third_party/ouncevk-$OVK/lib" ]; then
   tmp=$(mktemp -d)
   curl -fsSL -o "$tmp/ovk.pkg.tar.zst" "https://github.com/ouncebrew/ouncevk/releases/download/$OVK/ouncevk-$OVK-1-any.pkg.tar.zst"

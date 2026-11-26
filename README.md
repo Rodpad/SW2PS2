@@ -33,6 +33,12 @@ folders can be changed in Settings -> App. The app keeps its own files in `/swit
   the game is touched (Settings -> App: When touched / Always / Hidden).
 - **UI size:** Normal (larger rows and text, easier to tap; the default) or Compact, in
   Settings -> App.
+- **Box art and game details,** downloaded on the console (no account needed) from the LaunchBox
+  Games Database, matched by the disc's serial (`.iso` and `.cue`/`.bin`; other formats by file
+  name). A details panel beside the game list shows the case in 3D (drag to turn it), its back,
+  the publisher, year, genre and description (Settings -> App -> Game details panel; Download
+  missing info).
+- **Themes:** Dark, Light, Black, Blue, Purple, Red, Green, Orange, Retro and Retro Colour.
 - **Built-in speed settings** for demanding games, measured on the Switch 2 or taken from the
   community AetherSX2/NetherSX2 lists, so most games start well without tuning.
 
@@ -113,8 +119,8 @@ SW2PS2 uses the [OunceSX2](https://github.com/nyathea/OunceSX2) core with its ow
 - **Faster hand-offs between the emulated processors.** The emulated CPU no longer waits for
   memory to settle each time it hands graphics work to the vector unit or checks on the I/O
   processor, and EE interrupt scheduling skips a needless read from the I/O processor's core.
-- **Newer graphics driver.** SW2PS2 links the OunceVK 20261123.1 release (faster at higher
-  resolutions) and shuts its Vulkan device down fully at exit.
+- **Graphics driver.** SW2PS2 links the OunceVK 20261117.1 release and shuts its Vulkan device
+  down fully at exit. (OunceVK 20261118 to 20261123.1 crashed on the way back to hbmenu.)
 - **Per-game speed settings built in.** Demanding games start with emulated-CPU settings
   measured on the Switch 2, falling back to the community-tested AetherSX2/NetherSX2 lists. Any
   game can be adjusted from the in-game menu, and the app tells you once if a game falls below
@@ -155,7 +161,7 @@ Needs devkitPro (devkitA64) with the ounce-devkit Switch 2 additions (libounce, 
 1. `tools/setup_third_party.sh` clones the cores at the pinned commits and applies `patches/`.
 2. `tools/build_core.sh` builds libjpeg-turbo (from the core's own copy) and the core, with the
    exact settings the app is built with (CMake + Ninja).
-3. `make` builds the app, linking the OunceVK 20261123.1 driver that step 1 unpacks into
+3. `make` builds the app, linking the OunceVK 20261117.1 driver that step 1 unpacks into
    `third_party/` (`make OUNCEVK=` uses the devkit's copy instead).
 
 After changing what the app links, `tools/make_notices.py` regenerates
