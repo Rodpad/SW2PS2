@@ -33,11 +33,11 @@ folders can be changed in Settings -> App. The app keeps its own files in `/swit
   the game is touched (Settings -> App: When touched / Always / Hidden).
 - **UI size:** Normal (larger rows and text, easier to tap; the default) or Compact, in
   Settings -> App.
-- **Box art and game details,** downloaded on the console (no account needed) from the LaunchBox
-  Games Database, matched by the disc's serial (`.iso` and `.cue`/`.bin`; other formats by file
-  name). A details panel beside the game list shows the case in 3D (drag to turn it), its back,
-  the publisher, year, genre, region (NTSC / PAL / NTSC-J) and description (Settings -> App ->
-  Game details panel; Download missing info). With details downloaded, the game list shows each
+- **Box art and game details,** downloaded on the console from [ScreenScraper](https://www.screenscraper.fr)
+  (no account needed), matched by the disc's serial (`.iso` and `.cue`/`.bin`; other formats by file
+  name and size). A details panel beside the game list shows the case in 3D with its front, back
+  and sides (drag to turn it), the publisher, year, genre, region (NTSC / PAL / NTSC-J) and
+  description (Settings -> App -> Game details panel; Download missing box art and descriptions). With details downloaded, the game list shows each
   game's proper title (Settings -> App -> Game names: Title or File name).
 - **Themes:** Dark, Light, Black, Blue, Purple, Red, Green, Orange, Retro and Retro Colour.
 - **Built-in speed settings** for demanding games, measured on the Switch 2 or taken from the
@@ -141,6 +141,17 @@ SW2PS2 uses the [OunceSX2](https://github.com/nyathea/OunceSX2) core with its ow
   stopped the hardware renderer on the Switch 2; Burnout Revenge skips them.
 - **Loading a state right after boot.** A state load is held until the game itself has
   started; loading while the BIOS was still booting crashed God of War II.
+- **No crash on the way back to hbmenu.** OunceVK 20261118 to 20261123.1 crashed there after
+  10-20 s of rendering, even with no game played; SW2PS2 links 20261117.1 (measured at the same
+  speed).
+- **Games that play videos with the software renderer** (the game database's SoftwareRendererFMV,
+  194 entries, e.g. Naruto: Narutimate Hero 3) showed a black screen and crashed: switching
+  renderers rebuilt the graphics on SW2PS2's own Vulkan / OpenGL context. Their videos now stay on
+  the hardware renderer.
+- **Games that draw sprites on the CPU** (the game database's cpuSpriteRenderBW, 318 entries, e.g.
+  Dark Cloud 2) crashed: the ARM64 JIT's code for some of those draws (a bilinear paletted sprite)
+  is faulty. The hardware renderer's CPU draws use the C scanline functions instead; the game
+  database's fix stays on, so those games keep their correct graphics.
 
 ## Layout
 
@@ -167,6 +178,11 @@ Needs devkitPro (devkitA64) with the ounce-devkit Switch 2 additions (libounce, 
 
 After changing what the app links, `tools/make_notices.py` regenerates
 `romfs/licenses/THIRD_PARTY_NOTICES.txt`.
+
+Box art downloads use [ScreenScraper](https://www.screenscraper.fr) and need a ScreenScraper
+developer account, which is not in this repository: put `devid=...` and `devpassword=...` on two
+lines in `~/.config/sw2/screenscraper.txt` and run `tools/make_ss_dev.sh`, which writes the
+ignored `source/ss_dev.h`. Without it the app builds and runs but cannot download box art.
 
 ## Licence
 

@@ -24,7 +24,7 @@ endif
 
 APP_TITLE	:=	SW2PS2
 APP_AUTHOR	:=	Rodpad
-APP_VERSION	:=	1.4.0-exp.2
+APP_VERSION	:=	1.4.0-exp.3
 
 TARGET		:=	sw2ps2
 BUILD		:=	build

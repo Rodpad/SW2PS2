@@ -28,3 +28,4 @@ __pycache__/
 # the experimental branch carries its current test binary
 !/experimental/
 !/experimental/sw2ps2.nro
+/source/ss_dev.h

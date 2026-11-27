@@ -503,6 +503,30 @@ index 2cb9926070..97b2fc4a18 100644
  		BITFIELD_END
  
  		s8 EECycleRate; // EE cycle rate selector (1.0, 1.5, 2.0)
+diff --git a/pcsx2/Counters.cpp b/pcsx2/Counters.cpp
+index 5904839d7a..a14b1de2e0 100644
+--- a/pcsx2/Counters.cpp
++++ b/pcsx2/Counters.cpp
+@@ -494,7 +494,19 @@ static __fi void DoFMVSwitch()
+ 			break;
+ 	}
+ 
++#ifdef __SWITCH__
++	// SW2PS2: no software renderer for FMVs. Switching renderers reopens the GS on the front end's
++	// Vulkan / GL context, which left the screen black and then crashed the app (Naruto: Narutimate
++	// Hero 3 and Narutimate Accel 2, issue #3). FMVs stay on the hardware renderer.
+ 	if (EmuConfig.Gamefixes.SoftwareRendererFMVHack && EmuConfig.GS.UseHardwareRenderer())
++	{
++		static bool s_logged = false;
++		if (!s_logged) { s_logged = true; Console.WriteLn("GameDB: SoftwareRendererFMV ignored (FMVs stay on the hardware renderer)"); }
++	}
++	if (false)
++#else
++	if (EmuConfig.Gamefixes.SoftwareRendererFMVHack && EmuConfig.GS.UseHardwareRenderer())
++#endif
+ 	{
+ 		DevCon.Warning("FMV Switch");
+ 		// we don't use the sw toggle here, because it'll change back to auto if set to sw
 diff --git a/pcsx2/Dmac.cpp b/pcsx2/Dmac.cpp
 index 1da71e6ec9..8944dd416f 100644
 --- a/pcsx2/Dmac.cpp
@@ -738,6 +762,34 @@ index 7340c3205b..bf28a8bee2 100644
  			s_last_draw_rect = draw_rect;
  
  			// MetalFX spatial upscale runs before CAS/present, and only when actually upscaling
+diff --git a/pcsx2/GS/Renderers/HW/GSRendererHWMultiISA.cpp b/pcsx2/GS/Renderers/HW/GSRendererHWMultiISA.cpp
+index 9b979e1e2c..c6d344fe4b 100644
+--- a/pcsx2/GS/Renderers/HW/GSRendererHWMultiISA.cpp
++++ b/pcsx2/GS/Renderers/HW/GSRendererHWMultiISA.cpp
+@@ -2,6 +2,9 @@
+ // SPDX-License-Identifier: GPL-3.0+
+ 
+ #include "GSRendererHW.h"
++#ifdef __SWITCH__
++extern "C" thread_local int sw2_swprim_c_scanline;  // (GameDatabase.cpp)
++#endif
+ #include "GS/Renderers/SW/GSLevelOfDetail.h"
+ 
+ #include "GS/Renderers/Common/GSSwPrimRender.h"
+@@ -702,7 +705,13 @@ bool GSSwPrimRenderFunctions::Run(GSRenderer& hw, GSSwPrimRenderState& sw, const
+ 	if (!sw.rasterizer)
+ 		sw.rasterizer = std::make_unique<GSSingleRasterizer>();
+ 
++#ifdef __SWITCH__
++	sw2_swprim_c_scanline = 1;  // the C scanline functions, not the JIT (GameDatabase.cpp)
++	static_cast<GSSingleRasterizer*>(sw.rasterizer.get())->Draw(data);
++	sw2_swprim_c_scanline = 0;
++#else
+ 	static_cast<GSSingleRasterizer*>(sw.rasterizer.get())->Draw(data);
++#endif
+ 	MarkDrawWritten(hw.m_mem, context, bbox);
+ 
+ 	return true;
 diff --git a/pcsx2/GS/Renderers/OpenGL/GLContextEGL.cpp b/pcsx2/GS/Renderers/OpenGL/GLContextEGL.cpp
 index 303d7ffb9f..be6ebe6a4a 100644
 --- a/pcsx2/GS/Renderers/OpenGL/GLContextEGL.cpp
@@ -892,6 +944,34 @@ index 6e853f423b..7b53f1b1bf 100644
  	GLProgram prog;
  	m_shader_cache.GetProgram(&prog, vs, ps);
  	it = m_programs.emplace(psel, std::move(prog)).first;
+diff --git a/pcsx2/GS/Renderers/SW/GSDrawScanline.cpp b/pcsx2/GS/Renderers/SW/GSDrawScanline.cpp
+index 54b6c7558f..28ee7130c8 100644
+--- a/pcsx2/GS/Renderers/SW/GSDrawScanline.cpp
++++ b/pcsx2/GS/Renderers/SW/GSDrawScanline.cpp
+@@ -25,6 +25,11 @@ constexpr GSScanlineConstantData128B g_const_128b;
+ 
+ MULTI_ISA_UNSHARED_IMPL;
+ 
++#ifdef __SWITCH__
++extern "C" int sw2_c_scanline;  // SW2PS2 test only: the C scanline functions instead of the JIT
++extern "C" thread_local int sw2_swprim_c_scanline;  // SW2PS2: the hardware renderer's CPU draws use the C scanline functions (GameDatabase.cpp)
++#endif
++
+ static __forceinline const GSScanlineGlobalData& GlobalFromLocal(const GSScanlineLocalData& local)
+ {
+ 	return *local.gd;
+@@ -136,7 +141,11 @@ bool GSDrawScanline::SetupDraw(GSRasterizerData& data, bool allow_compile)
+ {
+ 	const GSScanlineGlobalData& global = data.global;
+ 
++#ifdef __SWITCH__
++	if (!SysMemory::HasCodeMemory() || sw2_c_scanline || sw2_swprim_c_scanline)  // (sw2_c_scanline: test key "cScanline"; sw2_swprim_c_scanline: the hardware renderer's CPU draws)
++#else
+ 	if (!SysMemory::HasCodeMemory())
++#endif
+ 	{
+ 		data.setup_prim = &GSDrawScanline::CSetupPrim;
+ 		data.draw_scanline = &GSDrawScanline::CDrawScanline;
 diff --git a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
 index ed78b9c38e..8b7588197e 100644
 --- a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
@@ -1641,10 +1721,10 @@ index 5bba9b2520..7d8f661dfb 100644
  		s_pacing = enabled;
  		if (!enabled)
 diff --git a/pcsx2/GameDatabase.cpp b/pcsx2/GameDatabase.cpp
-index 1bac5a4b58..dbf73be25c 100644
+index 1bac5a4b58..4c7613d1fd 100644
 --- a/pcsx2/GameDatabase.cpp
 +++ b/pcsx2/GameDatabase.cpp
-@@ -889,6 +889,18 @@ bool GameDatabaseSchema::GameEntry::configMatchesHWFix(const Pcsx2Config::GSOpti
+@@ -889,6 +889,23 @@ bool GameDatabaseSchema::GameEntry::configMatchesHWFix(const Pcsx2Config::GSOpti
  	}
  }
  
@@ -1652,6 +1732,11 @@ index 1bac5a4b58..dbf73be25c 100644
 +extern int sw2_db_effects;  // SW2PS2 front end: apply the database's accuracy recommendations
 +extern int sw2_blending_explicit;
 +extern "C" { int sw2_no_gs_hooks = 0; }  // SW2PS2 test only: skip the database's CRC draw hooks (key "noGsHooks")
++extern "C" { int sw2_c_scanline = 0; }  // SW2PS2 test only: the software rasteriser's C scanline functions instead of the JIT (key "cScanline")
++// SW2PS2: set by the hardware renderer's CPU draws (SwPrimRender) around its rasteriser, on that thread: they use the
++// C scanline functions. The ARM64 JIT's code for some of their draws crashed the app (Dark Cloud 2 (Korea): a bilinear
++// paletted sprite, selector 001192851227904c, the first CPU sprite of its intro; issue #4).
++extern "C" { thread_local int sw2_swprim_c_scanline = 0; }  // SW2PS2 test only: apply the database's cpuSpriteRenderBW anyway (key "cpuSprite")
 +// SW2PS2: games whose CRC draw hooks (getSkipCount / beforeDraw) crash on the Switch 2. Burnout Revenge
 +// (GSC_BurnoutGames + OI_BurnoutGames) kills the app ~7 s after boot with them; it boots and plays without
 +// (found 2026-11-24; soft protection, the EE recompiler, the IOP thread and memory cards were ruled out).
@@ -1663,7 +1748,7 @@ index 1bac5a4b58..dbf73be25c 100644
  void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
  	Pcsx2Config::GSOptions& config, const PerGameOverrides& overrides, ApplyMode mode) const
  {
-@@ -1144,6 +1156,10 @@ void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
+@@ -1144,6 +1161,10 @@ void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
  
  			case GSHWFixId::MinimumBlendingLevel:
  			{
@@ -1674,7 +1759,7 @@ index 1bac5a4b58..dbf73be25c 100644
  				if (value >= 0 && value <= static_cast<int>(AccBlendLevel::Maximum))
  					config.AccurateBlendingUnit = std::max(config.AccurateBlendingUnit, static_cast<AccBlendLevel>(value));
  			}
-@@ -1151,6 +1167,10 @@ void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
+@@ -1151,6 +1172,10 @@ void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
  
  			case GSHWFixId::MaximumBlendingLevel:
  			{
@@ -1685,7 +1770,7 @@ index 1bac5a4b58..dbf73be25c 100644
  				if (value >= 0 && value <= static_cast<int>(AccBlendLevel::Maximum))
  					config.AccurateBlendingUnit = std::min(config.AccurateBlendingUnit, static_cast<AccBlendLevel>(value));
  			}
-@@ -1169,6 +1189,20 @@ void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
+@@ -1169,6 +1194,20 @@ void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
  
  			case GSHWFixId::RecommendedBlendingLevel:
  			{
@@ -1706,7 +1791,7 @@ index 1bac5a4b58..dbf73be25c 100644
  				// Quiet also while auto-tune applies a trial: a toast per apply stacks up (see AutoTune::IsApplyingSettings).
  				if (quiet || AutoTune::IsApplyingSettings())
  					break;
-@@ -1204,6 +1238,14 @@ void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
+@@ -1204,6 +1243,14 @@ void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
  
  			case GSHWFixId::RecommendedAccurateAlphaTest:
  			{
@@ -1721,7 +1806,7 @@ index 1bac5a4b58..dbf73be25c 100644
  				// Quiet also while auto-tune applies a trial: a toast per apply stacks up (see AutoTune::IsApplyingSettings).
  				if (quiet || AutoTune::IsApplyingSettings())
  					break;
-@@ -1229,6 +1271,14 @@ void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
+@@ -1229,6 +1276,14 @@ void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
  
  			case GSHWFixId::RecommendedHWAA1:
  			{
@@ -1736,7 +1821,7 @@ index 1bac5a4b58..dbf73be25c 100644
  				// Quiet also while auto-tune applies a trial: a toast per apply stacks up (see AutoTune::IsApplyingSettings).
  				if (quiet || AutoTune::IsApplyingSettings())
  					break;
-@@ -1253,10 +1303,18 @@ void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
+@@ -1253,10 +1308,18 @@ void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
  			break;
  
  			case GSHWFixId::GetSkipCount:
