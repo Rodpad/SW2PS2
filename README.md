@@ -17,6 +17,14 @@ folders can be changed in Settings -> App. The app keeps its own files in `/swit
 ## Features
 
 ### Games
+- **Box art browsing, scraped on the console:** browse your games as a grid of box covers or as a
+  list, with a details panel showing the box in 3D (front, back and sides; drag to turn it), the
+  title, publisher, year, genre, region and description. Box art and details are downloaded on
+  the console from [ScreenScraper](https://www.screenscraper.fr), with no account needed and no PC
+  required (Settings -> App -> Download missing box art and descriptions; the app offers it the first
+  time games have none). Four views (List, List & details, Grid, Grid & details) on the right stick
+  press. Games are matched by their disc serial (`.iso` and `.cue`/`.bin`); with details downloaded,
+  the list shows each game's proper title.
 - **Game list** with All / Favourites / Recent tabs (L / R). Games are found in the games
   folder and any folders inside it: `.iso`, `.chd`, `.cso`, `.zso`, `.ciso`, `.gz`, `.m3u`, and `.cue` with its
   `.bin`. The BIOS is found the same way, in its folder or folders inside it.
@@ -24,21 +32,17 @@ folders can be changed in Settings -> App. The app keeps its own files in `/swit
   the defaults for all games.
 - **Menus wrap round:** in the game list, Settings and the in-game menu, going past the bottom
   jumps to the top and past the top to the bottom.
-- **Search and sort:** the game list's header row has the tabs, a search field (with a clear
-  button) and the sort order (name, last played, date added); left / right moves along it and A
-  uses it. The footer has Play, Favourite (−), Search (+), Settings (Y), Refresh (X) and Exit (B,
-  press twice), reachable with the D-pad.
+- **Search and sort:** the game list's header row has [L] All / Favourites / Recent [R], a search
+  field (with a clear button) and the sort order (name, last played, date added). Buttons: A play,
+  L / R tabs, ZL / ZR page up / down (hold to keep paging), left stick press the next sort order,
+  right stick press the next view, − Favourite, + Search, Y Refresh, X Settings, B Exit (press
+  twice). The list and grid wrap round, stopping on the header row and the footer on the way. On a
+  single Joy-Con, SL switches tabs and SR pages down.
 - **Touch on every screen:** tap anything (it lights while held and acts when released), drag to
   scroll, tap outside a window to close it. During play an on-screen Menu button appears when
   the game is touched (Settings -> App: When touched / Always / Hidden).
 - **UI size:** Normal (larger rows and text, easier to tap; the default) or Compact, in
   Settings -> App.
-- **Box art and game details,** downloaded on the console from [ScreenScraper](https://www.screenscraper.fr)
-  (no account needed), matched by the disc's serial (`.iso` and `.cue`/`.bin`; other formats by file
-  name and size). A details panel beside the game list shows the case in 3D with its front, back
-  and sides (drag to turn it), the publisher, year, genre, region (NTSC / PAL / NTSC-J) and
-  description (Settings -> App -> Game details panel; Download missing box art and descriptions). With details downloaded, the game list shows each
-  game's proper title (Settings -> App -> Game names: Title or File name).
 - **Themes:** Dark, Light, Black, Blue, Purple, Red, Green, Orange, Retro and Retro Colour.
 - **Built-in speed settings** for demanding games, measured on the Switch 2 or taken from the
   community AetherSX2/NetherSX2 lists, so most games start well without tuning.
