@@ -36,8 +36,9 @@ folders can be changed in Settings -> App. The app keeps its own files in `/swit
 - **Box art and game details,** downloaded on the console (no account needed) from the LaunchBox
   Games Database, matched by the disc's serial (`.iso` and `.cue`/`.bin`; other formats by file
   name). A details panel beside the game list shows the case in 3D (drag to turn it), its back,
-  the publisher, year, genre and description (Settings -> App -> Game details panel; Download
-  missing info).
+  the publisher, year, genre, region (NTSC / PAL / NTSC-J) and description (Settings -> App ->
+  Game details panel; Download missing info). With details downloaded, the game list shows each
+  game's proper title (Settings -> App -> Game names: Title or File name).
 - **Themes:** Dark, Light, Black, Blue, Purple, Red, Green, Orange, Retro and Retro Colour.
 - **Built-in speed settings** for demanding games, measured on the Switch 2 or taken from the
   community AetherSX2/NetherSX2 lists, so most games start well without tuning.
