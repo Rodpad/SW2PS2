@@ -14,7 +14,7 @@ BIOS (default folder `/bios/ps2`) and your own game dumps (default folder `/roms
 folders can be changed in Settings -> App. The app keeps its own files in `/switch/sw2ps2`
 (save states in `states/`, per-game settings in `settings/`).
 
-<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/f754d8eb-b66c-461c-a1b8-d41ab1a7087f" />
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/7172eb19-a984-47e3-87d2-745547d571c3" />
 
 ## Features
 
